@@ -51,3 +51,10 @@
 3. FM10, FM9 (control-plane liveness/accounting), FM5 (Exec/Snapshot race)
 4. FM6, FM7, FM11, FM4, FM12
 5. Lows as touched
+
+## Follow-up queue (after the findings above are fixed)
+
+1. **HIGH — Remove supervisor implementation duplication** (per ADR-004). Today the guest supervisor daemon (`runtime/guest-supervisor/cmd/guest-supervisor/`) and the local backend's in-process supervisor (`runtime/local-backend/supervisor.go`) are two implementations of one semantic spec; a parity defect already occurred (FM12). Target: the guest supervisor daemon is the single supervisor implementation, and the local/isolated backends run that same daemon on the host (unconfined or bwrap-confined) instead of reimplementing it. Resolves the drift class that produced FM12, FL2, FL3, FL4 by construction.
+2. Upstream the aarch64 jailer `midr_el1` patch (firecracker ≤1.17 hard-fails without `CONFIG_ARM64_CPUID_REGS`); the host runs a locally-built patched jailer until then.
+3. Generalize `runtime/host-agent` (currently hard-typed to `*localbackend.Backend`) so a Firecracker backend can serve a fleet host — prerequisite for the real-K8s-fleet work.
+4. Soak-run the remote conformance suite to attribute or clear the one unexplained flake observed in the first FC-enabled run.
