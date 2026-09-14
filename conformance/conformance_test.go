@@ -1,7 +1,9 @@
 // Package conformance is the executable specification of the platform
 // lifecycle/epoch contract (PLAN.md §4-5 gates, REQUIREMENTS §5). The suite
-// runs against both the fake backend and the local process backend; a few
-// scripted-fault tests are fake-only and a few real-process tests local-only.
+// runs against the fake backend, the local process backend, and — when the
+// host offers KVM + Firecracker artifacts (FC_TEST=1) — the firecracker VM
+// backend (ADR-0001 M6 gate, INV-026); a few scripted-fault tests are
+// fake-only and a few real-process tests local-only.
 package conformance
 
 import (
@@ -53,6 +55,8 @@ func newSystem(t *testing.T, backend string) *system {
 			t.Fatal(err)
 		}
 		rt = lb
+	case "firecracker":
+		rt = firecrackerRuntime(t)
 	default:
 		t.Fatalf("unknown backend %q", backend)
 	}
@@ -80,9 +84,13 @@ func (s *system) localBackend(t *testing.T) *localbackend.Backend {
 	return lb
 }
 
-// runBoth runs a conformance scenario against every applicable backend.
+// runBoth runs a conformance scenario against every applicable backend:
+// fake + local always, and the firecracker VM backend when the host offers
+// it (FC_TEST=1, KVM, artifacts — otherwise that subtest skips with a clear
+// message). Semantic differences must surface as capability declarations,
+// never as weakened shared assertions (INV-026).
 func runBoth(t *testing.T, fn func(t *testing.T, s *system)) {
-	for _, backend := range []string{"fake", "local"} {
+	for _, backend := range []string{"fake", "local", "firecracker"} {
 		t.Run(backend, func(t *testing.T) {
 			fn(t, newSystem(t, backend))
 		})

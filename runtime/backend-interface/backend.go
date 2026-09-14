@@ -75,11 +75,17 @@ type Capabilities struct {
 	SupportsPause    bool
 	SupportsSnapshot bool
 	SupportsRestore  bool
-	// SupportsCheckpoint declares STOP/CONT-class execution checkpointing:
-	// pause halts CPU but RAM stays allocated (never reported as reclaimed).
+	// SupportsCheckpoint declares execution-state checkpointing (STOP/CONT
+	// or snapshot class): pause + snapshot capture the live execution.
 	SupportsCheckpoint bool
-	NetworkIsolated    bool
-	HostCredentialFree bool
+	// CheckpointReclaimsMemory declares snapshot-class checkpoints whose
+	// capture lets the runtime be terminated and its RAM honestly reported
+	// as reclaimed (e.g. full VM snapshot to disk); Restore boots back from
+	// the checkpoint with real continuity. When false (STOP/CONT class),
+	// RAM stays allocated across a checkpoint suspend and is reported 0.
+	CheckpointReclaimsMemory bool
+	NetworkIsolated          bool
+	HostCredentialFree       bool
 }
 
 // Backend is the runtime backend contract (DESIGN §6.7).

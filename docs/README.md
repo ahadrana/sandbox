@@ -110,9 +110,11 @@ milestone to code:
   `domain/`, `control-plane/sandbox-manager/`, `control-plane/event-service/`,
   `workspace/`, `environment-builder/`; conformance in `conformance/`
   (lifecycle, epoch, workspace, chaos suites).
-- **M6 — capabilities model:** `runtime/backend-interface/` plus
-  `runtime/local-backend/` (PROCESS) and `runtime/isolated-backend/`
-  (NAMESPACE/bwrap); ADR-001.
+- **M6 — capabilities model + VM backend:** `runtime/backend-interface/` plus
+  `runtime/local-backend/` (PROCESS), `runtime/isolated-backend/`
+  (NAMESPACE/bwrap), and `runtime/firecracker-backend/` (VM — implemented,
+  no longer deferred; conformance-gated on KVM hosts via FC_TEST=1);
+  ADR-001.
 - **M7 — policy enforcement:** quota, capability, and fork-bomb/limits
   conformance tests.
 - **M8 — suspend/checkpoint:** manager suspend/resume + checkpoint

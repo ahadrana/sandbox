@@ -171,6 +171,10 @@ func (b *Backend) Capabilities() backendinterface.Capabilities {
 		SupportsSnapshot:   true,
 		SupportsRestore:    true,
 		SupportsCheckpoint: true,
+		// Full VM snapshots go to disk; after capture the VMM can be
+		// terminated and its RAM honestly reclaimed, with Restore booting
+		// back from the snapshot.
+		CheckpointReclaimsMemory: true,
 		// With Networking off no NIC is attached at all (nothing to
 		// isolate, fail-closed); with it on, guest traffic is confined
 		// to a per-incarnation TAP behind a host egress chain.

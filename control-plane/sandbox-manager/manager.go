@@ -1382,9 +1382,12 @@ func (m *Manager) suspendWithReasonLocked(sb *domain.Sandbox, reason string, all
 	return m.flushTx()
 }
 
-// checkpointSuspendLocked pauses the incarnation (SIGSTOP class) and records
-// an EXECUTION_STATE checkpoint; RAM stays allocated, which Usage keeps
-// reporting honestly. The handle stays live for a continuity resume.
+// checkpointSuspendLocked pauses the incarnation and records an
+// EXECUTION_STATE checkpoint. STOP/CONT-class backends keep RAM allocated
+// (honestly reported as 0 reclaimed); snapshot-class backends
+// (Capabilities.CheckpointReclaimsMemory) are terminated after capture and
+// report the reclaimed RAM — Restore boots back from the checkpoint with
+// real continuity. The handle stays live for a continuity resume.
 func (m *Manager) checkpointSuspendLocked(sb *domain.Sandbox, h backendinterface.Handle, payloadReason func(map[string]any) map[string]any) error {
 	if err := m.rt.Pause(h); err != nil {
 		return err
@@ -1407,9 +1410,20 @@ func (m *Manager) checkpointSuspendLocked(sb *domain.Sandbox, h backendinterface
 	m.checkpoints[cpID] = checkpointRecord{data: data, rec: rec}
 	m.tx.Checkpoints = append(m.tx.Checkpoints, &rec)
 	sb.CheckpointRef = &cpID
+	ramReclaimed := int64(0)
+	incState := domain.IncarnationPaused
+	if m.rt.Capabilities().CheckpointReclaimsMemory {
+		if st, err := m.rt.Stats(h); err == nil {
+			ramReclaimed = st.MemoryBytes
+		}
+		if err := m.rt.Terminate(h); err != nil {
+			return err
+		}
+		incState = domain.IncarnationTerminated
+	}
 	if sb.RuntimeIncarnationID != nil {
 		if inc, ok := m.incarnations[*sb.RuntimeIncarnationID]; ok {
-			inc.State = domain.IncarnationPaused
+			inc.State = incState
 			m.txIncarnation(inc)
 		}
 	}
@@ -1420,7 +1434,7 @@ func (m *Manager) checkpointSuspendLocked(sb *domain.Sandbox, h backendinterface
 		"mode":                 "execution_state",
 		"checkpoint_id":        cpID,
 		"workspace_generation": sb.WorkspaceGeneration,
-		"ram_reclaimed_bytes":  int64(0),
+		"ram_reclaimed_bytes":  ramReclaimed,
 	}))
 	return nil
 }

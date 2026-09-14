@@ -53,6 +53,21 @@ func TestBackendCapabilityDeclarations(t *testing.T) {
 	if caps.IsolationClass != backendinterface.IsolationProcess || caps.SupportsSnapshot {
 		t.Fatalf("local caps wrong: %+v", caps)
 	}
+	if firecrackerAvailable() {
+		fcaps := firecrackerRuntime(t).Capabilities()
+		if fcaps.IsolationClass != backendinterface.IsolationVM {
+			t.Fatalf("firecracker isolation = %s, want VM", fcaps.IsolationClass)
+		}
+		if !fcaps.SupportsSnapshot || !fcaps.SupportsRestore || !fcaps.SupportsCheckpoint {
+			t.Fatalf("firecracker snapshot/checkpoint caps missing: %+v", fcaps)
+		}
+		if !fcaps.CheckpointReclaimsMemory {
+			t.Fatalf("firecracker must declare snapshot-class RAM reclamation: %+v", fcaps)
+		}
+		if !fcaps.HostCredentialFree {
+			t.Fatalf("firecracker caps incomplete: %+v", fcaps)
+		}
+	}
 	if !isolatedbackend.Available() {
 		t.Skip("isolated backend unavailable")
 	}
