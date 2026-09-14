@@ -339,6 +339,36 @@ func (d *Durable) GC(workspaceID string) (int, error) {
 		}
 		removed++
 	}
+	// blobs/ is a shared content-addressed pool across all workspaces in the
+	// store: before unlinking any blob, union in the references of every
+	// other workspace's surviving generations.
+	wsEntries, err := os.ReadDir(filepath.Join(d.root, "workspaces"))
+	if err != nil {
+		return removed, err
+	}
+	for _, we := range wsEntries {
+		if !we.IsDir() || we.Name() == workspaceID {
+			continue
+		}
+		otherGenDir := filepath.Join(d.root, "workspaces", we.Name(), "generations")
+		genEntries, err := os.ReadDir(otherGenDir)
+		if err != nil {
+			continue
+		}
+		for _, e := range genEntries {
+			var gen int64
+			if _, err := fmt.Sscanf(e.Name(), "%d.json", &gen); err != nil {
+				continue
+			}
+			m, err := d.readManifestFile(we.Name(), gen)
+			if err != nil {
+				continue
+			}
+			for _, digest := range m.Files {
+				referenced[digest] = true
+			}
+		}
+	}
 	blobs, err := os.ReadDir(filepath.Join(d.root, "blobs"))
 	if err != nil {
 		return removed, err

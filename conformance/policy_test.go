@@ -5,6 +5,7 @@
 package conformance
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"strconv"
@@ -464,5 +465,65 @@ func TestWallDeadlineSuspend(t *testing.T) {
 	report := mustMaterialize(t, d, sb.SandboxID)
 	if report.NewEpoch != 2 {
 		t.Fatalf("rematerialize epoch = %d, want 2", report.NewEpoch)
+	}
+}
+
+// H4 regression: a quota-denied materialize leaves the sandbox FAILED (not
+// wedged in STARTING), and retry succeeds once the quota is raised.
+func TestQuotaDeniedMaterializeRetryable(t *testing.T) {
+	runBoth(t, func(t *testing.T, s *system) {
+		d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 5)
+		s.mgr.SetQuota(domain.Quota{TenantID: "tenant-1", MaxLiveSandboxes: 1})
+		first, err := d.CreateSandbox("task-first")
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustMaterialize(t, d, first.SandboxID)
+		second, err := d.CreateSandbox("task-second")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.mgr.Materialize(second.SandboxID)
+		var qerr *domain.QuotaExceededError
+		if !errors.As(err, &qerr) {
+			t.Fatalf("expected QuotaExceededError, got %v", err)
+		}
+		got := mustGetSandbox(t, s, second.SandboxID)
+		if got.ObservedState != domain.SandboxFailed {
+			t.Fatalf("state after quota denial = %s, want FAILED", got.ObservedState)
+		}
+		s.mgr.SetQuota(domain.Quota{TenantID: "tenant-1", MaxLiveSandboxes: 2})
+		if _, err := s.mgr.Materialize(second.SandboxID); err != nil {
+			t.Fatalf("retry after quota raised: %v", err)
+		}
+		if got := mustGetSandbox(t, s, second.SandboxID); got.ObservedState != domain.SandboxRunning {
+			t.Fatalf("state after retry = %s, want RUNNING", got.ObservedState)
+		}
+	})
+}
+
+// H4 regression: an rt.Create failure leaves the sandbox FAILED and a later
+// Materialize retry succeeds.
+func TestCreateFailureMaterializeRetryable(t *testing.T) {
+	s := newSystem(t, "fake")
+	fb := s.fakeBackend(t)
+	d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 6)
+	sb, err := d.CreateSandbox("task-flaky-create")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fb.Faults.FailCreate = true
+	if _, err := s.mgr.Materialize(sb.SandboxID); err == nil {
+		t.Fatal("expected materialize failure")
+	}
+	if got := mustGetSandbox(t, s, sb.SandboxID); got.ObservedState != domain.SandboxFailed {
+		t.Fatalf("state after create failure = %s, want FAILED", got.ObservedState)
+	}
+	fb.Faults.FailCreate = false
+	if _, err := s.mgr.Materialize(sb.SandboxID); err != nil {
+		t.Fatalf("retry after fault cleared: %v", err)
+	}
+	if got := mustGetSandbox(t, s, sb.SandboxID); got.ObservedState != domain.SandboxRunning {
+		t.Fatalf("state after retry = %s, want RUNNING", got.ObservedState)
 	}
 }

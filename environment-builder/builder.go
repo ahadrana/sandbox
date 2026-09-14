@@ -168,6 +168,7 @@ type Builder struct {
 	byKey       map[string]string              // family|digest -> environment_id
 	installRuns map[string]int                 // config digest -> real install executions
 	specs       map[string]EnvironmentSpec     // environment_id -> build spec
+	compLocks   map[string]*sync.Mutex         // completion serialization keys -> lock
 }
 
 // Open opens (or creates) the builder registry rooted at root, reloading
@@ -185,6 +186,7 @@ func Open(root string, repos RepoSource, clock domain.Clock, ids *domain.IDGen) 
 		byKey:          map[string]string{},
 		installRuns:    map[string]int{},
 		specs:          map[string]EnvironmentSpec{},
+		compLocks:      map[string]*sync.Mutex{},
 	}
 	entries, err := os.ReadDir(filepath.Join(root, "artifacts"))
 	if err != nil {
@@ -238,18 +240,43 @@ func (b *Builder) StartBuild(family string, spec EnvironmentSpec) (*domain.Envir
 	return &cp, nil
 }
 
+// completionLock returns the named serialization lock for CompleteBuild.
+// Locks are acquired in a fixed order (environment, then artifact digest),
+// which cannot cycle: an environment has exactly one digest.
+func (b *Builder) completionLock(key string) *sync.Mutex {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	l, ok := b.compLocks[key]
+	if !ok {
+		l = &sync.Mutex{}
+		b.compLocks[key] = l
+	}
+	return l
+}
+
 // CompleteBuild drives a BUILDING environment to its terminal state:
 // checkout base + repos at exact SHAs, bounded install command, immutable
 // artifact on success. Terminal states: ACTIVE (success, becomes the family
 // default) or FAILED (never replaces the last-known-good default).
+// Completion is serialized per environment and per artifact digest:
+// concurrent completions of the same environment run the install at most
+// once, and concurrent builds sharing an artifactDir publish one intact
+// artifact.
 func (b *Builder) CompleteBuild(environmentID string) error {
 	b.mu.Lock()
 	env, ok := b.envs[environmentID]
+	b.mu.Unlock()
 	if !ok {
-		b.mu.Unlock()
-		ErrNotFound_ := ErrNotFound
-		return ErrNotFound_
+		return ErrNotFound
 	}
+	envLock := b.completionLock("env:" + environmentID)
+	envLock.Lock()
+	defer envLock.Unlock()
+	digestLock := b.completionLock("digest:" + env.ConfigDigest)
+	digestLock.Lock()
+	defer digestLock.Unlock()
+
+	b.mu.Lock()
 	if env.Status != domain.EnvironmentBuilding {
 		cp := *env
 		b.mu.Unlock()
@@ -357,6 +384,9 @@ func (b *Builder) finish(env *domain.Environment, artifactDir string, reused boo
 	for _, other := range b.envs {
 		if other.Name == env.Name && other.EnvironmentID != env.EnvironmentID && other.Status == domain.EnvironmentActive {
 			other.Status = domain.EnvironmentRetired
+			if err := b.persistRecordLocked(other); err != nil {
+				return err
+			}
 		}
 	}
 	record, err := json.Marshal(env)
@@ -367,6 +397,17 @@ func (b *Builder) finish(env *domain.Environment, artifactDir string, reused boo
 		return err
 	}
 	return nil
+}
+
+// persistRecordLocked rewrites the environment's environment.json inside its
+// artifact directory, so status transitions (e.g. ACTIVE -> RETIRED) survive
+// a restart. Caller holds b.mu.
+func (b *Builder) persistRecordLocked(env *domain.Environment) error {
+	record, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(b.root, "artifacts", env.ConfigDigest, "environment.json"), record, 0o644)
 }
 
 func moveAndDigest(srcDir, destDir string) (map[string]string, error) {
@@ -466,10 +507,13 @@ func (b *Builder) Activate(environmentID string) error {
 	for _, other := range b.envs {
 		if other.Name == env.Name && other.Status == domain.EnvironmentActive {
 			other.Status = domain.EnvironmentRetired
+			if err := b.persistRecordLocked(other); err != nil {
+				return err
+			}
 		}
 	}
 	env.Status = domain.EnvironmentActive
-	return nil
+	return b.persistRecordLocked(env)
 }
 
 // ArtifactManifest reads the artifact's file set, verifying every file
@@ -481,7 +525,7 @@ func (b *Builder) ArtifactManifest(environmentID string) (map[string]string, err
 	if !ok {
 		return nil, ErrNotFound
 	}
-	if env.Status != domain.EnvironmentActive {
+	if env.Status != domain.EnvironmentActive && env.Status != domain.EnvironmentRetired {
 		return nil, ErrIllegalState
 	}
 	artifactDir := filepath.Join(b.root, "artifacts", env.ConfigDigest)

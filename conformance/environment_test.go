@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ type envFixture struct {
 	repos   *environmentbuilder.LocalRepoSource
 	clock   *domain.ManualClock
 	ids     *domain.IDGen
+	root    string
 }
 
 func newEnvFixture(t *testing.T) *envFixture {
@@ -27,11 +29,12 @@ func newEnvFixture(t *testing.T) *envFixture {
 	clock := domain.NewManualClock(time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC))
 	ids := domain.NewIDGen()
 	repos := environmentbuilder.NewLocalRepoSource(t.TempDir())
-	b, err := environmentbuilder.Open(t.TempDir(), repos, clock, ids)
+	root := t.TempDir()
+	b, err := environmentbuilder.Open(root, repos, clock, ids)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &envFixture{builder: b, repos: repos, clock: clock, ids: ids}
+	return &envFixture{builder: b, repos: repos, clock: clock, ids: ids, root: root}
 }
 
 func baseSpec() environmentbuilder.EnvironmentSpec {
@@ -367,5 +370,93 @@ func TestBootFromArtifactIsolation(t *testing.T) {
 	}
 	if manifest["etc/base.conf"] != "original" {
 		t.Fatal("immutable artifact mutated by a sandbox")
+	}
+}
+
+// H2 regression: concurrent CompleteBuild of the same environment runs the
+// install exactly once and publishes one intact artifact.
+func TestConcurrentCompleteBuildSerialized(t *testing.T) {
+	f := newEnvFixture(t)
+	f.repos.AddVersion("base-go", "", map[string]string{"bin/go": "binary"})
+	f.repos.AddVersion("app", "sha-app-1", map[string]string{"main.go": "v1"})
+	env, err := f.builder.StartBuild("coding", baseSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = f.builder.CompleteBuild(env.EnvironmentID)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+	if runs := f.builder.InstallRuns(environmentbuilder.SpecDigest(baseSpec())); runs != 1 {
+		t.Fatalf("install ran %d times, want exactly 1", runs)
+	}
+	got, err := f.builder.Get(env.EnvironmentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.EnvironmentActive {
+		t.Fatalf("status = %s, want ACTIVE", got.Status)
+	}
+	files, err := f.builder.ArtifactManifest(env.EnvironmentID)
+	if err != nil {
+		t.Fatalf("artifact not intact: %v", err)
+	}
+	if files["install.marker"] != "installed\n" || files["repo/app/main.go"] != "v1" {
+		t.Fatalf("artifact content wrong: %v", files)
+	}
+}
+
+// H9 regression: a superseded ACTIVE build is persisted RETIRED, so after
+// reopening the builder exactly one ACTIVE per family exists.
+func TestRetiredStatusPersistsAcrossReopen(t *testing.T) {
+	f := newEnvFixture(t)
+	f.repos.AddVersion("base-go", "", map[string]string{"bin/go": "binary"})
+	f.repos.AddVersion("app", "sha-app-1", map[string]string{"main.go": "v1"})
+	f.repos.AddVersion("app", "sha-app-2", map[string]string{"main.go": "v2"})
+	envA := mustBuild(t, f, "coding", baseSpec())
+	specB := baseSpec()
+	specB.RepoInputs[0].SHA = "sha-app-2"
+	envB := mustBuild(t, f, "coding", specB)
+	if envB.Status != domain.EnvironmentActive {
+		t.Fatalf("envB status = %s", envB.Status)
+	}
+
+	reopened, err := environmentbuilder.Open(f.root, f.repos, f.clock, f.ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := reopened.Active("coding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.EnvironmentID != envB.EnvironmentID {
+		t.Fatalf("family default after reopen = %s, want envB %s", active.EnvironmentID, envB.EnvironmentID)
+	}
+	a, err := reopened.Get(envA.EnvironmentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != domain.EnvironmentRetired {
+		t.Fatalf("envA status after reopen = %s, want RETIRED", a.Status)
+	}
+	// Retired environments remain bootable/readable (INV-021).
+	files, err := reopened.ArtifactManifest(envA.EnvironmentID)
+	if err != nil {
+		t.Fatalf("retired env artifact unreadable: %v", err)
+	}
+	if files["repo/app/main.go"] != "v1" {
+		t.Fatalf("retired env content = %q", files["repo/app/main.go"])
 	}
 }

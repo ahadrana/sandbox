@@ -864,3 +864,83 @@ func TestLargeOutputCapturedByRef(t *testing.T) {
 		}
 	}
 }
+
+// H3 regression: an execution's recorded GenerationAfter is a value copy;
+// later commits must not rewrite the earlier execution's audit record.
+func TestGenerationAfterIsValueCopy(t *testing.T) {
+	runBoth(t, func(t *testing.T, s *system) {
+		d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 99)
+		sb, _ := d.CreateSandbox("task-gen-copy")
+		mustMaterialize(t, d, sb.SandboxID)
+
+		ex1, err := d.ExecSync(sb.SandboxID, domain.Operation{
+			Command: "write a.txt",
+			Writes:  map[string]string{"a.txt": "one"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ex1.GenerationAfter == nil || *ex1.GenerationAfter != 2 {
+			t.Fatalf("ex1 GenerationAfter = %v, want 2", ex1.GenerationAfter)
+		}
+		if _, err := d.ExecSync(sb.SandboxID, domain.Operation{
+			Command: "write b.txt",
+			Writes:  map[string]string{"b.txt": "two"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.mgr.GetExecution(ex1.ExecutionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.GenerationAfter == nil || *got.GenerationAfter != 2 {
+			t.Fatalf("ex1 GenerationAfter after second commit = %v, want 2", got.GenerationAfter)
+		}
+	})
+}
+
+// H5 regression: runtime loss finalizes in-flight executions FAILED with an
+// explicit terminal reason; no control-plane restart is needed to observe a
+// terminal state, and a late CompleteExecution is a clean error.
+func TestRuntimeLossFinalizesExecutions(t *testing.T) {
+	runBoth(t, func(t *testing.T, s *system) {
+		d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 77)
+		sb, _ := d.CreateSandbox("task-loss-finalize")
+		mustMaterialize(t, d, sb.SandboxID)
+		ex, err := s.mgr.StartExecution(api.StartExecutionRequest{
+			SandboxID:   sb.SandboxID,
+			PrincipalID: "principal-1",
+			Operation:   domain.Operation{Command: "sleep 60"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ex.State != domain.ExecutionRunning {
+			t.Fatalf("execution state = %s, want RUNNING", ex.State)
+		}
+		if err := s.mgr.KillRuntime(sb.SandboxID); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.mgr.GetExecution(ex.ExecutionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != domain.ExecutionFailed {
+			t.Fatalf("execution state after runtime loss = %s, want FAILED", got.State)
+		}
+		if got.TerminalReason == nil || *got.TerminalReason == "" {
+			t.Fatal("terminal reason not recorded")
+		}
+		if got.CompletedAt == nil {
+			t.Fatal("CompletedAt not recorded")
+		}
+		if _, err := s.mgr.CompleteExecution(ex.ExecutionID); err == nil {
+			t.Fatal("CompleteExecution on finalized execution should be a clean error")
+		}
+		// Events: ExecutionFailed emitted through the outbox.
+		events, _ := s.outbox.Replay(0)
+		if len(eventsOfType(events, domain.EventExecutionFailed)) == 0 {
+			t.Fatal("no ExecutionFailed event emitted")
+		}
+	})
+}

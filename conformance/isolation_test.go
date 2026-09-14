@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -163,5 +164,49 @@ func TestIsolatedBackendConformanceSample(t *testing.T) {
 	out, _ := os.ReadFile(strings.TrimPrefix(*ex.StdoutRef, "file://"))
 	if !strings.Contains(string(out), content) {
 		t.Fatalf("guest cannot read its own workspace file: %q", out)
+	}
+}
+
+// H7 regression: a background execution name containing "../" must be
+// rejected at the supervisor boundary with a clean error, and no output
+// file may be created outside the output directory.
+func TestBackgroundNamePathTraversalRejected(t *testing.T) {
+	root := t.TempDir()
+	lb, err := localbackend.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := lb.Create(backendinterface.Spec{
+		SandboxID:     "sb-sec",
+		IncarnationID: "inc-sec",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lb.Start(h); err != nil {
+		t.Fatal(err)
+	}
+	// "x/../../escape" makes filepath.Join collapse out of the output
+	// directory into the incarnation dir: without validation the file
+	// create would succeed outside outDir.
+	err = lb.Exec(h, "ex-sec", domain.Operation{
+		Command:         "true",
+		SpawnBackground: []domain.BackgroundSpec{{Name: "x/../../escape", Ticks: 1}},
+	})
+	if err == nil {
+		t.Fatal("traversal execution ID accepted")
+	}
+	var escaped []string
+	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err == nil && strings.Contains(info.Name(), "escape") {
+			escaped = append(escaped, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(escaped) > 0 {
+		t.Fatalf("files created by traversal ID: %v", escaped)
 	}
 }

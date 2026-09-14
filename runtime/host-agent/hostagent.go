@@ -195,24 +195,24 @@ func (h *HostAgent) Cache() *artifactCache { return h.cache }
 
 // Create materializes an incarnation from cache/durable stores under a
 // placement fence. Replays with the current fence are idempotent (exactly
-// one incarnation); older fences are rejected.
+// one incarnation); older fences are rejected. The fence/capacity check and
+// the backend create are atomic under h.mu: neither assemble nor
+// backend.Create calls back into the host, so concurrent duplicate creates
+// yield exactly one incarnation and a single capacity charge.
 func (h *HostAgent) Create(req CreateRequest) (backendinterface.Handle, error) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if req.Fence < h.fences[req.SandboxID] {
-		h.mu.Unlock()
 		return backendinterface.Handle{}, ErrStaleFence
 	}
 	if req.Fence == h.fences[req.SandboxID] {
 		if incID, ok := h.bySandbox[req.SandboxID]; ok {
-			h.mu.Unlock()
 			return backendinterface.Handle{IncarnationID: incID}, nil
 		}
 	}
 	if h.slotsUsed+1 > h.slots || h.memUsed+req.MemoryBytes > h.memCapacity {
-		h.mu.Unlock()
 		return backendinterface.Handle{}, ErrCapacity
 	}
-	h.mu.Unlock()
 
 	// Pin the environment artifact before assembly so eviction pressure
 	// from this very create cannot evict it (pin protection, PLAN §13).
@@ -242,8 +242,6 @@ func (h *HostAgent) Create(req CreateRequest) (backendinterface.Handle, error) {
 		}
 		return backendinterface.Handle{}, err
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.fences[req.SandboxID] = req.Fence
 	h.bySandbox[req.SandboxID] = req.IncarnationID
 	h.incarnations[req.IncarnationID] = &incRecord{sandboxID: req.SandboxID, fence: req.Fence, memory: req.MemoryBytes, envID: req.EnvironmentID}

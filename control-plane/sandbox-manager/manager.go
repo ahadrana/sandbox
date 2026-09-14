@@ -750,6 +750,21 @@ func (m *Manager) Materialize(sandboxID string) (*api.RestoreReport, error) {
 		return nil, domain.ErrIllegalState
 	}
 	if err := m.materializeLocked(sb, report); err != nil {
+		// Any failure after the STARTING transition must leave the sandbox
+		// in a valid, persisted state so a later Materialize retry is legal
+		// instead of wedging on STARTING (FAILED is retriable).
+		if sb.ObservedState == domain.SandboxStarting {
+			if terr := m.transition(sb, domain.SandboxFailed); terr != nil {
+				return nil, terr
+			}
+			m.emit(sb, sb.SandboxID, domain.EventSandboxFailed, map[string]any{
+				"reason": "materialize failed",
+				"detail": err.Error(),
+			})
+		}
+		if ferr := m.flushTx(); ferr != nil {
+			return nil, ferr
+		}
 		return nil, err
 	}
 	if err := m.flushTx(); err != nil {
@@ -779,6 +794,9 @@ func (m *Manager) KillRuntime(sandboxID string) error {
 
 // markRuntimeLostLocked records loss of the current incarnation and fails
 // the sandbox explicitly (INV-024); recovery happens on rematerialization.
+// All non-terminal executions of the sandbox are finalized FAILED with an
+// explicit terminal reason, so a reconnecting client gets a terminal result
+// immediately rather than after the next control-plane restart (INV-010).
 func (m *Manager) markRuntimeLostLocked(sb *domain.Sandbox, reason string) error {
 	delete(m.handles, sb.SandboxID)
 	if sb.RuntimeIncarnationID != nil {
@@ -794,6 +812,23 @@ func (m *Manager) markRuntimeLostLocked(sb *domain.Sandbox, reason string) error
 	m.emit(sb, sb.SandboxID, domain.EventSandboxFailed, map[string]any{
 		"reason": reason,
 	})
+	for _, ex := range m.executions {
+		if ex.SandboxID != sb.SandboxID || ex.State.Terminal() {
+			continue
+		}
+		if err := domain.TransitionExecution(ex.State, domain.ExecutionFailed); err != nil {
+			return err
+		}
+		ex.State = domain.ExecutionFailed
+		now := m.clock.Now()
+		ex.CompletedAt = &now
+		ex.TerminalReason = &reason
+		m.txExecution(ex)
+		m.emit(sb, ex.ExecutionID, domain.EventExecutionFailed, map[string]any{
+			"execution_id": ex.ExecutionID,
+			"reason":       reason,
+		})
+	}
 	return nil
 }
 
@@ -1014,7 +1049,8 @@ func (m *Manager) finalizeCompletedLocked(sb *domain.Sandbox, ex *domain.Executi
 	if err := m.commitLocked(sb, h, &ex.ExecutionID); err != nil {
 		return err
 	}
-	ex.GenerationAfter = &sb.WorkspaceGeneration
+	generationAfter := sb.WorkspaceGeneration
+	ex.GenerationAfter = &generationAfter
 	m.txExecution(ex)
 	m.emit(sb, ex.ExecutionID, domain.EventExecutionCompleted, map[string]any{
 		"execution_id":     ex.ExecutionID,

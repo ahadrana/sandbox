@@ -684,3 +684,172 @@ func TestGateDestroyAllRuntimeState(t *testing.T) {
 		t.Fatal("reset event not attributed to sandbox")
 	}
 }
+
+// H1 regression: GC must not delete blobs referenced by other workspaces.
+func TestGCPreservesCrossWorkspaceBlobs(t *testing.T) {
+	root := t.TempDir()
+	d, _, _ := newDurableWS(t, root)
+	ws1, err := d.Create("tenant-1", "env-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws2, err := d.Create("tenant-1", "env-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Identical content in both workspaces dedups to one shared blob.
+	if _, err := d.Commit(ws1.WorkspaceID, 1, map[string]string{"shared.txt": "shared-content"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Commit(ws2.WorkspaceID, 1, map[string]string{"shared.txt": "shared-content"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Move ws1's head past gen 2 so gen 2 becomes an unpinned non-head
+	// generation that GC will collect.
+	if _, err := d.Commit(ws1.WorkspaceID, 2, map[string]string{"other.txt": "other"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := d.GC(ws1.WorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 2 {
+		t.Fatalf("GC removed %d generations, want 2", removed)
+	}
+	files, err := d.ReadManifest(ws2.WorkspaceID, 2)
+	if err != nil {
+		t.Fatalf("ws2 generation unreadable after ws1 GC: %v", err)
+	}
+	if files["shared.txt"] != "shared-content" {
+		t.Fatalf("ws2 shared.txt = %q, want byte-identical content", files["shared.txt"])
+	}
+}
+
+// H6 regression: a corrupt journal line anywhere but the end is journal
+// damage, not a torn write — Load must fail loudly.
+func TestCorruptMidJournalLineFailsLoudly(t *testing.T) {
+	dir := t.TempDir()
+	store, err := sandboxmanager.OpenFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(sandboxmanager.Tx{Sandboxes: []*domain.Sandbox{{SandboxID: "sb-1", Version: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	f, err := os.OpenFile(filepath.Join(dir, "journal.jsonl"), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt line followed by a valid line: not a torn final write.
+	if _, err := f.WriteString("{garbage\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"Sandboxes":[{"SandboxID":"sb-2","Version":1}]}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, err := sandboxmanager.OpenFileStore(dir); err == nil {
+		t.Fatal("corrupt mid-journal line silently accepted")
+	}
+}
+
+// H6 regression: a corrupt snapshot.json is quarantined aside and the store
+// recovers from the journal instead of bricking.
+func TestCorruptSnapshotQuarantinedAndRecovered(t *testing.T) {
+	dir := t.TempDir()
+	store, err := sandboxmanager.OpenFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(sandboxmanager.Tx{Sandboxes: []*domain.Sandbox{{SandboxID: "sb-1", Version: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(sandboxmanager.Tx{Sandboxes: []*domain.Sandbox{{SandboxID: "sb-2", Version: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	if err := os.WriteFile(filepath.Join(dir, "snapshot.json"), []byte("{corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store2, err := sandboxmanager.OpenFileStore(dir)
+	if err != nil {
+		t.Fatalf("corrupt snapshot bricked the store: %v", err)
+	}
+	snap, err := store2.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The journal still holds sb-2; sb-1 was only in the compacted snapshot
+	// and is lost with it — the contract is recovery, not silence.
+	if _, ok := snap.Sandboxes["sb-2"]; !ok {
+		t.Fatal("journal state lost during snapshot quarantine")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "snapshot.json.corrupt")); err != nil {
+		t.Fatal("corrupt snapshot not quarantined aside")
+	}
+	// The store keeps accepting commits after recovery.
+	if err := store2.Commit(sandboxmanager.Tx{Sandboxes: []*domain.Sandbox{{SandboxID: "sb-3", Version: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// H6 regression: compaction is crash-atomic in ordering — after Snapshot()
+// returns, state survives reopen with the journal already truncated, and
+// replaying already-snapshotted journal records (crash between rename and
+// truncate) is idempotent.
+func TestSnapshotCrashOrderingIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	store, err := sandboxmanager.OpenFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(sandboxmanager.Tx{Sandboxes: []*domain.Sandbox{{SandboxID: "sb-1", Version: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	// No .tmp snapshot file may survive a completed Snapshot().
+	if _, err := os.Stat(filepath.Join(dir, "snapshot.json.tmp")); !os.IsNotExist(err) {
+		t.Fatal("snapshot tmp file left behind")
+	}
+	store2, err := sandboxmanager.OpenFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, _ := store2.Load()
+	if got, ok := snap.Sandboxes["sb-1"]; !ok || got.Version != 1 {
+		t.Fatalf("state lost across compaction: %+v", snap.Sandboxes)
+	}
+	// Simulated crash between rename and journal truncate: re-append a
+	// record that is already inside snapshot.json, then reload.
+	store2.Close()
+	journal, err := os.ReadFile(filepath.Join(dir, "journal.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journal) != 0 {
+		t.Fatal("journal not truncated by Snapshot")
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "journal.jsonl"), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"Sandboxes":[{"SandboxID":"sb-1","Version":1}]}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	store3, err := sandboxmanager.OpenFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap3, _ := store3.Load()
+	if got, ok := snap3.Sandboxes["sb-1"]; !ok || got.Version != 1 {
+		t.Fatalf("duplicate replay corrupted state: %+v", snap3.Sandboxes)
+	}
+}

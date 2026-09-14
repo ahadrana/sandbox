@@ -32,6 +32,8 @@ type Faults struct {
 	DropResponses  bool
 	LoseAcks       bool
 	SupervisorDead bool
+	// FailCreate makes Create fail, simulating placement/runtime rejection.
+	FailCreate bool
 	// CorruptCheckpoint makes Restore fail as if checkpoint metadata were
 	// corrupt or incompatible (INV-009 fallback testing).
 	CorruptCheckpoint bool
@@ -81,6 +83,9 @@ func (b *Backend) get(h backendinterface.Handle) (*runtime, error) {
 func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.Faults.FailCreate {
+		return backendinterface.Handle{}, errors.New("injected create failure")
+	}
 	b.runtimes[spec.IncarnationID] = &runtime{
 		spec:        spec,
 		files:       copyFiles(spec.WorkspaceManifest),

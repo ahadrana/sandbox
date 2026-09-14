@@ -52,7 +52,20 @@ func newLocalSupervisor(wsDir, outDir, incarnationID string, wrapper CommandWrap
 	}
 }
 
+// validateExecutionID rejects IDs that could escape the output directory
+// when joined into a file path (the supervisor is the security boundary;
+// execution IDs are caller-controlled).
+func validateExecutionID(id string) error {
+	if id == "" || strings.ContainsAny(id, "/\\\x00") || strings.Contains(id, "..") {
+		return fmt.Errorf("invalid execution ID %q", id)
+	}
+	return nil
+}
+
 func (s *localSupervisor) Exec(req supervisor.ExecRequest) error {
+	if err := validateExecutionID(req.ExecutionID); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	if _, dup := s.execs[req.ExecutionID]; dup {
 		s.mu.Unlock()
@@ -172,6 +185,9 @@ func (s *localSupervisor) Cancel(executionID string) error {
 }
 
 func (s *localSupervisor) ReadOutput(executionID string, stderr bool, offset int64, maxBytes int) (supervisor.OutputChunk, error) {
+	if err := validateExecutionID(executionID); err != nil {
+		return supervisor.OutputChunk{}, err
+	}
 	if maxBytes > supervisor.MaxChunkBytes {
 		return supervisor.OutputChunk{}, supervisor.ErrTooLarge
 	}

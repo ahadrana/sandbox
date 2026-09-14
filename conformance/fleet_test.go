@@ -2,6 +2,7 @@ package conformance
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	sandboxmanager "github.com/agent-sandbox/platform/control-plane/sandbox-manager"
 	"github.com/agent-sandbox/platform/domain"
 	environmentbuilder "github.com/agent-sandbox/platform/environment-builder"
+	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
 	hostagent "github.com/agent-sandbox/platform/runtime/host-agent"
 	localbackend "github.com/agent-sandbox/platform/runtime/local-backend"
 	"github.com/agent-sandbox/platform/workspace"
@@ -359,5 +361,43 @@ func TestPlacementRespectsCapacity(t *testing.T) {
 	}
 	if got := mustGetSandbox2(t, fs.mgr, sb.SandboxID).ObservedState; got == domain.SandboxRunning {
 		t.Fatal("sandbox running without capacity")
+	}
+}
+
+// H8 regression: N concurrent duplicate Creates for the same sandbox+fence
+// yield exactly one incarnation and charge capacity exactly once.
+func TestConcurrentDuplicateCreateAtomic(t *testing.T) {
+	fs := newFleetSystem(t, 1, 4)
+	agent := fs.hosts["host-1"]
+	req := hostagent.CreateRequest{
+		SandboxID: "sb-race", IncarnationID: "inc-race-1", Fence: 3, Epoch: 1,
+		WorkspaceID: createWSForTest(t, fs), WorkspaceGeneration: 1, MemoryBytes: 64,
+	}
+	const n = 16
+	var wg sync.WaitGroup
+	handles := make([]backendinterface.Handle, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			handles[i], errs[i] = agent.Create(req)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+		if handles[i] != handles[0] {
+			t.Fatalf("goroutine %d got a different incarnation: %v vs %v", i, handles[i], handles[0])
+		}
+	}
+	v := agent.View()
+	if v.UsedSlots != 1 {
+		t.Fatalf("slots charged %d times, want 1", v.UsedSlots)
+	}
+	if v.UsedMemory != 64 {
+		t.Fatalf("memory charged %d, want 64", v.UsedMemory)
 	}
 }
