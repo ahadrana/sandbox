@@ -78,6 +78,10 @@ type Config struct {
 	// SupervisorPort is the vsock port the in-guest supervisor listens on;
 	// default 5000.
 	SupervisorPort uint32
+	// ReResolveInterval is how often hostname-based egress policy entries
+	// are re-resolved and the incarnation's chain atomically swapped
+	// (FM4); default 60s, <=0 disables re-resolution.
+	ReResolveInterval time.Duration
 }
 
 func (c *Config) withDefaults() Config {
@@ -109,6 +113,9 @@ func (c *Config) withDefaults() Config {
 	if out.MaxSnapshotsPerIncarnation == 0 {
 		out.MaxSnapshotsPerIncarnation = 3
 	}
+	if out.ReResolveInterval == 0 {
+		out.ReResolveInterval = 60 * time.Second
+	}
 	return out
 }
 
@@ -126,11 +133,16 @@ type incarnation struct {
 	wsMirror  map[string]string
 	dirty     bool
 	ops       map[string]domain.Operation
-	vsockCID  uint32
-	sup       *vsockSupervisor
-	jailed    bool
-	jailRoot  string
-	net       *netState
+	// results caches the last maxCachedResults completed waits so
+	// WaitExecution stays idempotent while inc.ops can be pruned once a
+	// result is observed (FL9: bounded per-incarnation maps).
+	results      map[string]supervisor.Result
+	resultsOrder []string
+	vsockCID     uint32
+	sup          *vsockSupervisor
+	jailed       bool
+	jailRoot     string
+	net          *netState
 	// opMu serializes guest-mutating operations (Exec writes/commands)
 	// against the pause/snapshot window: Snapshot holds it across
 	// pause+snapshotCreate so an Exec either fully lands in the guest before
@@ -138,6 +150,9 @@ type incarnation struct {
 	// never half-applied mid-snapshot (wsMirror/guest divergence, INV-006).
 	opMu sync.Mutex
 }
+
+// maxCachedResults bounds the per-incarnation completed-result cache (FL9).
+const maxCachedResults = 256
 
 // Backend is a Firecracker-microVM RuntimeBackend (IsolationClass VM).
 type Backend struct {
@@ -158,22 +173,36 @@ func (b *Backend) JailerStatus() string {
 	return b.jailerFailed
 }
 
-// New creates a Backend storing incarnation state under cfg.Root.
+// New creates a Backend storing incarnation state under cfg.Root. Startup
+// also sweeps host plumbing leaked by a previous (crashed) backend process
+// (FM11): stale fc-tap-* devices, FC-EGR-*/FC-EGR6-* chains, and jail bind
+// mounts/trees — only resources matching this platform's exact naming
+// conventions, and never a slot registered to a live incarnation of this
+// process.
 func New(cfg Config) (*Backend, error) {
 	c := cfg.withDefaults()
 	if c.KernelPath == "" || c.RootfsPath == "" || c.FirecrackerBin == "" {
 		return nil, fmt.Errorf("firecrackerbackend: KernelPath, RootfsPath and FirecrackerBin are required")
 	}
-	if err := os.MkdirAll(filepath.Join(c.Root, "snapshots"), 0o755); err != nil {
+	// Guest memory and tenant workspace contents live under Root: private
+	// from creation, umask-independent (FM7).
+	if err := os.MkdirAll(c.Root, 0o700); err != nil {
 		return nil, err
 	}
+	os.Chmod(c.Root, 0o700)
+	if err := os.MkdirAll(filepath.Join(c.Root, "snapshots"), 0o700); err != nil {
+		return nil, err
+	}
+	os.Chmod(filepath.Join(c.Root, "snapshots"), 0o700)
 	if c.Networking {
 		if err := checkNetPrereqs(); err != nil {
 			return nil, err
 		}
+		sweepStaleNetworking()
 	}
 	b := &Backend{cfg: c, incs: map[string]*incarnation{}, nextCID: c.VsockBaseCID}
 	if c.JailerBin != "" {
+		b.sweepStaleJails()
 		if err := jailerProbe(c.JailerBin); err != nil {
 			b.jailerFailed = err.Error()
 			fmt.Fprintf(os.Stderr, "firecrackerbackend: jailer disabled, using raw spawns: %v\n", err)
@@ -228,9 +257,10 @@ func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, e
 		return backendinterface.Handle{}, fmt.Errorf("firecrackerbackend: incarnation %q already exists", spec.IncarnationID)
 	}
 	dir := filepath.Join(b.cfg.Root, spec.IncarnationID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return backendinterface.Handle{}, err
 	}
+	os.Chmod(dir, 0o700)
 	fail := func(err error) (backendinterface.Handle, error) {
 		if inc := b.incs[spec.IncarnationID]; inc != nil && inc.net != nil {
 			releaseSlot(inc.id, inc.net)
@@ -243,6 +273,7 @@ func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, e
 	if err := copyFile(rootfs, b.cfg.RootfsPath); err != nil {
 		return fail(err)
 	}
+	os.Chmod(rootfs, 0o600)
 	if err := injectWorkspaceUnit(rootfs); err != nil {
 		return fail(err)
 	}
@@ -257,13 +288,14 @@ func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, e
 		dir:      dir,
 		wsMirror: map[string]string{},
 		ops:      map[string]domain.Operation{},
+		results:  map[string]supervisor.Result{},
 	}
 	for k, v := range spec.WorkspaceManifest {
 		inc.wsMirror[k] = v
 	}
 	b.incs[spec.IncarnationID] = inc
 	if b.cfg.Networking {
-		if err := b.allocateNetworking(inc, preferredSlot(spec.IncarnationID)); err != nil {
+		if err := b.allocateNetworkingLocked(inc, preferredSlot(spec.IncarnationID)); err != nil {
 			delete(b.incs, spec.IncarnationID)
 			os.RemoveAll(dir)
 			return backendinterface.Handle{}, err
@@ -275,6 +307,7 @@ func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, e
 	if err := buildWorkspaceImage(filepath.Join(dir, "workspace.img"), spec.WorkspaceManifest); err != nil {
 		return fail(err)
 	}
+	os.Chmod(filepath.Join(dir, "workspace.img"), 0o600)
 	return backendinterface.Handle{IncarnationID: spec.IncarnationID}, nil
 }
 
@@ -287,13 +320,16 @@ func (b *Backend) spawn(inc *incarnation) error {
 	if b.jailerUsable() {
 		root, err := b.prepareJail(inc)
 		if err == nil {
+			b.mu.Lock()
 			inc.jailed = true
 			inc.jailRoot = root
+			b.mu.Unlock()
 			cmd, console, err = b.spawnJailed(inc, b.layoutFor(inc))
 		}
 		if err != nil {
-			inc.jailed = false
-			inc.jailRoot = ""
+			// FL12: a failed jailed spawn must not strand the prepared
+			// jail tree before the raw fallback runs.
+			b.cleanupJail(inc)
 			b.mu.Lock()
 			b.jailerFailed = err.Error()
 			b.mu.Unlock()
@@ -305,7 +341,7 @@ func (b *Backend) spawn(inc *incarnation) error {
 	if cmd == nil {
 		var err error
 		os.Remove(l.hostSock)
-		console, err = os.OpenFile(filepath.Join(inc.dir, "console.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		console, err = os.OpenFile(filepath.Join(inc.dir, "console.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 		if err != nil {
 			return err
 		}
@@ -337,7 +373,7 @@ func (b *Backend) spawn(inc *incarnation) error {
 		case <-time.After(50 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
-			b.killProc(inc)
+			b.stopProc(inc)
 			return fmt.Errorf("timeout waiting for firecracker API socket")
 		}
 	}
@@ -373,8 +409,8 @@ func (b *Backend) configureNew(inc *incarnation) error {
 	if err := api.addDrive("workspace", l.apiWS, false, false); err != nil {
 		return err
 	}
-	if inc.net != nil {
-		if err := api.addNIC("eth0", inc.net.tap, inc.net.mac); err != nil {
+	if ns := b.netOf(inc); ns != nil {
+		if err := api.addNIC("eth0", ns.tap, ns.mac); err != nil {
 			return err
 		}
 	}
@@ -485,7 +521,7 @@ func (b *Backend) Start(h backendinterface.Handle) error {
 		}
 	}
 	fail := func(err error) error {
-		b.killProc(inc)
+		b.stopProc(inc)
 		b.teardownNetworking(inc)
 		return err
 	}
@@ -628,42 +664,61 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 	ts := fmt.Sprint(time.Now().UnixNano())
 	snapRoot := b.snapshotDir(inc.id)
 	snapDir := filepath.Join(snapRoot, ts)
-	if err := os.MkdirAll(snapDir, 0o755); err != nil {
+	// FL6: a failed snapshot must not wedge the VM: resume it when we
+	// paused it (best-effort) and remove the partial snapshot dir so it is
+	// never counted toward GC or mistaken for a restorable checkpoint.
+	fail := func(err error) (backendinterface.CheckpointData, error) {
+		if wasRunning {
+			b.Resume(h)
+		}
+		os.RemoveAll(snapDir)
 		return backendinterface.CheckpointData{}, err
 	}
+	if err := os.MkdirAll(snapDir, 0o700); err != nil {
+		return backendinterface.CheckpointData{}, err
+	}
+	os.Chmod(snapDir, 0o700) // guest memory lands here (FM7)
 	// Disk state must be captured alongside memory: copy both drives while
 	// the VM is paused (reflink where the fs supports it).
 	if err := copyFile(filepath.Join(snapDir, "rootfs.ext4"), filepath.Join(inc.dir, "rootfs.ext4")); err != nil {
-		return backendinterface.CheckpointData{}, err
+		return fail(err)
 	}
+	os.Chmod(filepath.Join(snapDir, "rootfs.ext4"), 0o600)
 	if err := copyFile(filepath.Join(snapDir, "workspace.img"), filepath.Join(inc.dir, "workspace.img")); err != nil {
-		return backendinterface.CheckpointData{}, err
+		return fail(err)
 	}
+	os.Chmod(filepath.Join(snapDir, "workspace.img"), 0o600)
 	memPath := filepath.Join(snapDir, "mem.file")
 	statePath := filepath.Join(snapDir, "vm.state")
 	if inc.jailed {
 		// A jailed VMM can only write inside its chroot: share the
 		// incarnation's snapshot dir via bind mount.
 		if err := bindMount(snapRoot, filepath.Join(inc.jailRoot, "snap")); err != nil {
-			return backendinterface.CheckpointData{}, err
+			return fail(err)
 		}
 		memPath = "/snap/" + ts + "/mem.file"
 		statePath = "/snap/" + ts + "/vm.state"
 	}
-	if err := b.api(inc).snapshotCreate(memPath, statePath); err != nil {
-		return backendinterface.CheckpointData{}, err
+	if err := b.snapshotCreateHook(inc, memPath, statePath); err != nil {
+		return fail(err)
 	}
+	// The VMM (possibly root via the jailer) wrote these: force owner-only
+	// permissions on the full guest memory image and vCPU state (FM7).
+	os.Chmod(filepath.Join(snapDir, "mem.file"), 0o600)
+	os.Chmod(filepath.Join(snapDir, "vm.state"), 0o600)
 	meta := snapshotMeta{Spec: inc.spec, CreatedAt: time.Now()}
+	b.mu.Lock()
 	if inc.net != nil {
 		slot := inc.net.slot
 		meta.NetSlot = &slot
 	}
+	b.mu.Unlock()
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
-		return backendinterface.CheckpointData{}, err
+		return fail(err)
 	}
-	if err := os.WriteFile(filepath.Join(snapDir, "meta.json"), metaBytes, 0o644); err != nil {
-		return backendinterface.CheckpointData{}, err
+	if err := os.WriteFile(filepath.Join(snapDir, "meta.json"), metaBytes, 0o600); err != nil {
+		return fail(err)
 	}
 	b.gcSnapshots(inc.id)
 	b.mu.Lock()
@@ -680,6 +735,19 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 			"snapshot_dir": snapDir,
 		},
 	}, nil
+}
+
+// snapshotCreateFault, when set, fails the next snapshotCreate calls (FL6
+// regression test hook).
+var snapshotCreateFault func() error
+
+func (b *Backend) snapshotCreateHook(inc *incarnation, memPath, statePath string) error {
+	if snapshotCreateFault != nil {
+		if err := snapshotCreateFault(); err != nil {
+			return err
+		}
+	}
+	return b.api(inc).snapshotCreate(memPath, statePath)
 }
 
 // Restore boots a fresh firecracker process from a full snapshot taken by
@@ -703,13 +771,20 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 	}
 	b.mu.Lock()
 	inc, ok := b.incs[cp.IncarnationID]
-	if ok && !inc.dead && inc.cmd != nil {
-		b.killProcLocked(inc)
-	}
 	if !ok {
-		inc = &incarnation{id: cp.IncarnationID, ops: map[string]domain.Operation{}, wsMirror: map[string]string{}}
+		inc = &incarnation{id: cp.IncarnationID, ops: map[string]domain.Operation{}, results: map[string]supervisor.Result{}, wsMirror: map[string]string{}}
 		b.incs[cp.IncarnationID] = inc
 	}
+	b.mu.Unlock()
+	// Crash-recovery path (INV-009): reap any still-running VMM and fully
+	// clean its jail state BEFORE re-jailing (FM6) — the stale /snap bind
+	// mount and jail tree must go, or repeated jailed restores stack
+	// mounts and fail prepareJail's RemoveAll with EBUSY.
+	if ok {
+		b.stopProc(inc)
+		b.cleanupJail(inc)
+	}
+	b.mu.Lock()
 	inc.spec = meta.Spec
 	inc.dead = false
 	inc.paused = false
@@ -721,8 +796,6 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 	inc.vsockCID = b.nextCID
 	dir := filepath.Join(b.cfg.Root, cp.IncarnationID)
 	inc.dir = dir
-	inc.jailed = false
-	inc.jailRoot = ""
 	b.mu.Unlock()
 
 	// Networking: reallocate the slot recorded in the snapshot metadata so
@@ -734,7 +807,10 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 		if meta.NetSlot != nil {
 			preferred = *meta.NetSlot
 		}
-		if err := b.allocateNetworking(inc, preferred); err != nil {
+		b.mu.Lock()
+		err := b.allocateNetworkingLocked(inc, preferred)
+		b.mu.Unlock()
+		if err != nil {
 			return backendinterface.Handle{}, err
 		}
 		if err := b.setupNetworking(inc); err != nil {
@@ -742,21 +818,24 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 		}
 	}
 	fail := func(err error) error {
-		b.killProc(inc)
+		b.stopProc(inc)
 		b.teardownNetworking(inc)
 		b.cleanupJail(inc)
 		return err
 	}
 	os.RemoveAll(dir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return backendinterface.Handle{}, err
 	}
+	os.Chmod(dir, 0o700)
 	if err := copyFile(filepath.Join(dir, "rootfs.ext4"), filepath.Join(snapDir, "rootfs.ext4")); err != nil {
 		return backendinterface.Handle{}, fail(err)
 	}
+	os.Chmod(filepath.Join(dir, "rootfs.ext4"), 0o600)
 	if err := copyFile(filepath.Join(dir, "workspace.img"), filepath.Join(snapDir, "workspace.img")); err != nil {
 		return backendinterface.Handle{}, fail(err)
 	}
+	os.Chmod(filepath.Join(dir, "workspace.img"), 0o600)
 	if err := b.spawn(inc); err != nil {
 		return backendinterface.Handle{}, fail(err)
 	}
@@ -794,32 +873,35 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 	return backendinterface.Handle{IncarnationID: cp.IncarnationID}, nil
 }
 
-func (b *Backend) killProcLocked(inc *incarnation) {
-	if inc.cmd != nil && inc.cmd.Process != nil && inc.exited != nil {
-		select {
-		case <-inc.exited:
-		default:
-			if inc.jailed {
-				// sudo+jailer+firecracker run in their own process
-				// group (Setpgid at spawn).
-				killProcessGroup(inc.cmd.Process.Pid)
-			} else {
-				inc.cmd.Process.Kill()
-			}
-			select {
-			case <-inc.exited:
-			case <-time.After(5 * time.Second):
-			}
-		}
-	}
+// stopProc SIGKILLs and reaps the VMM process. Fields are swapped under
+// b.mu, but the (up to 5s) exit wait runs WITHOUT the lock so a stuck VMM
+// never stalls other incarnations (FL7). Idempotent: the process handle is
+// nil-ed under the lock, so concurrent callers no-op.
+func (b *Backend) stopProc(inc *incarnation) {
+	b.mu.Lock()
+	cmd, exited, jailed := inc.cmd, inc.exited, inc.jailed
 	inc.cmd = nil
 	inc.sup = nil
-}
-
-func (b *Backend) killProc(inc *incarnation) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.killProcLocked(inc)
+	b.mu.Unlock()
+	if cmd == nil || cmd.Process == nil || exited == nil {
+		return
+	}
+	select {
+	case <-exited:
+		return
+	default:
+	}
+	if jailed {
+		// sudo+jailer+firecracker run in their own process group (Setpgid
+		// at spawn).
+		killProcessGroup(cmd.Process.Pid)
+	} else {
+		cmd.Process.Kill()
+	}
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+	}
 }
 
 // Terminate SIGKILLs the VMM process, reaps it, tears down networking and
@@ -827,13 +909,15 @@ func (b *Backend) killProc(inc *incarnation) {
 // <root>/snapshots are retained unless DeleteSnapshotsOnTerminate is set.
 func (b *Backend) Terminate(h backendinterface.Handle) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	inc, ok := b.incs[h.IncarnationID]
+	if ok {
+		inc.dead = true
+	}
+	b.mu.Unlock()
 	if !ok {
 		return nil
 	}
-	b.killProcLocked(inc)
-	inc.dead = true
+	b.stopProc(inc)
 	b.teardownNetworking(inc)
 	b.cleanupJail(inc)
 	if b.cfg.DeleteSnapshotsOnTerminate {
@@ -894,13 +978,15 @@ func (b *Backend) Alive(h backendinterface.Handle) bool {
 // working directory (uncommitted state) destroyed. Snapshots survive.
 func (b *Backend) KillRuntime(h backendinterface.Handle) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	inc, ok := b.incs[h.IncarnationID]
+	if ok {
+		inc.dead = true
+	}
+	b.mu.Unlock()
 	if !ok {
 		return
 	}
-	b.killProcLocked(inc)
-	inc.dead = true
+	b.stopProc(inc)
 	b.teardownNetworking(inc)
 	b.cleanupJail(inc)
 	os.RemoveAll(inc.dir)
@@ -910,10 +996,14 @@ func (b *Backend) KillRuntime(h backendinterface.Handle) {
 // host-agent shutdown).
 func (b *Backend) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	incs := make([]*incarnation, 0, len(b.incs))
 	for _, inc := range b.incs {
-		b.killProcLocked(inc)
 		inc.dead = true
+		incs = append(incs, inc)
+	}
+	b.mu.Unlock()
+	for _, inc := range incs {
+		b.stopProc(inc)
 		b.teardownNetworking(inc)
 		b.cleanupJail(inc)
 	}
@@ -1033,12 +1123,19 @@ func (b *Backend) Exec(h backendinterface.Handle, executionID string, op domain.
 
 // WaitExecution blocks until the operation's command exits in the guest and
 // returns its result; operations without a command complete immediately.
+// Completed results are cached (bounded, maxCachedResults) and the live op
+// entry pruned, so per-incarnation maps stay bounded (FL9) while repeat
+// waits (reconciler, duplicate CompleteExecution) stay idempotent.
 func (b *Backend) WaitExecution(h backendinterface.Handle, executionID string) (supervisor.Result, error) {
 	b.mu.Lock()
 	inc, err := b.get(h)
 	if err != nil {
 		b.mu.Unlock()
 		return supervisor.Result{}, err
+	}
+	if res, done := inc.results[executionID]; done {
+		b.mu.Unlock()
+		return res, nil
 	}
 	op, known := inc.ops[executionID]
 	sup, supErr := b.supFor(inc)
@@ -1052,7 +1149,20 @@ func (b *Backend) WaitExecution(h backendinterface.Handle, executionID string) (
 	if supErr != nil {
 		return supervisor.Result{}, supErr
 	}
-	return sup.Wait(executionID)
+	res, err := sup.Wait(executionID)
+	if err != nil {
+		return supervisor.Result{}, err
+	}
+	b.mu.Lock()
+	delete(inc.ops, executionID)
+	inc.results[executionID] = res
+	inc.resultsOrder = append(inc.resultsOrder, executionID)
+	for len(inc.resultsOrder) > maxCachedResults {
+		delete(inc.results, inc.resultsOrder[0])
+		inc.resultsOrder = inc.resultsOrder[1:]
+	}
+	b.mu.Unlock()
+	return res, nil
 }
 
 // WorkspaceFiles reads the live guest /workspace through the supervisor when

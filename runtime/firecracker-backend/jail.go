@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Jailer support (ADR-0001 hardening gate): when Config.JailerBin is set,
@@ -83,15 +84,26 @@ func linkOrCopy(dst, src string) error {
 
 // prepareJail builds the jailer chroot layout for inc and returns the jail
 // root. Drive files are hardlinked from the incarnation dir (no extra 300MB
-// copies).
+// copies). A stale jail tree (crash leftover) is unmounted and removed
+// first; removal errors are NOT ignored (FM6).
 func (b *Backend) prepareJail(inc *incarnation) (string, error) {
 	base := b.cfg.ChrootBase
 	if base == "" {
 		base = filepath.Join(b.cfg.Root, "jails")
 	}
 	root := filepath.Join(base, "firecracker", inc.id, "root")
-	os.RemoveAll(filepath.Join(base, "firecracker", inc.id))
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	jailDir := filepath.Join(base, "firecracker", inc.id)
+	// A leftover /snap bind mount makes RemoveAll fail with EBUSY: unmount
+	// first (best-effort), then remove, and treat a remaining failure as
+	// fatal rather than stacking state on a dirty tree.
+	unmountRetry(filepath.Join(root, "snap"))
+	if err := os.RemoveAll(jailDir); err != nil {
+		sudo("rm", "-rf", jailDir).Run()
+		if _, serr := os.Stat(jailDir); serr == nil {
+			return "", fmt.Errorf("stale jail tree %s not removable: %v", jailDir, err)
+		}
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", err
 	}
 	if err := linkOrCopy(filepath.Join(root, "vmlinux"), b.cfg.KernelPath); err != nil {
@@ -109,7 +121,7 @@ func (b *Backend) prepareJail(inc *incarnation) (string, error) {
 // spawnJailed starts the VMM through the jailer. The jailer runs via
 // passwordless sudo and drops privileges to the current uid/gid.
 func (b *Backend) spawnJailed(inc *incarnation, l vmmLayout) (*exec.Cmd, *os.File, error) {
-	console, err := os.OpenFile(filepath.Join(inc.dir, "console.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	console, err := os.OpenFile(filepath.Join(inc.dir, "console.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -151,8 +163,15 @@ func jailerProbe(bin string) error {
 }
 
 // bindMount bind-mounts hostDir onto target (snapshot sharing into a jail).
+// Idempotent: the per-incarnation <jail>/snap mount survives from Restore
+// through later Snapshots of the same incarnation, and mount --bind onto an
+// occupied mountpoint STACKS rather than replacing — so an existing mount
+// is reused, never stacked (FM6).
 func bindMount(hostDir, target string) error {
-	if err := os.MkdirAll(target, 0o755); err != nil {
+	if mountpointPresent(target) {
+		return nil
+	}
+	if err := os.MkdirAll(target, 0o700); err != nil {
 		return err
 	}
 	if out, err := sudo("mount", "--bind", hostDir, target).CombinedOutput(); err != nil {
@@ -164,17 +183,58 @@ func bindMount(hostDir, target string) error {
 	return nil
 }
 
-func unmount(target string) {
-	sudo("umount", "-l", target).Run()
+// mountpointPresent reports whether target appears in this process's mount
+// table.
+func mountpointPresent(target string) bool {
+	data, err := os.ReadFile("/proc/self/mounts")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == target {
+			return true
+		}
+	}
+	return false
+}
+
+// unmountRetry lazy-detaches target, retrying briefly: the bind mount lives
+// in a shared peer group with the jailer's mount namespace, and that
+// namespace's teardown lags the jailer's death (RCU) — an immediate umount
+// can fail EINVAL while the peer reference settles (FM6). A mount that
+// survives all retries is logged loudly, never silently stacked.
+func unmountRetry(target string) {
+	if !mountpointPresent(target) {
+		return
+	}
+	var last []byte
+	for i := 0; i < 20; i++ {
+		out, err := sudo("umount", "-l", target).CombinedOutput()
+		if err == nil || strings.Contains(string(out), "not mounted") {
+			return
+		}
+		last = out
+		time.Sleep(50 * time.Millisecond)
+	}
+	if mountpointPresent(target) {
+		fmt.Fprintf(os.Stderr, "firecrackerbackend: umount %s failed after retries: %s\n", target, last)
+	}
 }
 
 // cleanupJail unmounts the snapshot bind mount and removes the jail tree
-// for inc. Safe to call on non-jailed incarnations.
+// for inc. Safe to call on non-jailed incarnations. The inc.jailRoot swap
+// happens under b.mu (FL12); the blocking umount/rm do not (FL7).
 func (b *Backend) cleanupJail(inc *incarnation) {
-	if inc.jailRoot == "" {
+	b.mu.Lock()
+	root := inc.jailRoot
+	inc.jailRoot = ""
+	inc.jailed = false
+	b.mu.Unlock()
+	if root == "" {
 		return
 	}
-	unmount(filepath.Join(inc.jailRoot, "snap"))
+	unmountRetry(filepath.Join(root, "snap"))
 	base := b.cfg.ChrootBase
 	if base == "" {
 		base = filepath.Join(b.cfg.Root, "jails")
@@ -185,6 +245,43 @@ func (b *Backend) cleanupJail(inc *incarnation) {
 	if err := os.RemoveAll(jailDir); err != nil {
 		sudo("rm", "-rf", jailDir).Run()
 	}
-	inc.jailRoot = ""
-	inc.jailed = false
+}
+
+// sweepStaleJails reclaims jail state leaked by a crashed backend process
+// (FM11): any /snap bind mount under the chroot base recorded in
+// /proc/mounts is unmounted, then every jail tree matching the incarnation
+// naming convention is removed. Errors are logged loudly, never fatal.
+func (b *Backend) sweepStaleJails() {
+	base := b.cfg.ChrootBase
+	if base == "" {
+		base = filepath.Join(b.cfg.Root, "jails")
+	}
+	if data, err := os.ReadFile("/proc/mounts"); err == nil {
+		prefix := filepath.Join(base, "firecracker") + "/"
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			mp := fields[1]
+			if strings.HasPrefix(mp, prefix) && strings.HasSuffix(mp, "/snap") {
+				fmt.Fprintf(os.Stderr, "firecrackerbackend: crash sweep: unmounting stale jail bind %s\n", mp)
+				unmountRetry(mp)
+			}
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(base, "firecracker"))
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || validateIncarnationID(e.Name()) != nil {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "firecrackerbackend: crash sweep: removing stale jail tree %s\n", e.Name())
+		dir := filepath.Join(base, "firecracker", e.Name())
+		if err := os.RemoveAll(dir); err != nil {
+			sudo("rm", "-rf", dir).Run()
+		}
+	}
 }

@@ -8,10 +8,13 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"syscall"
+	"time"
 
 	"github.com/agent-sandbox/platform/runtime/guest-supervisor"
 )
@@ -52,9 +55,18 @@ func main() {
 	for {
 		conn, err := ln.accept()
 		if err != nil {
+			// FL5: fd exhaustion must back off, not hot-spin.
+			if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+				log.Printf("accept: %v (fd exhaustion; backing off)", err)
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
 			log.Printf("accept: %v", err)
 			continue
 		}
+		// FL5: a stalled peer gets 30s to deliver its first frame before the
+		// connection (goroutine + fd + busy-poll vCPU) is reclaimed.
+		conn.deadline = time.Now().Add(30 * time.Second)
 		go serveConn(agent, conn)
 	}
 }
@@ -68,6 +80,7 @@ func serveConn(agent *agent, conn *vsockConn) {
 		log.Printf("read request: %v", err)
 		return
 	}
+	conn.deadline = time.Time{} // first frame received; long Waits may idle
 	resp := agent.dispatch(req)
 	if err := supervisor.WriteFrame(conn, resp); err != nil {
 		log.Printf("write response: %v", err)

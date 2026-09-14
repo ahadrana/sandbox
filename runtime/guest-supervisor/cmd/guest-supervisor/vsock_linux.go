@@ -33,12 +33,20 @@ const (
 
 type vsockListener struct{ fd int }
 
-type vsockConn struct{ fd int }
+type vsockConn struct {
+	fd int
+	// deadline bounds how long Read may go without data (idle timeout,
+	// FL5); zero means no deadline. Set for the first-frame window only.
+	deadline time.Time
+}
 
 func (c *vsockConn) Read(p []byte) (int, error) {
 	for {
 		n, err := syscall.Read(c.fd, p)
 		if err == eagain {
+			if !c.deadline.IsZero() && time.Now().After(c.deadline) {
+				return 0, fmt.Errorf("vsock idle timeout waiting for data")
+			}
 			time.Sleep(time.Millisecond)
 			continue
 		}
@@ -132,6 +140,7 @@ func debugDial(cid, port uint32) error {
 	if err != nil {
 		return err
 	}
+	defer syscall.Close(fd) // FL13
 	raw := sockaddrVM(port, cid)
 	for {
 		_, _, errno := syscall.RawSyscall(syscall.SYS_CONNECT, uintptr(fd), uintptr(unsafe.Pointer(raw)), 16)

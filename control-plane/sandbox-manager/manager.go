@@ -567,6 +567,9 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 		return err
 	}
 	if err := m.rt.Start(h); err != nil {
+		// Mirror the startup-failure path: never leave a half-started
+		// incarnation (net state, VMM) lingering (FL11).
+		m.rt.Terminate(h)
 		return err
 	}
 	if err := m.runStartupLocked(sb, h, incID); err != nil {

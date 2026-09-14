@@ -79,7 +79,13 @@ func buildGuestSupervisor(t *testing.T) string {
 		}
 		path := filepath.Join(dir, "guest-supervisor")
 		cmd := exec.Command("go", "build", "-o", path, "github.com/agent-sandbox/platform/runtime/guest-supervisor/cmd/guest-supervisor")
-		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=arm64")
+		// Build for the test host's arch (the microVM runs the same arch);
+		// FC_GUEST_GOARCH overrides for cross-arch setups (FL10).
+		goarch := os.Getenv("FC_GUEST_GOARCH")
+		if goarch == "" {
+			goarch = runtime.GOARCH
+		}
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+goarch)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			guestSupervisorBin.err = fmt.Errorf("build guest-supervisor: %v: %s", err, out)
 			return
@@ -877,14 +883,14 @@ func TestNetworkSlotCollision(t *testing.T) {
 		return &incarnation{id: id, spec: egressSpec(id, network.EgressPolicy{DefaultAllow: true}), ops: map[string]domain.Operation{}}
 	}
 	inc1 := mkInc(ids[0])
-	if err := b.allocateNetworking(inc1, preferredSlot(inc1.id)); err != nil {
+	if err := b.allocateNetworkingLocked(inc1, preferredSlot(inc1.id)); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.setupNetworking(inc1); err != nil {
 		t.Fatal(err)
 	}
 	inc2 := mkInc(ids[1])
-	if err := b.allocateNetworking(inc2, preferredSlot(inc2.id)); err != nil {
+	if err := b.allocateNetworkingLocked(inc2, preferredSlot(inc2.id)); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.setupNetworking(inc2); err != nil {
@@ -903,13 +909,13 @@ func TestNetworkSlotCollision(t *testing.T) {
 	}
 	// Exhaustion: a third colliding incarnation must error, never clobber.
 	inc3 := mkInc(ids[0] + "-third")
-	if err := b.allocateNetworking(inc3, preferredSlot(inc1.id)); err == nil {
+	if err := b.allocateNetworkingLocked(inc3, preferredSlot(inc1.id)); err == nil {
 		t.Fatal("allocator handed out an occupied slot")
 	}
 	b.teardownNetworking(inc1)
 	b.teardownNetworking(inc2)
 	// Slots are released: the third allocation now succeeds.
-	if err := b.allocateNetworking(inc3, preferredSlot(inc1.id)); err != nil {
+	if err := b.allocateNetworkingLocked(inc3, preferredSlot(inc1.id)); err != nil {
 		t.Fatalf("slot not released after teardown: %v", err)
 	}
 	b.teardownNetworking(inc3)
@@ -1338,5 +1344,287 @@ func TestWedgedSupervisorWaitReturns(t *testing.T) {
 	}
 	if err := b.Terminate(h); err != nil {
 		t.Fatalf("Terminate after wedged wait: %v", err)
+	}
+}
+
+// FM6: Restore after a crash-style kill must fully clean the stale jail
+// (unmount the /snap bind, remove the jail tree) before re-jailing —
+// repeated jailed restores must never stack mounts.
+func TestJailedRestoreCleansStaleJail(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.GuestSupervisorBin = buildGuestSupervisor(t)
+	cfg.JailerBin = os.Getenv("JAILER_BIN")
+	if cfg.JailerBin == "" {
+		cfg.JailerBin = "/usr/local/bin/jailer"
+	}
+	cfg.ChrootBase = filepath.Join(t.TempDir(), "jails")
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	if s := b.JailerStatus(); s != "" {
+		t.Skipf("jailer not usable on this host: %s", s)
+	}
+	h, err := b.Create(createSpec("inc-jr", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start (jailed): %v", err)
+	}
+	if b.JailerStatus() != "" {
+		t.Fatalf("jailer fell back to raw spawn: %s", b.JailerStatus())
+	}
+	snapMounts := func() int {
+		data, err := os.ReadFile("/proc/self/mountinfo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 5 && strings.HasPrefix(fields[4], cfg.ChrootBase) && strings.HasSuffix(fields[4], "/snap") {
+				t.Logf("snap mount: %s", line)
+				n++
+			}
+		}
+		return n
+	}
+	crashKill := func() {
+		b.mu.Lock()
+		inc := b.incs["inc-jr"]
+		b.mu.Unlock()
+		b.stopProc(inc) // VMM dies; jail tree + /snap bind stay (crash)
+	}
+	for round := 1; round <= 2; round++ {
+		cp, err := b.Snapshot(h)
+		if err != nil {
+			t.Fatalf("Snapshot round %d: %v", round, err)
+		}
+		if got := snapMounts(); got != 1 {
+			t.Fatalf("round %d: %d snap mounts after Snapshot, want 1", round, got)
+		}
+		crashKill()
+		if got := snapMounts(); got != 1 {
+			t.Fatalf("round %d: %d snap mounts after crash kill, want 1 (leak pre-state)", round, got)
+		}
+		if _, err := b.Restore(cp); err != nil {
+			t.Fatalf("Restore round %d: %v", round, err)
+		}
+		// Exactly one: the stale bind from before the crash was unmounted
+		// (FM6), and Restore created a fresh one for snapshotLoad. Two
+		// would mean the old jail leaked and mounts stacked.
+		if got := snapMounts(); got != 1 {
+			t.Fatalf("round %d: %d snap mounts after Restore, want exactly 1 (stacked or missing)", round, got)
+		}
+		res := execOp(t, b, h, fmt.Sprintf("jr-%d", round), "echo jailed-restore")
+		if res.ExitCode != 0 {
+			t.Fatalf("exec after jailed restore round %d failed", round)
+		}
+	}
+}
+
+// FM7: guest memory, drives, and tenant workspace artifacts are owner-only
+// (0700 dirs / 0600 files), umask-independent.
+func TestArtifactPermissions(t *testing.T) {
+	b := newBackend(t)
+	h, err := b.Create(createSpec("inc-perm", map[string]string{"a.txt": "A"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Terminate(h)
+	cp, err := b.Snapshot(h)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	mode := func(path string) os.FileMode {
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		return st.Mode().Perm()
+	}
+	root := b.cfg.Root
+	incDir := filepath.Join(root, "inc-perm")
+	snapDir := cp.Metadata["snapshot_dir"]
+	for path, want := range map[string]os.FileMode{
+		root:                                    0o700,
+		filepath.Join(root, "snapshots"):        0o700,
+		incDir:                                  0o700,
+		filepath.Join(incDir, "console.log"):    0o600,
+		filepath.Join(incDir, "rootfs.ext4"):    0o600,
+		filepath.Join(incDir, "workspace.img"):  0o600,
+		snapDir:                                 0o700,
+		filepath.Join(snapDir, "rootfs.ext4"):   0o600,
+		filepath.Join(snapDir, "workspace.img"): 0o600,
+		filepath.Join(snapDir, "mem.file"):      0o600,
+		filepath.Join(snapDir, "vm.state"):      0o600,
+		filepath.Join(snapDir, "meta.json"):     0o600,
+	} {
+		if got := mode(path); got != want {
+			t.Errorf("%s mode = %o, want %o", path, got, want)
+		}
+	}
+}
+
+// FM11: a backend process crash leaks TAPs/chains; the next New() sweeps
+// exactly those (platform-named) leftovers.
+func TestCrashRecoverySweep(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.GuestSupervisorBin = buildGuestSupervisor(t)
+	cfg.Networking = true
+	b1, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No b1.Close: it "crashes" below. Fallback safety net via b2's sweep.
+	h, err := b1.Create(egressSpec("inc-sweep", network.EgressPolicy{DefaultAllow: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b1.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	b1.mu.Lock()
+	inc := b1.incs["inc-sweep"]
+	ns := inc.net
+	b1.mu.Unlock()
+	if ns == nil {
+		t.Fatal("no network state")
+	}
+	t.Cleanup(func() { cleanupNetDevices(ns) })
+	if err := exec.Command("ip", "link", "show", ns.tap).Run(); err != nil {
+		t.Fatalf("TAP %s missing after Start", ns.tap)
+	}
+	// Crash: VMM dies, plumbing stays; the process-local slot registration
+	// dies with the process (simulated by clearing it).
+	b1.stopProc(inc)
+	slotAlloc.Lock()
+	delete(slotAlloc.used, ns.slot)
+	slotAlloc.Unlock()
+
+	b2, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b2.Close() })
+	if err := exec.Command("ip", "link", "show", ns.tap).Run(); err == nil {
+		t.Fatalf("stale TAP %s survived New() sweep", ns.tap)
+	}
+	for _, chain := range []string{ns.chain, ns.chain6} {
+		bin := "iptables"
+		if strings.HasPrefix(chain, egressChain6Pfx) {
+			bin = "ip6tables"
+		}
+		if out, err := sudo(bin, "-S", chain).CombinedOutput(); err == nil {
+			t.Fatalf("stale chain %s survived New() sweep: %s", chain, out)
+		}
+	}
+}
+
+// FM4: hostname policy entries are re-resolved periodically and the chain
+// swapped atomically — after several ticks the resolved rules are intact
+// and no tmp chain leaks.
+func TestHostnamePolicyReResolve(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.GuestSupervisorBin = buildGuestSupervisor(t)
+	cfg.Networking = true
+	cfg.ReResolveInterval = time.Second
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	h, err := b.Create(egressSpec("inc-reresolve", network.EgressPolicy{
+		DefaultAllow: true,
+		Deny:         []string{"localhost"},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	b.mu.Lock()
+	ns := b.incs["inc-reresolve"].net
+	b.mu.Unlock()
+	if ns == nil {
+		t.Fatal("no network state")
+	}
+	chainHas := func() (denyLocal, tmpLeaked bool) {
+		out, err := sudo("iptables", "-S", ns.chain).CombinedOutput()
+		if err != nil {
+			return false, false
+		}
+		denyLocal = strings.Contains(string(out), "127.0.0.1")
+		_, tmpErr := sudo("iptables", "-S", ns.chain+".tmp").CombinedOutput()
+		tmpLeaked = tmpErr == nil
+		return denyLocal, tmpLeaked
+	}
+	if deny, _ := chainHas(); !deny {
+		t.Fatal("localhost deny not resolved at setup")
+	}
+	// Let several re-resolve ticks run; the swap must keep rules intact.
+	time.Sleep(3500 * time.Millisecond)
+	deny, tmp := chainHas()
+	if !deny {
+		t.Fatal("localhost deny lost after re-resolve swap")
+	}
+	if tmp {
+		t.Fatal("tmp chain leaked after re-resolve swap")
+	}
+	// The jump still targets the real chain.
+	out, err := sudo("iptables", "-S", "FORWARD").CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "-j "+ns.chain) {
+		t.Fatalf("FORWARD jump missing after swaps: %v %s", err, out)
+	}
+}
+
+// FL6: an injected snapshotCreate failure resumes the VM and removes the
+// partial snapshot dir (never counted toward GC).
+func TestSnapshotFailureResumesAndCleans(t *testing.T) {
+	b := newBackend(t)
+	h, err := b.Create(createSpec("inc-snapfail", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Terminate(h)
+	snapshotCreateFault = func() error { return fmt.Errorf("injected snapshot failure") }
+
+	if _, err := b.Snapshot(h); err == nil {
+		t.Fatal("Snapshot succeeded despite injected fault")
+	}
+	snapshotCreateFault = nil
+	b.mu.Lock()
+	inc := b.incs["inc-snapfail"]
+	paused := inc.paused
+	b.mu.Unlock()
+	if paused {
+		t.Fatal("VM left paused after failed Snapshot")
+	}
+	if !b.Alive(h) {
+		t.Fatal("VM dead after failed Snapshot")
+	}
+	entries, _ := os.ReadDir(b.snapshotDir("inc-snapfail"))
+	if len(entries) != 0 {
+		t.Fatalf("partial snapshot dir retained: %v", entries)
+	}
+	// The VM is fully usable; a retry without the fault succeeds.
+	res := execOp(t, b, h, "sf-1", "echo still-running")
+	if res.ExitCode != 0 {
+		t.Fatal("exec after failed snapshot returned nonzero")
+	}
+	if _, err := b.Snapshot(h); err != nil {
+		t.Fatalf("Snapshot retry after fault cleared: %v", err)
+	}
+	if err := b.Resume(h); err != nil {
+		t.Fatalf("Resume: %v", err)
 	}
 }

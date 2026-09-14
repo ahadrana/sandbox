@@ -84,7 +84,12 @@ func buildGuestSupervisor(t *testing.T) string {
 		}
 		path := filepath.Join(dir, "guest-supervisor")
 		cmd := exec.Command("go", "build", "-o", path, "github.com/agent-sandbox/platform/runtime/guest-supervisor/cmd/guest-supervisor")
-		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=arm64")
+		// Build for the test host's arch; FC_GUEST_GOARCH overrides (FL10).
+		goarch := os.Getenv("FC_GUEST_GOARCH")
+		if goarch == "" {
+			goarch = runtime.GOARCH
+		}
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+goarch)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			guestSupervisorBin.err = fmt.Errorf("build guest-supervisor: %v: %s", err, out)
 			return

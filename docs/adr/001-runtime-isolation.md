@@ -111,8 +111,17 @@ conformance assertions were not weakened — the difference is declared
   dropped host-side in a per-incarnation ip6tables DROP chain (host IPv6
   forwarding stays off). DNS: the base rootfs ships an empty resolv.conf;
   the guest unit points it at a public resolver, so DNS is ordinary egress
-  subject to the same policy. With networking off, no NIC exists at all
-  (fail-closed) and `NetworkIsolated` is declared false.
+  subject to the same policy. **Hostname policy entries** (non-IP/CIDR
+  allow/deny entries) are resolved through DNS at chain setup and
+  re-resolved every `Config.ReResolveInterval` (default 60s) with an
+  atomic chain swap (build tmp chain, retarget the FORWARD/INPUT jumps,
+  rename) — a failure keeps the old rules. Caveat: re-resolution is
+  periodic, not per-connection, so a hostname whose DNS answer changes
+  between re-resolve ticks is enforced at its LAST resolved addresses;
+  DNS answers are also attacker-influenceable in principle. Security-
+  sensitive denies (e.g. blocking a known-bad destination) should use
+  IP/CIDR entries, not hostnames. With networking off, no NIC exists at
+  all (fail-closed) and `NetworkIsolated` is declared false.
 - **Snapshot GC.** Snapshots are per-incarnation timestamped dirs;
   `MaxSnapshotsPerIncarnation` (default 3) GCs oldest;
   `DeleteSnapshotsOnTerminate` optionally purges on Terminate.

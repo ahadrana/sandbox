@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -104,19 +105,28 @@ func (a *agent) Exec(req supervisor.ExecRequest) error {
 		stdout.Close()
 		stderr.Close()
 		a.mu.Lock()
-		delete(a.execs, req.ExecutionID)
+		// FL3: record the failure and close done so Wait/Status return
+		// promptly instead of blocking on a start that never happened.
+		t.result.ExitCode = -1
+		t.result.CompletedAt = time.Now()
+		close(t.done)
 		a.mu.Unlock()
 		return err
 	}
+	// FM12: publish startedAt/pgid/result refs under a.mu before the wait
+	// goroutine starts, so Status/baselinePGIDs never read them unsynced.
+	a.mu.Lock()
 	t.startedAt = time.Now()
 	t.pgid = cmd.Process.Pid
 	t.result.StdoutRef = "guest://" + stdoutPath
 	t.result.StderrRef = "guest://" + stderrPath
 	t.result.StartedAt = t.startedAt
+	a.mu.Unlock()
 	go func() {
 		waitErr := cmd.Wait()
 		stdout.Close()
 		stderr.Close()
+		a.mu.Lock()
 		t.result.CompletedAt = time.Now()
 		t.result.ExitCode = 0
 		if waitErr != nil {
@@ -129,9 +139,10 @@ func (a *agent) Exec(req supervisor.ExecRequest) error {
 		if st := cmd.ProcessState; st != nil {
 			t.result.Usage.CPUSeconds = st.UserTime().Seconds() + st.SystemTime().Seconds()
 		}
-		a.mu.Lock()
 		a.finished += t.result.Usage.CPUSeconds
 		a.mu.Unlock()
+		// close after the result writes: <-t.done is the happens-before
+		// edge for Wait readers.
 		close(t.done)
 	}()
 	return nil
@@ -152,6 +163,8 @@ func (a *agent) Status(executionID string) (supervisor.StatusResponse, error) {
 	if err != nil {
 		return supervisor.StatusResponse{}, err
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	select {
 	case <-t.done:
 		return supervisor.StatusResponse{
@@ -177,12 +190,29 @@ func (a *agent) Cancel(executionID string) error {
 	if err != nil {
 		return err
 	}
-	if t.cmd.Process != nil {
-		syscall.Kill(-t.cmd.Process.Pid, syscall.SIGKILL)
+	a.mu.Lock()
+	pgid := t.pgid
+	a.mu.Unlock()
+	if pgid <= 0 {
+		return nil
 	}
+	// PID/PGID-reuse recheck (FL2): skip the group-kill only when the group
+	// leader is POSITIVELY disowned — its environ is readable and lacks the
+	// marker. An unreadable/empty environ (zombie, or the brief post-exec
+	// procfs window) is inconclusive: kill, matching the old behavior.
+	if markerDisowned(a.marker, pgid) {
+		return nil
+	}
+	syscall.Kill(-pgid, syscall.SIGKILL)
 	return nil
 }
 
+// ReadOutput returns up to maxBytes of the spill file at offset. EOF means
+// "the main command has exited and this read reached the current end of the
+// file" (FL4): background descendants still holding the spill files open may
+// append MORE data after the main shell exits, so trailing background output
+// requires polling ReadOutput again after the exec completes — EOF is not a
+// guarantee that no further bytes will ever appear.
 func (a *agent) ReadOutput(executionID string, stderr bool, offset int64, maxBytes int) (supervisor.OutputChunk, error) {
 	if err := validateExecutionID(executionID); err != nil {
 		return supervisor.OutputChunk{}, err
@@ -292,8 +322,12 @@ func (a *agent) TerminateBackground() error {
 			continue // PID reused by an unowned process since the scan
 		}
 		if p.PGID > 0 && !killedPGID[p.PGID] {
-			syscall.Kill(-p.PGID, syscall.SIGKILL)
-			killedPGID[p.PGID] = true
+			// PGID-reuse recheck (FL2): the group leader must still be one
+			// of ours before the whole group is signaled.
+			if p.PGID == p.PID || markerOwned(a.marker, p.PGID) {
+				syscall.Kill(-p.PGID, syscall.SIGKILL)
+				killedPGID[p.PGID] = true
+			}
 		}
 		syscall.Kill(p.PID, syscall.SIGKILL)
 	}
@@ -303,6 +337,15 @@ func (a *agent) TerminateBackground() error {
 func markerOwned(marker string, pid int) bool {
 	environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
 	return err == nil && hasEnvEntry(string(environ), marker)
+}
+
+// markerDisowned reports ownership positively disproved: the process exists
+// with a readable, non-empty environ that lacks the marker (i.e. the PID
+// was reused by someone else's process). Empty/unreadable environ is
+// inconclusive (zombie or the post-exec procfs window) and returns false.
+func markerDisowned(marker string, pid int) bool {
+	environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	return err == nil && len(environ) > 0 && !hasEnvEntry(string(environ), marker)
 }
 
 func hasEnvEntry(environ, entry string) bool {
@@ -355,7 +398,9 @@ func checkWorkspacePath(path string) error {
 	return supervisor.CheckWorkspacePath(path)
 }
 
-// WriteFile materializes a workspace file under the work dir.
+// WriteFile materializes a workspace file under the work dir. The final
+// component is opened O_NOFOLLOW (FL1): a symlink planted in the workspace
+// must not redirect the write outside the root.
 func (a *agent) WriteFile(path string, content []byte) error {
 	if err := checkWorkspacePath(path); err != nil {
 		return err
@@ -364,23 +409,43 @@ func (a *agent) WriteFile(path string, content []byte) error {
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(full, content, 0o644)
+	fd, err := syscall.Open(full, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), full)
+	defer f.Close()
+	_, err = f.Write(content)
+	return err
 }
 
 func (a *agent) ReadFile(path string) ([]byte, error) {
 	if err := checkWorkspacePath(path); err != nil {
 		return nil, err
 	}
-	return os.ReadFile(filepath.Join(a.workDir, filepath.Clean(path)))
+	full := filepath.Join(a.workDir, filepath.Clean(path))
+	fd, err := syscall.Open(full, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), full)
+	defer f.Close()
+	return io.ReadAll(f)
 }
 
-// WorkspaceFiles walks the work dir into a manifest map. Values stay raw
-// bytes: the wire encodes them base64, so binary files round-trip intact.
+// WorkspaceFiles walks the work dir into a manifest map. Only regular files
+// are shipped (FL1): symlinks/devices/FIFOs are skipped so a planted symlink
+// cannot exfiltrate host-guest files (e.g. /etc/shadow) into the manifest.
+// Values stay raw bytes: the wire encodes them base64, so binary files
+// round-trip intact.
 func (a *agent) WorkspaceFiles() (map[string][]byte, error) {
 	out := map[string][]byte{}
 	err := filepath.Walk(a.workDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
 		}
 		rel, err := filepath.Rel(a.workDir, path)
 		if err != nil {
