@@ -24,7 +24,10 @@ func newTestSupervisor(t *testing.T) *localSupervisor {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return newLocalSupervisor(wsDir, outDir, "inc-test", nil)
+	// Unique marker per test: the inventory scans all of /proc, and a shared
+	// marker would pick up other tests' transient processes mid-exec.
+	marker := "inc-" + strings.NewReplacer("/", "-", "_", "-").Replace(t.Name())
+	return newLocalSupervisor(wsDir, outDir, marker, nil)
 }
 
 // L1: the PID-reuse guard accepts owned processes and rejects unowned ones.
@@ -44,7 +47,17 @@ func TestMarkerOwnedGuard(t *testing.T) {
 		t.Fatal("no owned processes found")
 	}
 	for _, p := range inv {
-		if !markerOwned(s.marker, p.PID) {
+		// /proc environ reads are not atomic across execve; a pid scanned
+		// mid-exec can read as unowned for a few ms. Retry briefly: a
+		// genuinely foreign pid never becomes owned.
+		owned := false
+		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			if markerOwned(s.marker, p.PID) {
+				owned = true
+				break
+			}
+		}
+		if !owned {
 			t.Fatalf("owned pid %d rejected by markerOwned", p.PID)
 		}
 	}
