@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/agent-sandbox/platform/domain"
 	"github.com/agent-sandbox/platform/runtime/backend-interface"
@@ -275,10 +276,26 @@ func (b *Backend) Terminate(h backendinterface.Handle) error {
 
 // markerOwned re-verifies, immediately before a kill, that pid still carries
 // the incarnation marker — closing the PID-reuse window between the
-// inventory scan and the SIGKILL.
+// inventory scan and the SIGKILL. /proc environ reads are not atomic across
+// an execve: a live process (e.g. sh exec'ing its command tail) briefly
+// exposes an empty or TRUNCATED environ. A verdict is taken only from two
+// consecutive identical non-empty reads; anything unstable (mid-exec) is
+// retried, and a persistently empty environ (zombie) is not owned.
 func markerOwned(marker string, pid int) bool {
-	environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
-	return err == nil && hasEnvEntry(string(environ), marker)
+	prev := ""
+	for i := 0; i < 5; i++ {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+		if err != nil {
+			return false
+		}
+		cur := string(data)
+		if len(cur) > 0 && cur == prev {
+			return hasEnvEntry(cur, marker)
+		}
+		prev = cur
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
 }
 
 func (b *Backend) killProcesses(inc *incarnation) {

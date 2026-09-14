@@ -335,17 +335,45 @@ func (a *agent) TerminateBackground() error {
 }
 
 func markerOwned(marker string, pid int) bool {
-	environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
-	return err == nil && hasEnvEntry(string(environ), marker)
+	prev := ""
+	for i := 0; i < 5; i++ {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+		if err != nil {
+			return false
+		}
+		cur := string(data)
+		if len(cur) > 0 && cur == prev {
+			return hasEnvEntry(cur, marker)
+		}
+		// /proc environ reads are not atomic across an execve (empty or
+		// truncated briefly): retry on instability instead of treating a
+		// live owned process as foreign. A persistently empty environ
+		// (zombie) stays unowned.
+		prev = cur
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
 }
 
-// markerDisowned reports ownership positively disproved: the process exists
-// with a readable, non-empty environ that lacks the marker (i.e. the PID
-// was reused by someone else's process). Empty/unreadable environ is
-// inconclusive (zombie or the post-exec procfs window) and returns false.
+// markerDisowned reports ownership positively disproved: two consecutive
+// identical non-empty environ reads (stable, so not a mid-exec truncation)
+// both lack the marker — i.e. the PID was reused by someone else's process.
+// Empty/unreadable/unstable environ is inconclusive and returns false.
 func markerDisowned(marker string, pid int) bool {
-	environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
-	return err == nil && len(environ) > 0 && !hasEnvEntry(string(environ), marker)
+	prev := ""
+	for i := 0; i < 5; i++ {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+		if err != nil {
+			return false
+		}
+		cur := string(data)
+		if len(cur) > 0 && cur == prev {
+			return !hasEnvEntry(cur, marker)
+		}
+		prev = cur
+		time.Sleep(2 * time.Millisecond)
+	}
+	return false
 }
 
 func hasEnvEntry(environ, entry string) bool {

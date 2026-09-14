@@ -2,9 +2,13 @@ package localbackend
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	supervisor "github.com/agent-sandbox/platform/runtime/guest-supervisor"
 )
@@ -99,4 +103,51 @@ func TestExecEnvOverridesAmbient(t *testing.T) {
 	if string(data) != "exec-wins,extra" {
 		t.Fatalf("env = %q, want exec-wins override with extraEnv preserved", data)
 	}
+}
+
+// markerOwned must stay true for a live owned process even across an execve
+// (sh exec'ing its command tail briefly exposes an empty /proc environ —
+// the window is inconclusive, not proof of foreign ownership).
+func TestMarkerOwnedAcrossExec(t *testing.T) {
+	marker := incarnationEnvMarker + "inc-exec-window"
+	cmd := exec.Command("/bin/sh", "-c", "exec sleep 30")
+	cmd.Env = append(os.Environ(), marker)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+	for i := 0; i < 2000; i++ {
+		if !markerOwned(marker, cmd.Process.Pid) {
+			t.Fatalf("iteration %d: owned pid %d rejected across exec", i, cmd.Process.Pid)
+		}
+	}
+}
+
+// A persistently empty-environ process (zombie) is not owned, and a foreign
+// process is not owned — the FL2 protection is unaffected by the retry.
+func TestMarkerOwnedNegative(t *testing.T) {
+	marker := incarnationEnvMarker + "inc-negative"
+	if markerOwned(marker, os.Getpid()) {
+		t.Fatal("foreign process accepted by markerOwned")
+	}
+	// Zombie: started, exited, not yet reaped.
+	cmd := exec.Command("/bin/sh", "-c", "true")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(fmt.Sprintf("/proc/%d/stat", cmd.Process.Pid))
+		if strings.Contains(string(data), ") Z") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if markerOwned(marker, cmd.Process.Pid) {
+		t.Fatal("zombie accepted by markerOwned")
+	}
+	cmd.Wait()
 }
