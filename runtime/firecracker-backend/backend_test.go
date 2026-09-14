@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -599,7 +600,45 @@ func egressSpec(id string, pol network.EgressPolicy) backendinterface.Spec {
 	return s
 }
 
-// hostServer serves "ok" on the given tap host IP (must exist already).
+// netOf returns the incarnation's allocated network state.
+func netOf(t *testing.T, b *Backend, id string) *netState {
+	t.Helper()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	inc := b.incs[id]
+	if inc == nil || inc.net == nil {
+		t.Fatalf("no network state for %s", id)
+	}
+	return inc.net
+}
+
+// uplinkIP returns the host's primary IPv4 address on the default-route
+// interface — the "external" target for egress tests (reachable, outside
+// the dropped VM/link-local ranges, INPUT-governed by the egress chain).
+func uplinkIP(t *testing.T) string {
+	t.Helper()
+	dev, err := defaultUplink()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("ip", "-4", "-o", "addr", "show", "dev", dev).CombinedOutput()
+	if err != nil {
+		t.Fatalf("addr show %s: %v: %s", dev, err, out)
+	}
+	fields := strings.Fields(string(out))
+	for i, f := range fields {
+		if f == "inet" && i+1 < len(fields) {
+			ip, _, err := net.ParseCIDR(fields[i+1])
+			if err == nil {
+				return ip.String()
+			}
+		}
+	}
+	t.Fatalf("no IPv4 address on %s: %s", dev, out)
+	return ""
+}
+
+// hostServer serves "ok" on the given host IP (must exist already).
 func hostServer(t *testing.T, hostIP string) *http.Server {
 	t.Helper()
 	ln, err := net.Listen("tcp", hostIP+":18080")
@@ -625,10 +664,13 @@ func TestEgressPolicy(t *testing.T) {
 	if !b.Capabilities().NetworkIsolated {
 		t.Fatal("NetworkIsolated = false with Networking enabled")
 	}
+	ext := uplinkIP(t)
+	hostServer(t, ext)
+	extURL := "http://" + ext + ":18080/ok"
 
-	// VM 1: default-allow policy — host service reachable, metadata blocked.
+	// VM 1: default-allow policy — external service reachable, DNS works,
+	// metadata blocked.
 	id1 := "inc-net-allow"
-	ns1 := netFor(id1)
 	h1, err := b.Create(egressSpec(id1, network.EgressPolicy{DefaultAllow: true}))
 	if err != nil {
 		t.Fatal(err)
@@ -636,48 +678,48 @@ func TestEgressPolicy(t *testing.T) {
 	if err := b.Start(h1); err != nil {
 		t.Fatalf("Start %s: %v", id1, err)
 	}
-	hostServer(t, ns1.hostIP)
-	if rc := curl(t, b, h1, "n1a", "http://"+ns1.hostIP+":18080/ok", 5); rc != 0 {
-		t.Fatalf("default-allow: curl host server exit = %d, want 0", rc)
+	if rc := curl(t, b, h1, "n1a", extURL, 5); rc != 0 {
+		t.Fatalf("default-allow: curl external exit = %d, want 0", rc)
 	}
 	if rc := curl(t, b, h1, "n1b", "http://169.254.169.254/", 3); rc == 0 {
 		t.Fatal("metadata endpoint reachable under default-allow policy")
 	}
+	// DNS: the injected resolver answers as ordinary egress traffic.
+	if rc := curl(t, b, h1, "n1c", "http://example.com/", 10); rc != 0 {
+		t.Fatalf("DNS/HTTP to example.com failed under default-allow: exit %d", rc)
+	}
 
-	// VM 2: default-allow with the host tap IP denied — host service blocked.
+	// VM 2: default-allow with the external IP denied — service blocked.
 	id2 := "inc-net-deny"
-	ns2 := netFor(id2)
-	h2, err := b.Create(egressSpec(id2, network.EgressPolicy{DefaultAllow: true, Deny: []string{ns2.hostIP}}))
+	h2, err := b.Create(egressSpec(id2, network.EgressPolicy{DefaultAllow: true, Deny: []string{ext}}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Start(h2); err != nil {
 		t.Fatalf("Start %s: %v", id2, err)
 	}
-	hostServer(t, ns2.hostIP)
-	if rc := curl(t, b, h2, "n2a", "http://"+ns2.hostIP+":18080/ok", 3); rc == 0 {
-		t.Fatal("denied host IP reachable")
+	if rc := curl(t, b, h2, "n2a", extURL, 3); rc == 0 {
+		t.Fatal("denied external IP reachable")
 	}
 
-	// VM 3: default-deny with only the host tap IP allowed.
+	// VM 3: default-deny with only the external IP allowed.
 	id3 := "inc-net-defdeny"
-	ns3 := netFor(id3)
-	h3, err := b.Create(egressSpec(id3, network.EgressPolicy{DefaultAllow: false, Allow: []string{ns3.hostIP}}))
+	h3, err := b.Create(egressSpec(id3, network.EgressPolicy{DefaultAllow: false, Allow: []string{ext}}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Start(h3); err != nil {
 		t.Fatalf("Start %s: %v", id3, err)
 	}
-	hostServer(t, ns3.hostIP)
-	if rc := curl(t, b, h3, "n3a", "http://"+ns3.hostIP+":18080/ok", 5); rc != 0 {
-		t.Fatalf("default-deny+allow: curl host server exit = %d, want 0", rc)
+	if rc := curl(t, b, h3, "n3a", extURL, 5); rc != 0 {
+		t.Fatalf("default-deny+allow: curl external exit = %d, want 0", rc)
 	}
 	if rc := curl(t, b, h3, "n3b", "http://192.0.2.1/", 3); rc == 0 {
 		t.Fatal("non-allowed destination reachable under default-deny policy")
 	}
 
 	// Teardown: no TAP devices or egress chains may survive Terminate.
+	nss := []*netState{netOf(t, b, id1), netOf(t, b, id2), netOf(t, b, id3)}
 	for _, h := range []backendinterface.Handle{h1, h2, h3} {
 		if err := b.Terminate(h); err != nil {
 			t.Fatal(err)
@@ -690,11 +732,185 @@ func TestEgressPolicy(t *testing.T) {
 	if strings.Contains(string(out), "FC-EGR-") {
 		t.Fatalf("egress chains survived Terminate:\n%s", out)
 	}
-	for _, id := range []string{id1, id2, id3} {
-		if err := exec.Command("ip", "link", "show", netFor(id).tap).Run(); err == nil {
-			t.Fatalf("tap %s survived Terminate", netFor(id).tap)
+	out6, err := exec.Command("sudo", "-n", "ip6tables-save").CombinedOutput()
+	if err != nil {
+		t.Fatalf("ip6tables-save: %v", err)
+	}
+	if strings.Contains(string(out6), "FC-EGR6-") {
+		t.Fatalf("ip6tables chains survived Terminate:\n%s", out6)
+	}
+	for _, ns := range nss {
+		if err := exec.Command("ip", "link", "show", ns.tap).Run(); err == nil {
+			t.Fatalf("tap %s survived Terminate", ns.tap)
 		}
 	}
+}
+
+// FM1: two networked VMs cannot reach each other (guest IP or host tap
+// side); spoofed-source packets are dropped host-side.
+func TestCrossVMIsolationAndSpoofing(t *testing.T) {
+	b := newNetBackend(t)
+	ext := uplinkIP(t)
+	hostServer(t, ext)
+	mk := func(id string) backendinterface.Handle {
+		h, err := b.Create(egressSpec(id, network.EgressPolicy{DefaultAllow: true}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Start(h); err != nil {
+			t.Fatalf("Start %s: %v", id, err)
+		}
+		return h
+	}
+	hA := mk("inc-xvm-a")
+	hB := mk("inc-xvm-b")
+	nsA := netOf(t, b, "inc-xvm-a")
+	nsB := netOf(t, b, "inc-xvm-b")
+
+	// Cross-VM: A cannot reach B's guest IP or B's host tap IP (DROP →
+	// timeout, not connection-refused).
+	if rc := curl(t, b, hA, "x1", "http://"+nsB.guestIP+":18080/", 3); rc == 0 {
+		t.Fatal("VM A reached VM B's guest IP")
+	}
+	if rc := curl(t, b, hA, "x2", "http://"+nsB.hostIP+":18080/", 3); rc == 0 {
+		t.Fatal("VM A reached VM B's host tap IP")
+	}
+	// Both still reach the allowed external target.
+	if rc := curl(t, b, hA, "x3", "http://"+ext+":18080/ok", 5); rc != 0 {
+		t.Fatalf("VM A lost allowed external egress: %d", rc)
+	}
+	if rc := curl(t, b, hB, "x4", "http://"+ext+":18080/ok", 5); rc != 0 {
+		t.Fatalf("VM B lost allowed external egress: %d", rc)
+	}
+
+	// Anti-spoofing: A adds a foreign source address and pings the external
+	// IP from it; the host `! -s` DROP (FORWARD or INPUT hook, depending on
+	// the destination) must eat every packet.
+	fake := "192.168.255.254"
+	execOp(t, b, hA, "x5", "ip addr add "+fake+"/32 dev eth0")
+	dropPkts := func() int {
+		total := 0
+		for _, hook := range []string{"FORWARD", "INPUT"} {
+			out, err := exec.Command("sudo", "-n", "iptables", "-L", hook, "-v", "-n", "-x").CombinedOutput()
+			if err != nil {
+				t.Fatalf("iptables -v: %v", err)
+			}
+			for _, line := range strings.Split(string(out), "\n") {
+				f := strings.Fields(line)
+				if len(f) >= 3 && f[2] == "DROP" && strings.Contains(line, nsA.tap) &&
+					strings.Contains(line, "!") && strings.Contains(line, nsA.guestIP) {
+					if n, err := strconv.Atoi(f[0]); err == nil {
+						total += n
+					}
+				}
+			}
+		}
+		return total
+	}
+	before := dropPkts()
+	res := execOp(t, b, hA, "x6", "ping -c 2 -W 1 -I "+fake+" "+ext)
+	if res.ExitCode == 0 {
+		t.Fatal("spoofed-source ping succeeded")
+	}
+	if got := dropPkts(); got <= before {
+		t.Fatalf("anti-spoof DROP counter did not increase: %d -> %d", before, got)
+	}
+	for _, h := range []backendinterface.Handle{hA, hB} {
+		if err := b.Terminate(h); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// FM2: IPv6 is disabled in the guest and any tap-ingress IPv6 is dropped
+// host-side anyway.
+func TestIPv6Blocked(t *testing.T) {
+	b := newNetBackend(t)
+	h, err := b.Create(egressSpec("inc-v6", network.EgressPolicy{DefaultAllow: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Terminate(h)
+	ns := netOf(t, b, "inc-v6")
+	// The guest has no inet6 address on eth0 (sysctl disable).
+	res := execOp(t, b, h, "v1", "ip -6 addr show dev eth0 | grep inet6")
+	if res.ExitCode == 0 {
+		t.Fatal("eth0 has an inet6 address despite disable_ipv6")
+	}
+	// Even attempting IPv6 egress fails (nothing to route with).
+	if rc := curl(t, b, h, "v2", "http://[2001:db8::1]/", 2); rc == 0 {
+		t.Fatal("IPv6 destination reachable")
+	}
+	// The host-enforced ip6tables DROP chain is hooked for this TAP.
+	out, err := exec.Command("sudo", "-n", "ip6tables-save").CombinedOutput()
+	if err != nil {
+		t.Fatalf("ip6tables-save: %v", err)
+	}
+	if !strings.Contains(string(out), ns.chain6) || !strings.Contains(string(out), "-i "+ns.tap+" -j "+ns.chain6) {
+		t.Fatalf("ip6tables DROP chain for %s missing:\n%s", ns.tap, out)
+	}
+}
+
+// FM3: slot collisions never clobber a live incarnation's TAP; the colliding
+// incarnation gets the next free slot. No VM boots needed.
+func TestNetworkSlotCollision(t *testing.T) {
+	b := newNetBackend(t)
+	defer func(old int) { netSlotSpace = old }(netSlotSpace)
+	netSlotSpace = 2
+	// Find two IDs mapping to the same preferred slot.
+	var ids []string
+	for i := 0; len(ids) < 2; i++ {
+		cand := fmt.Sprintf("inc-coll-%d", i)
+		if len(ids) == 0 || preferredSlot(cand) == preferredSlot(ids[0]) {
+			ids = append(ids, cand)
+		}
+	}
+	if preferredSlot(ids[0]) != preferredSlot(ids[1]) {
+		t.Fatalf("test setup: IDs do not collide (%s, %s)", ids[0], ids[1])
+	}
+	mkInc := func(id string) *incarnation {
+		return &incarnation{id: id, spec: egressSpec(id, network.EgressPolicy{DefaultAllow: true}), ops: map[string]domain.Operation{}}
+	}
+	inc1 := mkInc(ids[0])
+	if err := b.allocateNetworking(inc1, preferredSlot(inc1.id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.setupNetworking(inc1); err != nil {
+		t.Fatal(err)
+	}
+	inc2 := mkInc(ids[1])
+	if err := b.allocateNetworking(inc2, preferredSlot(inc2.id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.setupNetworking(inc2); err != nil {
+		t.Fatal(err)
+	}
+	if inc1.net.slot == inc2.net.slot {
+		t.Fatalf("colliding incarnations share slot %d", inc1.net.slot)
+	}
+	// The first incarnation's TAP and chain survive the second's setup.
+	if err := exec.Command("ip", "link", "show", inc1.net.tap).Run(); err != nil {
+		t.Fatalf("first incarnation's TAP %s clobbered by collision", inc1.net.tap)
+	}
+	out, err := exec.Command("sudo", "-n", "iptables", "-S", inc1.net.chain).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), metadataIP) {
+		t.Fatalf("first incarnation's chain damaged: %v %s", err, out)
+	}
+	// Exhaustion: a third colliding incarnation must error, never clobber.
+	inc3 := mkInc(ids[0] + "-third")
+	if err := b.allocateNetworking(inc3, preferredSlot(inc1.id)); err == nil {
+		t.Fatal("allocator handed out an occupied slot")
+	}
+	b.teardownNetworking(inc1)
+	b.teardownNetworking(inc2)
+	// Slots are released: the third allocation now succeeds.
+	if err := b.allocateNetworking(inc3, preferredSlot(inc1.id)); err != nil {
+		t.Fatalf("slot not released after teardown: %v", err)
+	}
+	b.teardownNetworking(inc3)
 }
 
 func TestJailerBoot(t *testing.T) {

@@ -209,7 +209,9 @@ func (b *Backend) get(h backendinterface.Handle) (*incarnation, error) {
 
 // Create materializes the per-incarnation directory: a private rootfs copy
 // (with the workspace mount unit injected) and a workspace ext4 image built
-// from Spec.WorkspaceManifest.
+// from Spec.WorkspaceManifest. When networking is enabled it also reserves
+// the incarnation's network slot, so the guest network unit baked into the
+// rootfs matches the TAP the VM gets at Start.
 func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -223,42 +225,49 @@ func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, e
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return backendinterface.Handle{}, err
 	}
-	rootfs := filepath.Join(dir, "rootfs.ext4")
-	if err := copyFile(rootfs, b.cfg.RootfsPath); err != nil {
+	fail := func(err error) (backendinterface.Handle, error) {
+		if inc := b.incs[spec.IncarnationID]; inc != nil && inc.net != nil {
+			releaseSlot(inc.id, inc.net)
+		}
+		delete(b.incs, spec.IncarnationID)
 		os.RemoveAll(dir)
 		return backendinterface.Handle{}, err
 	}
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	if err := copyFile(rootfs, b.cfg.RootfsPath); err != nil {
+		return fail(err)
+	}
 	if err := injectWorkspaceUnit(rootfs); err != nil {
-		os.RemoveAll(dir)
-		return backendinterface.Handle{}, err
+		return fail(err)
 	}
 	if b.cfg.GuestSupervisorBin != "" {
 		if err := injectGuestAgent(rootfs, b.cfg.GuestSupervisorBin, spec.IncarnationID, b.cfg.SupervisorPort); err != nil {
-			os.RemoveAll(dir)
-			return backendinterface.Handle{}, err
+			return fail(err)
 		}
 	}
-	if b.cfg.Networking {
-		ns := netFor(spec.IncarnationID)
-		if err := injectNetworkUnit(rootfs, ns.guestIP, ns.hostIP); err != nil {
-			os.RemoveAll(dir)
-			return backendinterface.Handle{}, err
-		}
-	}
-	if err := buildWorkspaceImage(filepath.Join(dir, "workspace.img"), spec.WorkspaceManifest); err != nil {
-		os.RemoveAll(dir)
-		return backendinterface.Handle{}, err
-	}
-	mirror := map[string]string{}
-	for k, v := range spec.WorkspaceManifest {
-		mirror[k] = v
-	}
-	b.incs[spec.IncarnationID] = &incarnation{
+	inc := &incarnation{
 		id:       spec.IncarnationID,
 		spec:     spec,
 		dir:      dir,
-		wsMirror: mirror,
+		wsMirror: map[string]string{},
 		ops:      map[string]domain.Operation{},
+	}
+	for k, v := range spec.WorkspaceManifest {
+		inc.wsMirror[k] = v
+	}
+	b.incs[spec.IncarnationID] = inc
+	if b.cfg.Networking {
+		if err := b.allocateNetworking(inc, preferredSlot(spec.IncarnationID)); err != nil {
+			delete(b.incs, spec.IncarnationID)
+			os.RemoveAll(dir)
+			return backendinterface.Handle{}, err
+		}
+		if err := injectNetworkUnit(rootfs, inc.net.guestIP, inc.net.hostIP); err != nil {
+			return fail(err)
+		}
+	}
+	if err := buildWorkspaceImage(filepath.Join(dir, "workspace.img"), spec.WorkspaceManifest); err != nil {
+		return fail(err)
 	}
 	return backendinterface.Handle{IncarnationID: spec.IncarnationID}, nil
 }
@@ -534,6 +543,9 @@ func (b *Backend) Resume(h backendinterface.Handle) error {
 type snapshotMeta struct {
 	Spec      backendinterface.Spec `json:"spec"`
 	CreatedAt time.Time             `json:"created_at"`
+	// NetSlot records the network slot baked into the snapshot's net
+	// device config (TAP name/MAC/guest IP); restore must reuse it.
+	NetSlot *int `json:"net_slot,omitempty"`
 }
 
 func (b *Backend) snapshotDir(incarnationID string) string {
@@ -618,11 +630,16 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 	if err := b.api(inc).snapshotCreate(memPath, statePath); err != nil {
 		return backendinterface.CheckpointData{}, err
 	}
-	meta, err := json.Marshal(snapshotMeta{Spec: inc.spec, CreatedAt: time.Now()})
+	meta := snapshotMeta{Spec: inc.spec, CreatedAt: time.Now()}
+	if inc.net != nil {
+		slot := inc.net.slot
+		meta.NetSlot = &slot
+	}
+	metaBytes, err := json.Marshal(meta)
 	if err != nil {
 		return backendinterface.CheckpointData{}, err
 	}
-	if err := os.WriteFile(filepath.Join(snapDir, "meta.json"), meta, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(snapDir, "meta.json"), metaBytes, 0o644); err != nil {
 		return backendinterface.CheckpointData{}, err
 	}
 	b.gcSnapshots(inc.id)
@@ -685,11 +702,18 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 	inc.jailRoot = ""
 	b.mu.Unlock()
 
-	// Networking is recomputed deterministically from the incarnation ID
-	// (netFor), so the TAP name/MAC match what the snapshot's net device
-	// config recorded; the policy comes from the restored spec.
+	// Networking: reallocate the slot recorded in the snapshot metadata so
+	// the TAP name/MAC/guest IP match the net device config the snapshot
+	// restores; the policy comes from the restored spec.
 	if b.cfg.Networking {
 		b.teardownNetworking(inc)
+		preferred := preferredSlot(inc.id)
+		if meta.NetSlot != nil {
+			preferred = *meta.NetSlot
+		}
+		if err := b.allocateNetworking(inc, preferred); err != nil {
+			return backendinterface.Handle{}, err
+		}
 		if err := b.setupNetworking(inc); err != nil {
 			return backendinterface.Handle{}, err
 		}

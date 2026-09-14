@@ -95,13 +95,24 @@ conformance assertions were not weakened — the difference is declared
   sysfs `midr_el1` as fatal; a jailer patched to skip the missing file is
   installed on the conformance host. An upstream fix should be proposed.
 - **Networking enforcement.** With `Config.Networking`, each incarnation
-  gets a deterministic TAP device and /30 pair in 192.168.0.0/16, host
-  MASQUERADE via the default uplink, and a per-incarnation iptables chain
-  enforcing `network.EgressPolicy`: `169.254.169.254` DROP first, then deny
-  entries, then allows, final DROP when `DefaultAllow` is false. The chain
-  hooks **both FORWARD and INPUT** — FORWARD alone would let guests bypass
-  the policy for host-local services. With networking off, no NIC exists at
-  all (fail-closed) and `NetworkIsolated` is declared false.
+  gets a TAP device and /30 pair allocated from a process-local slot
+  allocator in 192.168.0.0/16 (hash-preferred slot with linear-scan
+  collision resolution; a live incarnation's TAP is never clobbered, slots
+  are recorded in snapshot metadata for restore), host
+  MASQUERADE via the default uplink, and per-incarnation iptables chains
+  enforcing `network.EgressPolicy`. Chain order: `169.254.169.254` DROP
+  first, then link-local (`169.254.0.0/16`) and the **whole VM subnet
+  (`192.168.0.0/16`) DROP — guests cannot reach each other or host tap
+  services** — then policy denies, allows, and a final DROP when
+  `DefaultAllow` is false. **Anti-spoofing:** tap-ingress packets whose
+  source is not the VM's assigned /30 IP are dropped before the chain (in
+  both FORWARD and INPUT); the chain jump itself also carries the source
+  match. **IPv6:** disabled in-guest via sysctl AND all tap-ingress IPv6
+  dropped host-side in a per-incarnation ip6tables DROP chain (host IPv6
+  forwarding stays off). DNS: the base rootfs ships an empty resolv.conf;
+  the guest unit points it at a public resolver, so DNS is ordinary egress
+  subject to the same policy. With networking off, no NIC exists at all
+  (fail-closed) and `NetworkIsolated` is declared false.
 - **Snapshot GC.** Snapshots are per-incarnation timestamped dirs;
   `MaxSnapshotsPerIncarnation` (default 3) GCs oldest;
   `DeleteSnapshotsOnTerminate` optionally purges on Terminate.
