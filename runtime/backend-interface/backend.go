@@ -1,0 +1,96 @@
+// Package backendinterface defines the runtime backend contract. It must not
+// expose vendor-specific (Firecracker/Kubernetes) concepts (INV-026).
+package backendinterface
+
+import "errors"
+
+var (
+	ErrRuntimeGone     = errors.New("runtime incarnation gone")
+	ErrNotFound        = errors.New("runtime handle not found")
+	ErrIllegalState    = errors.New("runtime in wrong state for operation")
+	ErrResponseDropped = errors.New("fault injection: response dropped")
+	ErrSupervisorDead  = errors.New("fault injection: supervisor dead")
+)
+
+// AckLostError reports a response lost after the operation was applied;
+// callers must retry with the same idempotency key.
+type AckLostError struct{}
+
+func (AckLostError) Error() string { return "fault injection: ack lost after apply" }
+
+// ExecError reports an operation that ran and failed.
+type ExecError struct {
+	ExitCode int
+}
+
+func (e *ExecError) Error() string { return "operation failed" }
+
+type Spec struct {
+	SandboxID           string
+	IncarnationID       string
+	Epoch               int64
+	EnvironmentID       string
+	WorkspaceID         string
+	WorkspaceGeneration int64
+	MemoryBytes         int64
+	WorkspaceManifest   map[string]string
+	// Env carries incarnation-wide environment (e.g. the serialized egress
+	// policy as AGENT_SANDBOX_EGRESS) added to every spawned process.
+	Env map[string]string
+	// Priority (0-100) is forwarded to the scheduler.
+	Priority int
+}
+
+type Handle struct {
+	IncarnationID string
+}
+
+type Stats struct {
+	CPUSeconds    float64
+	MemoryBytes   int64
+	ProcessCount  int
+	UptimeSeconds int64
+}
+
+type CheckpointData struct {
+	IncarnationID string
+	Files         map[string]string
+	Metadata      map[string]string
+}
+
+// IsolationClass declares the strength of a backend's isolation boundary
+// (PLAN §9 gate: differences require explicit capability declarations).
+type IsolationClass string
+
+const (
+	IsolationProcess   IsolationClass = "PROCESS"
+	IsolationNamespace IsolationClass = "NAMESPACE"
+	IsolationVM        IsolationClass = "VM"
+)
+
+// Capabilities declares what a backend actually supports; conformance tests
+// skip on missing capabilities rather than failing on silent differences.
+type Capabilities struct {
+	IsolationClass   IsolationClass
+	SupportsPause    bool
+	SupportsSnapshot bool
+	SupportsRestore  bool
+	// SupportsCheckpoint declares STOP/CONT-class execution checkpointing:
+	// pause halts CPU but RAM stays allocated (never reported as reclaimed).
+	SupportsCheckpoint bool
+	NetworkIsolated    bool
+	HostCredentialFree bool
+}
+
+// Backend is the runtime backend contract (DESIGN §6.7).
+type Backend interface {
+	Capabilities() Capabilities
+	Create(spec Spec) (Handle, error)
+	Start(h Handle) error
+	Pause(h Handle) error
+	Resume(h Handle) error
+	Snapshot(h Handle) (CheckpointData, error)
+	Restore(cp CheckpointData) (Handle, error)
+	Terminate(h Handle) error
+	Stats(h Handle) (Stats, error)
+}
