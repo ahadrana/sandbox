@@ -37,6 +37,25 @@ func (e *QuotaExceededError) Error() string {
 	return "tenant " + e.TenantID + " quota exceeded: " + e.Resource
 }
 
+// ErrUnauthorized marks cross-tenant access rejection (INV-028).
+var ErrUnauthorized = errors.New("cross-tenant access denied")
+
+// UnauthorizedError reports a request whose asserted tenant does not own the
+// target sandbox. Authentication of the principal itself remains a gateway
+// concern (DESIGN §6.1); this is ownership enforcement only.
+type UnauthorizedError struct {
+	TenantID  string
+	OwnerID   string
+	SandboxID string
+}
+
+func (e *UnauthorizedError) Error() string {
+	return "tenant " + e.TenantID + " cannot access sandbox " + e.SandboxID +
+		" owned by tenant " + e.OwnerID
+}
+
+func (e *UnauthorizedError) Unwrap() error { return ErrUnauthorized }
+
 var sandboxTransitions = map[SandboxState][]SandboxState{
 	SandboxUnmaterialized:   {SandboxStarting, SandboxFailed, SandboxTerminated},
 	SandboxStarting:         {SandboxRunning, SandboxFailed, SandboxTerminated},
@@ -51,9 +70,11 @@ var sandboxTransitions = map[SandboxState][]SandboxState{
 }
 
 // TransitionSandbox enforces the sandbox lifecycle state machine.
+// Self-transitions are illegal: idempotent replay must be handled by the
+// caller, not by silently re-entering a state.
 func TransitionSandbox(from, to SandboxState) error {
 	if from == to {
-		return nil
+		return ErrIllegalTransition
 	}
 	for _, t := range sandboxTransitions[from] {
 		if t == to {
@@ -70,9 +91,10 @@ var executionTransitions = map[ExecutionState][]ExecutionState{
 }
 
 // TransitionExecution enforces the execution lifecycle state machine.
+// Self-transitions are illegal (see TransitionSandbox).
 func TransitionExecution(from, to ExecutionState) error {
 	if from == to {
-		return nil
+		return ErrIllegalTransition
 	}
 	for _, t := range executionTransitions[from] {
 		if t == to {

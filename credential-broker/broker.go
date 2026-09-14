@@ -6,11 +6,15 @@ package credentialbroker
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,24 +38,45 @@ type Claims struct {
 }
 
 // Broker signs and verifies tokens with an HMAC key and tracks revocations.
+// Revocations are durable: they are recorded in the JSONL audit file and
+// reloaded on open, so a broker restart cannot silently un-revoke a token.
 type Broker struct {
 	mu      sync.Mutex
 	key     []byte
-	nextID  int
 	revoked map[string]bool
 	audit   *network.AuditLog
 }
 
-// New creates a broker; auditPath "" means memory-only auditing.
+// New creates a broker; auditPath "" means memory-only auditing. When an
+// audit file exists, prior revocation records are reloaded from it.
 func New(key []byte, auditPath string) (*Broker, error) {
 	if len(key) == 0 {
 		return nil, errors.New("broker key required")
+	}
+	revoked := map[string]bool{}
+	if auditPath != "" {
+		if data, err := os.ReadFile(auditPath); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if line == "" {
+					continue
+				}
+				var entry network.AuditEntry
+				if err := json.Unmarshal([]byte(line), &entry); err != nil {
+					continue
+				}
+				if entry.Kind == "revoke" {
+					revoked[entry.Subject] = true
+				}
+			}
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
 	}
 	audit, err := network.NewAuditLog(auditPath)
 	if err != nil {
 		return nil, err
 	}
-	return &Broker{key: key, revoked: map[string]bool{}, audit: audit}, nil
+	return &Broker{key: key, revoked: revoked, audit: audit}, nil
 }
 
 func (b *Broker) sign(payload []byte) string {
@@ -61,12 +86,17 @@ func (b *Broker) sign(payload []byte) string {
 }
 
 // Issue mints a token scoped to tenant/task with capabilities and TTL.
+// Token IDs are random (crypto/rand), never sequential, so distinct broker
+// instances sharing an HMAC key cannot mint colliding IDs.
 func (b *Broker) Issue(tenantID, taskRef string, capabilities []string, ttl time.Duration, now time.Time) (string, Claims, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.nextID++
+	var idBytes [16]byte
+	if _, err := rand.Read(idBytes[:]); err != nil {
+		return "", Claims{}, err
+	}
 	claims := Claims{
-		TokenID:      fmt.Sprintf("tok-%d", b.nextID),
+		TokenID:      "tok-" + hex.EncodeToString(idBytes[:]),
 		TenantID:     tenantID,
 		TaskRef:      taskRef,
 		Capabilities: append([]string{}, capabilities...),
@@ -107,13 +137,13 @@ func (b *Broker) Verify(token string, now time.Time) (Claims, error) {
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return Claims{}, ErrMalformed
 	}
-	if now.After(claims.ExpiresAt) {
-		b.audit.Record("use", claims.TokenID, "denied: expired", now)
-		return Claims{}, ErrExpired
-	}
 	if b.revoked[claims.TokenID] {
 		b.audit.Record("use", claims.TokenID, "denied: revoked", now)
 		return Claims{}, ErrRevoked
+	}
+	if now.After(claims.ExpiresAt) {
+		b.audit.Record("use", claims.TokenID, "denied: expired", now)
+		return Claims{}, ErrExpired
 	}
 	b.audit.Record("use", claims.TokenID, "verified", now)
 	return claims, nil

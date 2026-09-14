@@ -39,10 +39,15 @@ type EnvironmentSpec struct {
 	Config         map[string]string
 }
 
-// SpecDigest computes the deterministic environment identity.
+// SpecDigest computes the deterministic environment identity. Every field
+// is length-prefixed so concatenation boundaries are unambiguous — two
+// specs that differ only in where a newline falls cannot collide.
 func SpecDigest(spec EnvironmentSpec) string {
 	var b strings.Builder
-	b.WriteString("base:" + spec.BaseRuntimeRef + "\n")
+	field := func(tag, value string) {
+		fmt.Fprintf(&b, "%s:%d:%s\n", tag, len(value), value)
+	}
+	field("base", spec.BaseRuntimeRef)
 	repos := append([]domain.RepoInput{}, spec.RepoInputs...)
 	sort.Slice(repos, func(i, j int) bool {
 		if repos[i].RepoURL != repos[j].RepoURL {
@@ -51,16 +56,16 @@ func SpecDigest(spec EnvironmentSpec) string {
 		return repos[i].SHA < repos[j].SHA
 	})
 	for _, r := range repos {
-		b.WriteString("repo:" + r.RepoURL + "@" + r.SHA + "\n")
+		field("repo", r.RepoURL+"@"+r.SHA)
 	}
-	b.WriteString("install:" + spec.InstallCommand + "\n")
+	field("install", spec.InstallCommand)
 	keys := make([]string, 0, len(spec.Config))
 	for k := range spec.Config {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		b.WriteString("config:" + k + "=" + spec.Config[k] + "\n")
+		field("config", k+"="+spec.Config[k])
 	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])
@@ -83,14 +88,31 @@ func NewLocalRepoSource(root string) *LocalRepoSource {
 	return &LocalRepoSource{root: root}
 }
 
+// resolve maps a repo ref to a directory inside the source root, rejecting
+// refs that escape it (e.g. "../").
+func (l *LocalRepoSource) resolve(ref string) (string, error) {
+	full := filepath.Join(l.root, filepath.Clean(ref))
+	root := filepath.Clean(l.root)
+	if full != root && !strings.HasPrefix(full, root+string(os.PathSeparator)) {
+		return "", fmt.Errorf("repo ref %q escapes the source root", ref)
+	}
+	return full, nil
+}
+
 // AddVersion registers repo content at an exact SHA.
 func (l *LocalRepoSource) AddVersion(ref, sha string, files map[string]string) error {
-	dir := filepath.Join(l.root, filepath.Clean(ref))
+	dir, err := l.resolve(ref)
+	if err != nil {
+		return err
+	}
 	if sha != "" {
 		dir = filepath.Join(dir, sha)
 	}
 	for path, content := range files {
 		full := filepath.Join(dir, filepath.Clean(path))
+		if full != dir && !strings.HasPrefix(full, dir+string(os.PathSeparator)) {
+			return fmt.Errorf("repo file path %q escapes the repo directory", path)
+		}
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			return err
 		}
@@ -102,7 +124,10 @@ func (l *LocalRepoSource) AddVersion(ref, sha string, files map[string]string) e
 }
 
 func (l *LocalRepoSource) Checkout(ref, sha, destDir string) error {
-	src := filepath.Join(l.root, filepath.Clean(ref))
+	src, err := l.resolve(ref)
+	if err != nil {
+		return err
+	}
 	if sha != "" {
 		src = filepath.Join(src, sha)
 	}

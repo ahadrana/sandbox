@@ -201,7 +201,7 @@ func Run(t *testing.T, cfg Config) Report {
 }
 
 func (r *runState) step() {
-	op := r.rng.Intn(14)
+	op := r.rng.Intn(15)
 	switch {
 	case op <= 2 && len(r.pool) < r.cfg.Sandboxes:
 		r.opCreate()
@@ -221,6 +221,8 @@ func (r *runState) step() {
 		r.opIdempotentRetry()
 	case op == 12:
 		r.opCacheLoss()
+	case op == 13:
+		r.opCrossTenantAttempt()
 	default:
 		r.opWorkspaceFault()
 	}
@@ -396,13 +398,48 @@ func (r *runState) opKillRuntime() {
 	if id == "" {
 		return
 	}
+	priorEpoch := int64(0)
+	if sb, err := r.mgr.GetSandbox(id); err == nil {
+		priorEpoch = sb.ExecutionEpoch
+	}
 	if err := r.mgr.KillRuntime(id); err != nil {
 		r.tolerate("kill_runtime", err)
 		return
 	}
 	r.faults["kill_runtime"]++
-	if r.materialized[id] {
-		r.killed[id] = true
+	if !r.materialized[id] {
+		return
+	}
+	r.killed[id] = true
+	// Rematerialize immediately and assert the kill is surfaced honestly
+	// (INV-008): the epoch MUST increment and an ExecutionStateReset with
+	// matching prior/new epochs MUST exist — false continuity here is the
+	// failure mode this harness exists to catch.
+	before := mustResetCount(r, id)
+	report, err := r.mgr.Materialize(id)
+	if !r.tolerate("kill_rematerialize", err) {
+		return
+	}
+	r.killed[id] = false
+	if report.NewEpoch <= report.PriorEpoch {
+		r.t.Fatalf("sandbox %s: runtime kill did not increment epoch (%d -> %d)", id, report.PriorEpoch, report.NewEpoch)
+	}
+	if report.PriorEpoch != priorEpoch {
+		r.t.Fatalf("sandbox %s: report prior epoch %d, want %d", id, report.PriorEpoch, priorEpoch)
+	}
+	found := false
+	events, _ := r.outbox.Replay(0)
+	for _, ev := range events {
+		if ev.EventType != domain.EventExecutionStateReset || ev.Payload["sandbox_id"] != id {
+			continue
+		}
+		if fmt.Sprint(ev.Payload["prior_epoch"]) == fmt.Sprint(report.PriorEpoch) &&
+			fmt.Sprint(ev.Payload["new_epoch"]) == fmt.Sprint(report.NewEpoch) {
+			found = true
+		}
+	}
+	if !found || mustResetCount(r, id) == before {
+		r.t.Fatalf("sandbox %s: no ExecutionStateReset matching %d -> %d after runtime kill", id, report.PriorEpoch, report.NewEpoch)
 	}
 }
 
@@ -508,6 +545,30 @@ func (r *runState) opCacheLoss() {
 		r.materialize(id)
 		return
 	}
+}
+
+// opCrossTenantAttempt asserts ownership enforcement (INV-028): a request
+// asserting a different tenant than the sandbox owner must be denied with a
+// typed unauthorized error — anything else (including success) is fatal.
+func (r *runState) opCrossTenantAttempt() {
+	id := r.pickLive()
+	if id == "" {
+		return
+	}
+	owner := r.tenant[id]
+	attacker := "tenant-chaos-attacker"
+	if owner == attacker {
+		attacker = "tenant-chaos-attacker-2"
+	}
+	_, err := r.mgr.StartExecution(api.StartExecutionRequest{
+		Version: api.SchemaVersionV1, SandboxID: id, TenantID: attacker,
+		PrincipalID: "chaos-attacker", Operation: domain.Operation{Command: "true"},
+	})
+	var unauth *domain.UnauthorizedError
+	if !errors.As(err, &unauth) {
+		r.t.Fatalf("cross-tenant exec on %s (owner %s) not denied: %v", id, owner, err)
+	}
+	r.faults["cross_tenant_denied"]++
 }
 
 func (r *runState) opWorkspaceFault() {

@@ -1,15 +1,21 @@
 package conformance
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	agentdriver "github.com/agent-sandbox/platform/agent-driver"
 	sandboxmanager "github.com/agent-sandbox/platform/control-plane/sandbox-manager"
 	"github.com/agent-sandbox/platform/domain"
 	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
+	fakebackend "github.com/agent-sandbox/platform/runtime/fake-backend"
+	supervisor "github.com/agent-sandbox/platform/runtime/guest-supervisor"
 	isolatedbackend "github.com/agent-sandbox/platform/runtime/isolated-backend"
 	localbackend "github.com/agent-sandbox/platform/runtime/local-backend"
 )
@@ -208,5 +214,169 @@ func TestBackgroundNamePathTraversalRejected(t *testing.T) {
 	}
 	if len(escaped) > 0 {
 		t.Fatalf("files created by traversal ID: %v", escaped)
+	}
+}
+
+// M11 regression: WaitExecution on an unknown execution ID returns
+// ErrNotFound, never a fabricated success (backend contract parity).
+func TestWaitExecutionUnknownIDNotFound(t *testing.T) {
+	lb, err := localbackend.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := lb.Create(backendinterface.Spec{SandboxID: "sb-w", IncarnationID: "inc-w"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lb.Start(h); err != nil {
+		t.Fatal(err)
+	}
+	_, err = lb.WaitExecution(h, "ex-never-started")
+	if !errors.Is(err, supervisor.ErrNotFound) {
+		t.Fatalf("WaitExecution unknown ID: err = %v, want ErrNotFound", err)
+	}
+}
+
+// M12 regression: a command that fails to START leaves no leaked exec entry:
+// Wait returns ErrNotFound (never hangs) and a retry with the same execution
+// ID is a fresh attempt.
+func TestExecStartFailureNoLeak(t *testing.T) {
+	lb, err := localbackend.New(t.TempDir(), localbackend.WithCommandWrapper(
+		func(argv, env []string, wsDir string) ([]string, []string) {
+			if strings.Contains(argv[2], "start-fails") {
+				return []string{"/nonexistent/binary"}, env
+			}
+			return argv, env
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := lb.Create(backendinterface.Spec{SandboxID: "sb-s", IncarnationID: "inc-s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lb.Start(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := lb.Exec(h, "ex-retry", domain.Operation{Command: "start-fails"}); err == nil {
+		t.Fatal("expected start failure")
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := lb.WaitExecution(h, "ex-retry")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, supervisor.ErrNotFound) {
+			t.Fatalf("Wait after start failure: err = %v, want ErrNotFound", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait hung after start failure (leaked exec entry)")
+	}
+	// Retry with the same ID succeeds.
+	if err := lb.Exec(h, "ex-retry", domain.Operation{Command: "true"}); err != nil {
+		t.Fatalf("retry with same ID: %v", err)
+	}
+	res, err := lb.WaitExecution(h, "ex-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("retry exit code = %d", res.ExitCode)
+	}
+}
+
+// M13 regression: dirty-flag updates are race-free against concurrent
+// Dirty/MarkCommitted, and a completed Exec with writes always leaves the
+// incarnation dirty (durability is never claimed for an in-flight write).
+func TestExecDirtyFlagRace(t *testing.T) {
+	lb, err := localbackend.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := lb.Create(backendinterface.Spec{SandboxID: "sb-d", IncarnationID: "inc-d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lb.Start(h); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = lb.Dirty(h)
+				lb.MarkCommitted(h)
+			}
+		}
+	}()
+	for i := 0; i < 50; i++ {
+		id := fmt.Sprintf("ex-dirty-%d", i)
+		if err := lb.Exec(h, id, domain.Operation{Writes: map[string]string{"f.txt": "data"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	if err := lb.Exec(h, "ex-dirty-final", domain.Operation{Writes: map[string]string{"final.txt": "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !lb.Dirty(h) {
+		t.Fatal("incarnation not dirty after Exec with writes returned")
+	}
+}
+
+// M16 regression: backend contract parity (INV-026) — both backends reject
+// Exec while paused and reject Snapshot on a non-paused incarnation.
+func TestBackendPausedContractParity(t *testing.T) {
+	backends := map[string]func(t *testing.T) sandboxmanager.Runtime{
+		"fake": func(t *testing.T) sandboxmanager.Runtime { return fakebackend.New() },
+		"local": func(t *testing.T) sandboxmanager.Runtime {
+			lb, err := localbackend.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return lb
+		},
+	}
+	for name, mk := range backends {
+		t.Run(name, func(t *testing.T) {
+			rt := mk(t)
+			h, err := rt.Create(backendinterface.Spec{SandboxID: "sb-p", IncarnationID: "inc-p"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := rt.Start(h); err != nil {
+				t.Fatal(err)
+			}
+			// Snapshot on a running (non-paused) incarnation is illegal.
+			if _, err := rt.Snapshot(h); !errors.Is(err, backendinterface.ErrIllegalState) {
+				t.Fatalf("Snapshot while running: err = %v, want ErrIllegalState", err)
+			}
+			if err := rt.Pause(h); err != nil {
+				t.Fatal(err)
+			}
+			// Exec while paused is illegal.
+			if err := rt.Exec(h, "ex-paused", domain.Operation{Command: "true"}); !errors.Is(err, backendinterface.ErrIllegalState) {
+				t.Fatalf("Exec while paused: err = %v, want ErrIllegalState", err)
+			}
+			// Snapshot while paused is legal.
+			if _, err := rt.Snapshot(h); err != nil {
+				t.Fatalf("Snapshot while paused: %v", err)
+			}
+			if err := rt.Resume(h); err != nil {
+				t.Fatal(err)
+			}
+			if err := rt.Exec(h, "ex-resumed", domain.Operation{Command: "true"}); err != nil {
+				t.Fatalf("Exec after resume: %v", err)
+			}
+		})
 	}
 }

@@ -145,6 +145,11 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 	if err != nil {
 		return backendinterface.CheckpointData{}, err
 	}
+	// Snapshot requires a paused incarnation, same as the local backend:
+	// checkpointing a running guest would capture inconsistent state.
+	if !r.paused {
+		return backendinterface.CheckpointData{}, backendinterface.ErrIllegalState
+	}
 	return backendinterface.CheckpointData{
 		IncarnationID: h.IncarnationID,
 		Files:         copyFiles(r.files),

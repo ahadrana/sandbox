@@ -103,6 +103,7 @@ func (d *Driver) Exec(sandboxID string, op domain.Operation) (*domain.Execution,
 	return d.Mgr.StartExecution(api.StartExecutionRequest{
 		Version:        api.SchemaVersionV1,
 		SandboxID:      sandboxID,
+		TenantID:       d.TenantID,
 		PrincipalID:    d.PrincipalID,
 		IdempotencyKey: d.NewKey(),
 		Operation:      op,

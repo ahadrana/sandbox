@@ -362,18 +362,23 @@ func (b *Backend) Exec(h backendinterface.Handle, executionID string, op domain.
 		b.mu.Unlock()
 		return err
 	}
-	if !inc.started {
+	if !inc.started || inc.paused {
 		b.mu.Unlock()
 		return backendinterface.ErrIllegalState
 	}
 	inc.ops[executionID] = op
+	if len(op.Writes) > 0 {
+		// Record dirtiness under the lock, at op-recording time: a
+		// concurrent MarkCommitted must never claim durability for a write
+		// that is still in flight (INV-006).
+		inc.dirty = true
+	}
 	b.mu.Unlock()
 
 	for path, content := range op.Writes {
 		if err := writeWorkspaceFile(inc.wsDir, path, content); err != nil {
 			return err
 		}
-		inc.dirty = true
 	}
 	if op.Command != "" {
 		if err := inc.sup.Exec(supervisor.ExecRequest{ExecutionID: executionID, Command: op.Command, Baseline: op.Baseline, Env: op.Env}); err != nil {
@@ -403,8 +408,11 @@ func (b *Backend) WaitExecution(h backendinterface.Handle, executionID string) (
 		b.mu.Unlock()
 		return supervisor.Result{}, err
 	}
-	op := inc.ops[executionID]
+	op, known := inc.ops[executionID]
 	b.mu.Unlock()
+	if !known {
+		return supervisor.Result{}, supervisor.ErrNotFound
+	}
 	if op.Command == "" {
 		return supervisor.Result{ExitCode: op.ExitCode}, nil
 	}

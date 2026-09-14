@@ -96,7 +96,7 @@ func (a *AgentRuntime) WriteFiles(sandboxID string, writes map[string]string) (*
 
 func (a *AgentRuntime) execOp(sandboxID string, op domain.Operation) (*domain.Execution, Observation, error) {
 	ex, err := a.Mgr.StartExecution(api.StartExecutionRequest{
-		Version: api.SchemaVersionV1, SandboxID: sandboxID, PrincipalID: a.PrincipalID,
+		Version: api.SchemaVersionV1, SandboxID: sandboxID, TenantID: a.TenantID, PrincipalID: a.PrincipalID,
 		Operation: op,
 	})
 	if err != nil {

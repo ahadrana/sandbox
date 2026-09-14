@@ -430,23 +430,26 @@ func TestCrashChainAtEveryPoint(t *testing.T) {
 				t.Fatalf("duplicate logical execution after crash at %d: %d", crashAt, len(execs))
 			}
 			got := execs[0]
-			if !got.State.Terminal() {
+			if crashAt >= 5 && !got.State.Terminal() {
 				t.Fatalf("execution non-terminal after reconciliation: %s", got.State)
 			}
 			// Terminal event must be observable by a replaying consumer.
-			consumer := eventservice.NewConsumer()
-			events := consumer.Poll(ds.outbox)
-			var terminal int
-			for _, ev := range events {
-				if ev.AggregateID == got.ExecutionID &&
-					(ev.EventType == domain.EventExecutionCompleted || ev.EventType == domain.EventExecutionFailed) {
-					terminal++
+			countTerminal := func() int {
+				consumer := eventservice.NewConsumer()
+				events := consumer.Poll(ds.outbox)
+				var terminal int
+				for _, ev := range events {
+					if ev.AggregateID == got.ExecutionID &&
+						(ev.EventType == domain.EventExecutionCompleted || ev.EventType == domain.EventExecutionFailed) {
+						terminal++
+					}
 				}
-			}
-			if terminal != 1 {
-				t.Fatalf("expected exactly 1 terminal event, got %d (crash at %d)", terminal, crashAt)
+				return terminal
 			}
 			if crashAt >= 5 {
+				if terminal := countTerminal(); terminal != 1 {
+					t.Fatalf("expected exactly 1 terminal event, got %d (crash at %d)", terminal, crashAt)
+				}
 				// Outcome was durable: the execution finalizes COMPLETED and
 				// the workspace generation is claimed, never silently advanced.
 				if got.State != domain.ExecutionCompleted {
@@ -467,14 +470,32 @@ func TestCrashChainAtEveryPoint(t *testing.T) {
 					t.Fatal("committed bytes missing")
 				}
 			} else {
-				// Crash before the outcome was durable: execution fails
-				// explicitly and the workspace does not advance silently.
-				if got.State != domain.ExecutionFailed {
-					t.Fatalf("state = %s, want FAILED", got.State)
+				// Crash before the outcome was durable, but the incarnation
+				// survived: the reconciler keeps the genuinely-live
+				// execution RUNNING (M9) rather than failing it by
+				// assumption, and the workspace does not advance silently.
+				if got.State != domain.ExecutionRunning {
+					t.Fatalf("state = %s, want RUNNING (live incarnation)", got.State)
 				}
 				head, _ := ds.ws.GetHead(sb.WorkspaceID)
 				if head.Generation != 1 {
 					t.Fatalf("workspace advanced silently to %d", head.Generation)
+				}
+				// The client completes it: the write commits under this
+				// execution's cause and exactly one terminal event exists.
+				done, err := restarted.CompleteExecution(got.ExecutionID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if done.State != domain.ExecutionCompleted {
+					t.Fatalf("state = %s after client completion, want COMPLETED", done.State)
+				}
+				head, _ = ds.ws.GetHead(sb.WorkspaceID)
+				if head.Generation != 2 || head.CauseExecutionID == nil || *head.CauseExecutionID != got.ExecutionID {
+					t.Fatalf("workspace head not claimed by the execution: %+v", head)
+				}
+				if terminal := countTerminal(); terminal != 1 {
+					t.Fatalf("expected exactly 1 terminal event, got %d (crash at %d)", terminal, crashAt)
 				}
 			}
 			// Idempotent retry still returns the same single execution.
@@ -851,5 +872,104 @@ func TestSnapshotCrashOrderingIdempotent(t *testing.T) {
 	snap3, _ := store3.Load()
 	if got, ok := snap3.Sandboxes["sb-1"]; !ok || got.Version != 1 {
 		t.Fatalf("duplicate replay corrupted state: %+v", snap3.Sandboxes)
+	}
+}
+
+// M8 regression: when the reconciler finalizes an execution whose workspace
+// commit already happened (idempotent replay), the sandbox's corrected
+// generation is persisted — a later plain restart must not regress it.
+func TestCommitReplayPersistsGeneration(t *testing.T) {
+	ds := newDurableSystem(t, "fake")
+	inner := ds.openStore(t)
+	cs := &crashStore{inner: inner, n: 5} // crash after outcome durable, before final tx
+	outbox := eventservice.NewOutbox()
+	mgr := sandboxmanager.New(ds.clock, ds.ids, ds.ws, ds.rt, outbox, cs, "host-1")
+	d := agentdriver.New(mgr, "tenant-1", "principal-1", 102)
+	sb, _ := d.CreateSandbox("task-replay-gen")
+	mustMaterialize(t, d, sb.SandboxID)
+	ex, err := mgr.StartExecution(api.StartExecutionRequest{
+		Version:        api.SchemaVersionV1,
+		SandboxID:      sb.SandboxID,
+		TenantID:       "tenant-1",
+		PrincipalID:    d.PrincipalID,
+		IdempotencyKey: d.NewKey(),
+		Operation:      domain.Operation{Writes: map[string]string{"replay.txt": "data"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.CompleteExecution(ex.ExecutionID); err == nil {
+		t.Fatal("expected injected crash error")
+	}
+	inner.Close()
+	ds.restart(t)
+	cur, err := ds.mgr.GetSandbox(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.WorkspaceGeneration != 2 {
+		t.Fatalf("generation after reconciliation = %d, want 2", cur.WorkspaceGeneration)
+	}
+	// Plain second restart: the replay-corrected generation must have been
+	// persisted, not reconstructed in memory only.
+	ds.restart(t)
+	cur2, err := ds.mgr.GetSandbox(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur2.WorkspaceGeneration != 2 {
+		t.Fatalf("generation regressed to %d after second restart, want 2", cur2.WorkspaceGeneration)
+	}
+}
+
+// M9 regression: after a control-plane restart, a RUNNING execution whose
+// incarnation verifies alive stays RUNNING and completes normally — it is
+// not failed by assumption.
+func TestReconcilerKeepsLiveExecutionsRunning(t *testing.T) {
+	ds := newDurableSystem(t, "fake")
+	inner := ds.openStore(t)
+	outbox := eventservice.NewOutbox()
+	mgr := sandboxmanager.New(ds.clock, ds.ids, ds.ws, ds.rt, outbox, inner, "host-1")
+	d := agentdriver.New(mgr, "tenant-1", "principal-1", 104)
+	sb, _ := d.CreateSandbox("task-live-exec")
+	mustMaterialize(t, d, sb.SandboxID)
+	ex, err := mgr.StartExecution(api.StartExecutionRequest{
+		Version:        api.SchemaVersionV1,
+		SandboxID:      sb.SandboxID,
+		TenantID:       "tenant-1",
+		PrincipalID:    d.PrincipalID,
+		IdempotencyKey: d.NewKey(),
+		Operation:      domain.Operation{Command: "sleep 5", Writes: map[string]string{"live.txt": "mine"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ex.State != domain.ExecutionRunning {
+		t.Fatalf("execution state = %s", ex.State)
+	}
+	// Control-plane restart; the backend incarnation survives (same rt).
+	inner.Close()
+	ds.restart(t)
+	got, err := ds.mgr.GetExecution(ex.ExecutionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != domain.ExecutionRunning {
+		t.Fatalf("live execution state after restart = %s, want RUNNING", got.State)
+	}
+	// Completion still works and the write is attributed to this execution.
+	done, err := ds.mgr.CompleteExecution(ex.ExecutionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.State != domain.ExecutionCompleted {
+		t.Fatalf("state = %s, want COMPLETED", done.State)
+	}
+	head, err := ds.ws.GetHead(sb.WorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head.CauseExecutionID == nil || *head.CauseExecutionID != ex.ExecutionID {
+		t.Fatalf("workspace write misattributed: %+v", head.CauseExecutionID)
 	}
 }

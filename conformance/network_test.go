@@ -71,6 +71,32 @@ func TestMetadataEndpointsAlwaysDenied(t *testing.T) {
 	if dec.Allowed {
 		t.Fatal("metadata endpoint allowed by engine")
 	}
+	// M4: bypass variants — case, trailing dot, cluster-name suffixes, and
+	// alternate IP encodings — must all fail closed.
+	policy := network.EgressPolicy{DefaultAllow: true, Allow: []string{"*"}}
+	for _, dest := range []string{
+		"169.254.169.254",
+		"169.254.169.254.",
+		"::ffff:169.254.169.254",
+		"2852039166", // decimal encoding
+		"0xa9fea9fe", // hex encoding
+		"0xA9FEA9FE", // upper-case hex
+		"kubernetes.default.svc",
+		"KUBERNETES.default.svc",
+		"kubernetes.default.svc.",
+		"kubernetes.default.svc.cluster.local",
+		"kubernetes.default.svc.my-cluster.example",
+	} {
+		if dec := network.EvaluateEgress(policy, dest, time.Now()); dec.Allowed {
+			t.Fatalf("bypass variant %q allowed", dest)
+		}
+	}
+	// Lookalikes that are NOT the protected endpoints must still be allowed.
+	for _, dest := range []string{"169.254.169.253", "kubernetes.default.svcx.example.com", "example.com"} {
+		if dec := network.EvaluateEgress(policy, dest, time.Now()); !dec.Allowed {
+			t.Fatalf("legitimate destination %q denied", dest)
+		}
+	}
 }
 
 // Endpoint bindings route through the fail-closed gateway and expire at
@@ -289,5 +315,84 @@ func TestSecretNotInTranscript(t *testing.T) {
 	}
 	if !strings.Contains(string(auditBytes), claims.TokenID) {
 		t.Fatal("audit log missing token ID records")
+	}
+}
+
+// M5 regression: revocations survive a broker restart (durable audit file),
+// token IDs are random/unique across instances, and revocation is checked
+// before expiry.
+func TestBrokerRevocationDurableAcrossRestart(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "broker-audit.jsonl")
+	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	b1, err := credentialbroker.New([]byte("shared-key"), auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, claims, err := b1.Issue("tenant-1", "task-x", []string{"read:workspace"}, time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1.Revoke(claims.TokenID, now)
+
+	// A second broker instance sharing the HMAC key and audit file.
+	b2, err := credentialbroker.New([]byte("shared-key"), auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b2.Verify(token, now); !errors.Is(err, credentialbroker.ErrRevoked) {
+		t.Fatalf("revoked token verified after broker restart: %v", err)
+	}
+	// Revocation is checked before expiry: revoked AND expired is revoked.
+	if _, err := b2.Verify(token, now.Add(2*time.Minute)); !errors.Is(err, credentialbroker.ErrRevoked) {
+		t.Fatalf("revoked+expired token: err = %v, want ErrRevoked", err)
+	}
+	// Token IDs are random: distinct instances never mint colliding IDs.
+	_, claims2, err := b2.Issue("tenant-2", "task-y", nil, time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims2.TokenID == claims.TokenID {
+		t.Fatalf("token ID collision across broker instances: %s", claims2.TokenID)
+	}
+	seen := map[string]bool{claims.TokenID: true, claims2.TokenID: true}
+	for i := 0; i < 100; i++ {
+		_, c, err := b2.Issue("tenant-2", "task-y", nil, time.Minute, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen[c.TokenID] {
+			t.Fatalf("duplicate token ID %s", c.TokenID)
+		}
+		seen[c.TokenID] = true
+	}
+}
+
+// TestEgressEnforcementDeclarationOnlyGap is a DECLARED GAP test (M19),
+// modeled on the isolation tests' declared-difference style: on the local
+// backend, egress policy is enforced only for destinations the caller
+// volunteers via Operation.EgressDestination. A command's real network
+// access is NOT checked — undeclared egress neither evaluates policy nor
+// writes an audit record. The isolated backend's gap closure (no host
+// network via bwrap) is asserted in the isolation tests.
+func TestEgressEnforcementDeclarationOnlyGap(t *testing.T) {
+	s := newSystem(t, "local")
+	s.mgr.SetEgressPolicy("default", network.EgressPolicy{DefaultAllow: false})
+	d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 83)
+	sb, _ := d.CreateSandbox("task-egress-gap")
+	mustMaterialize(t, d, sb.SandboxID)
+
+	// Undeclared: the command runs with NO policy evaluation, even under a
+	// default-deny policy. This is the capability gap, asserted honestly.
+	if _, err := d.ExecSync(sb.SandboxID, domain.Operation{Command: "true"}); err != nil {
+		t.Fatalf("undeclared egress command failed under default-deny: %v", err)
+	}
+	for _, e := range s.mgr.EgressAuditEntries() {
+		if e.Subject == sb.SandboxID {
+			t.Fatalf("undeclared command produced an egress audit record: %+v", e)
+		}
+	}
+	// Declared: the same destination volunteered IS evaluated and denied.
+	if _, err := d.Exec(sb.SandboxID, domain.Operation{Command: "true", EgressDestination: "example.com"}); !errors.Is(err, domain.ErrEgressDenied) {
+		t.Fatalf("declared egress not policy-enforced: %v", err)
 	}
 }

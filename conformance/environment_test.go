@@ -460,3 +460,41 @@ func TestRetiredStatusPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("retired env content = %q", files["repo/app/main.go"])
 	}
 }
+
+// M18 regression: SpecDigest is collision-free across field boundaries, and
+// repo refs that escape the source root are rejected.
+func TestSpecDigestCollisionResistant(t *testing.T) {
+	a := environmentbuilder.EnvironmentSpec{BaseRuntimeRef: "base", RepoInputs: []domain.RepoInput{{RepoURL: "u", SHA: "s"}}}
+	b := environmentbuilder.EnvironmentSpec{BaseRuntimeRef: "base\nrepo:u@s"}
+	if environmentbuilder.SpecDigest(a) == environmentbuilder.SpecDigest(b) {
+		t.Fatal("newline-boundary collision between distinct specs")
+	}
+	c := environmentbuilder.EnvironmentSpec{InstallCommand: "x"}
+	d := environmentbuilder.EnvironmentSpec{InstallCommand: "x\nconfig:k=v", Config: map[string]string{}}
+	if environmentbuilder.SpecDigest(c) == environmentbuilder.SpecDigest(d) {
+		t.Fatal("install/config boundary collision between distinct specs")
+	}
+	// Identity still holds for identical inputs.
+	if environmentbuilder.SpecDigest(a) != environmentbuilder.SpecDigest(environmentbuilder.EnvironmentSpec{BaseRuntimeRef: "base", RepoInputs: []domain.RepoInput{{RepoURL: "u", SHA: "s"}}}) {
+		t.Fatal("identical inputs produced different digests")
+	}
+}
+
+func TestRepoRefContainment(t *testing.T) {
+	repos := environmentbuilder.NewLocalRepoSource(t.TempDir())
+	if err := repos.AddVersion("../escape", "", map[string]string{"x": "y"}); err == nil {
+		t.Fatal("escaping repo ref accepted by AddVersion")
+	}
+	if err := repos.AddVersion("ok", "", map[string]string{"../escape.txt": "y"}); err == nil {
+		t.Fatal("escaping file path accepted by AddVersion")
+	}
+	if err := repos.AddVersion("ok", "", map[string]string{"dir/file.txt": "y"}); err != nil {
+		t.Fatalf("legitimate version rejected: %v", err)
+	}
+	if err := repos.Checkout("../escape", "", t.TempDir()); err == nil {
+		t.Fatal("escaping repo ref accepted by Checkout")
+	}
+	if err := repos.Checkout("ok", "", t.TempDir()); err != nil {
+		t.Fatalf("legitimate checkout rejected: %v", err)
+	}
+}

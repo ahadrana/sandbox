@@ -130,6 +130,18 @@ func (c *artifactCache) has(key string) bool {
 	return ok
 }
 
+// keys snapshots the cache keys under the cache lock (safe for concurrent
+// readers like View).
+func (c *artifactCache) keys() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.entries))
+	for k := range c.entries {
+		out = append(out, k)
+	}
+	return out
+}
+
 // CreateRequest is a fenced incarnation-create command from the control plane.
 type CreateRequest struct {
 	SandboxID           string
@@ -188,6 +200,18 @@ func New(hostID string, backend *localbackend.Backend, envs EnvironmentSource, w
 }
 
 func (h *HostAgent) HostID() string { return h.hostID }
+
+// IncarnationIDs snapshots the host's live incarnation IDs under the host
+// lock (used by fleet orphan reconciliation at re-registration).
+func (h *HostAgent) IncarnationIDs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, 0, len(h.incarnations))
+	for id := range h.incarnations {
+		out = append(out, id)
+	}
+	return out
+}
 
 func (h *HostAgent) Backend() *localbackend.Backend { return h.backend }
 
@@ -476,7 +500,7 @@ func (h *HostAgent) View() scheduler.HostView {
 			v.CachedCheckpoints[rec.sandboxID] = true
 		}
 	}
-	for key := range h.cache.entries {
+	for _, key := range h.cache.keys() {
 		if strings.HasPrefix(key, "env:") {
 			v.CachedEnvironments[strings.TrimPrefix(key, "env:")] = true
 			continue

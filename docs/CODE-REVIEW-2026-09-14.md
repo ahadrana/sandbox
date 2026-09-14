@@ -18,25 +18,25 @@
 
 ## Medium severity
 
-- [ ] **M1 — `domain/statemachine.go:55` — self-transitions legal from terminal states.** `CancelExecution` on a cancelled execution re-completes it and emits a duplicate event; `Manager.transition` with `to == current` bumps `Sandbox.Version` silently.
-- [ ] **M2 — `manager.go:849` — epoch fence inert unless `DependsOnVolatileState` is set.** A client supplying only `ExpectedEpoch` gets no fencing and no error (INV-008 exposure). Fence whenever `ExpectedEpoch != 0`.
-- [ ] **M3 — no tenant authorization anywhere.** `PrincipalID` is self-asserted; any caller knowing a `sandbox_id` can exec/read/terminate cross-tenant. Chaos "isolation" assertions only check attribution. Document as a declared simulation gap or enforce (INV-028, DESIGN §6.1).
-- [ ] **M4 — `network/network.go:39` — metadata deny-list bypassable.** Case variants, trailing-dot FQDN, `kubernetes.default.svc.cluster.local`, and alternate IP encodings (decimal/hex/IPv6-mapped) bypass `AlwaysDenied`. Test only probes two exact strings.
-- [ ] **M5 — `credential-broker/broker.go:41,67` — revocation memory-only; sequential token IDs.** Broker restart silently un-revokes live tokens; `tok-%d` IDs collide across broker instances sharing an HMAC key.
-- [ ] **M6 — `filestore.go:62,46` — corrupt journal/snapshot handling.** A corrupt line mid-journal silently drops it and everything after (only the final line may be torn); corrupt `snapshot.json` bricks the store with no fallback/quarantine.
-- [ ] **M7 — `manager.go:1659` — wall-deadline suspend leaks incarnation record.** Never sets `IncarnationTerminated`, never clears `RuntimeIncarnationID` (miscounts quota after restart), skips endpoint-binding suspension (INV-017).
-- [ ] **M8 — `manager.go:1064` — idempotent commit replay doesn't persist corrected generation.** Durable sandbox generation regresses vs workspace head after another restart.
-- [ ] **M9 — `manager.go:334` — restart reconciler fails genuinely-running executions.** Executions without stored outcome marked FAILED even when the backend incarnation verifies alive; their later workspace writes get misattributed.
-- [ ] **M10 — `runtime/host-agent/fleet.go:367` — `Fleet.Capabilities()` over-declares** (VM class, restore=true) while `Fleet.Restore` returns `ErrUnsupported`; zero hosts → full VM-class reported.
-- [ ] **M11 — `runtime/local-backend/local.go:406` — `WaitExecution` fabricates `ExitCode: 0` for unknown IDs** instead of `ErrNotFound` (fake backend does this correctly).
-- [ ] **M12 — `runtime/local-backend/supervisor.go:91` — exec entry leaked on `cmd.Start` failure** → `Wait` hangs forever; execution ID permanently consumed.
-- [ ] **M13 — `runtime/local-backend/local.go:376` — data race on `inc.dirty`** (write outside lock); also a commit-ordering gap: `MarkCommitted` can run between workspace write and `dirty=true`, claiming durability for an uncommitted write (INV-006).
-- [ ] **M14 — `runtime/host-agent/hostagent.go:481` — `View()` reads artifact cache without its lock** → race with concurrent creates ("concurrent map iteration and map write").
-- [ ] **M15 — `runtime/host-agent/fleet.go:227` — terminate on lost host orphans incarnation.** Re-registered host runs unroutable, unaccounted compute (INV-016); fleet believes it gone.
-- [ ] **M16 — backend drift (INV-026).** Local accepts `Exec` while paused, fake rejects; `fake.Snapshot` doesn't require paused, local does.
-- [ ] **M17 — `chaos/chaos.go:306` — kill path can't catch false continuity.** No assertion that runtime kill ⇒ epoch increment + reset event (the INV-008 failure mode the harness exists to catch). Suspend path has it; kill path doesn't.
-- [ ] **M18 — `environment-builder/builder.go:43,88,484` — builder identity/traversal/retired-read issues.** `SpecDigest` newline-concatenation collisions; `filepath.Clean` doesn't stop `../` in repo refs; `ArtifactManifest` rejects RETIRED envs though they must be bootable (INV-021).
-- [ ] **M19 — egress "enforcement" is declaration-only.** `Operation.EgressDestination` is caller-volunteered; real commands' network access is unchecked on the local backend. Needs an explicit named gap test (isolation tests set the precedent).
+- [x] **M1 — `domain/statemachine.go:55` — self-transitions legal from terminal states.** `CancelExecution` on a cancelled execution re-completes it and emits a duplicate event; `Manager.transition` with `to == current` bumps `Sandbox.Version` silently.
+- [x] **M2 — `manager.go:849` — epoch fence inert unless `DependsOnVolatileState` is set.** A client supplying only `ExpectedEpoch` gets no fencing and no error (INV-008 exposure). Fence whenever `ExpectedEpoch != 0`.
+- [x] **M3 — no tenant authorization anywhere.** `PrincipalID` is self-asserted; any caller knowing a `sandbox_id` can exec/read/terminate cross-tenant. Chaos "isolation" assertions only check attribution. Document as a declared simulation gap or enforce (INV-028, DESIGN §6.1).
+- [x] **M4 — `network/network.go:39` — metadata deny-list bypassable.** Case variants, trailing-dot FQDN, `kubernetes.default.svc.cluster.local`, and alternate IP encodings (decimal/hex/IPv6-mapped) bypass `AlwaysDenied`. Test only probes two exact strings.
+- [x] **M5 — `credential-broker/broker.go:41,67` — revocation memory-only; sequential token IDs.** Broker restart silently un-revokes live tokens; `tok-%d` IDs collide across broker instances sharing an HMAC key.
+- [x] **M6 — `filestore.go:62,46` — corrupt journal/snapshot handling.** A corrupt line mid-journal silently drops it and everything after (only the final line may be torn); corrupt `snapshot.json` bricks the store with no fallback/quarantine.
+- [x] **M7 — `manager.go:1659` — wall-deadline suspend leaks incarnation record.** Never sets `IncarnationTerminated`, never clears `RuntimeIncarnationID` (miscounts quota after restart), skips endpoint-binding suspension (INV-017).
+- [x] **M8 — `manager.go:1064` — idempotent commit replay doesn't persist corrected generation.** Durable sandbox generation regresses vs workspace head after another restart.
+- [x] **M9 — `manager.go:334` — restart reconciler fails genuinely-running executions.** Executions without stored outcome marked FAILED even when the backend incarnation verifies alive; their later workspace writes get misattributed.
+- [x] **M10 — `runtime/host-agent/fleet.go:367` — `Fleet.Capabilities()` over-declares** (VM class, restore=true) while `Fleet.Restore` returns `ErrUnsupported`; zero hosts → full VM-class reported.
+- [x] **M11 — `runtime/local-backend/local.go:406` — `WaitExecution` fabricates `ExitCode: 0` for unknown IDs** instead of `ErrNotFound` (fake backend does this correctly).
+- [x] **M12 — `runtime/local-backend/supervisor.go:91` — exec entry leaked on `cmd.Start` failure** → `Wait` hangs forever; execution ID permanently consumed.
+- [x] **M13 — `runtime/local-backend/local.go:376` — data race on `inc.dirty`** (write outside lock); also a commit-ordering gap: `MarkCommitted` can run between workspace write and `dirty=true`, claiming durability for an uncommitted write (INV-006).
+- [x] **M14 — `runtime/host-agent/hostagent.go:481` — `View()` reads artifact cache without its lock** → race with concurrent creates ("concurrent map iteration and map write").
+- [x] **M15 — `runtime/host-agent/fleet.go:227` — terminate on lost host orphans incarnation.** Re-registered host runs unroutable, unaccounted compute (INV-016); fleet believes it gone.
+- [x] **M16 — backend drift (INV-026).** Local accepts `Exec` while paused, fake rejects; `fake.Snapshot` doesn't require paused, local does.
+- [x] **M17 — `chaos/chaos.go:306` — kill path can't catch false continuity.** No assertion that runtime kill ⇒ epoch increment + reset event (the INV-008 failure mode the harness exists to catch). Suspend path has it; kill path doesn't.
+- [x] **M18 — `environment-builder/builder.go:43,88,484` — builder identity/traversal/retired-read issues.** `SpecDigest` newline-concatenation collisions; `filepath.Clean` doesn't stop `../` in repo refs; `ArtifactManifest` rejects RETIRED envs though they must be bootable (INV-021).
+- [x] **M19 — egress "enforcement" is declaration-only.** `Operation.EgressDestination` is caller-volunteered; real commands' network access is unchecked on the local backend. Needs an explicit named gap test (isolation tests set the precedent).
 
 ## Low severity
 

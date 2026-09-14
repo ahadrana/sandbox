@@ -9,7 +9,9 @@ package network
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +27,9 @@ type EgressPolicy struct {
 }
 
 // AlwaysDenied destinations are cloud metadata and cluster API endpoints;
-// no policy may permit them (FR-SEC-001).
+// no policy may permit them (FR-SEC-001). Matching normalizes case, trailing
+// dots, cluster-domain suffixes, and alternate IP encodings so bypass
+// variants fail closed (see isAlwaysDenied).
 var AlwaysDenied = []string{"169.254.169.254", "kubernetes.default.svc"}
 
 // EgressDecision is one evaluated destination plus its audit record.
@@ -34,6 +38,43 @@ type EgressDecision struct {
 	Allowed     bool      `json:"allowed"`
 	Reason      string    `json:"reason"`
 	At          time.Time `json:"at"`
+}
+
+// normalizeHost canonicalizes a destination for policy matching: lowercase,
+// no trailing dot.
+func normalizeHost(dest string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(dest)), ".")
+}
+
+// metadataIP is 169.254.169.254.
+const metadataIPv4 = 0xA9FEA9FE
+
+// isMetadataIP reports whether dest names the link-local cloud metadata
+// address in any encoding: dotted quad, IPv6-mapped, decimal, or hex.
+func isMetadataIP(dest string) bool {
+	if ip := net.ParseIP(dest); ip != nil {
+		v4 := ip.To4() // also unwraps IPv6-mapped forms
+		return v4 != nil && uint32(v4[0])<<24|uint32(v4[1])<<16|uint32(v4[2])<<8|uint32(v4[3]) == metadataIPv4
+	}
+	var n uint64
+	var err error
+	if strings.HasPrefix(dest, "0x") || strings.HasPrefix(dest, "0X") {
+		n, err = strconv.ParseUint(dest[2:], 16, 32)
+	} else {
+		n, err = strconv.ParseUint(dest, 10, 32)
+	}
+	return err == nil && uint32(n) == metadataIPv4
+}
+
+// isAlwaysDenied reports whether dest is a metadata/cluster endpoint in any
+// normalized form; these may never be permitted by policy.
+func isAlwaysDenied(dest string) bool {
+	d := normalizeHost(dest)
+	if isMetadataIP(d) {
+		return true
+	}
+	const clusterAPI = "kubernetes.default.svc"
+	return d == clusterAPI || strings.HasPrefix(d, clusterAPI+".")
 }
 
 func hostMatches(list []string, dest string) bool {
@@ -52,15 +93,16 @@ func hostMatches(list []string, dest string) bool {
 // EvaluateEgress decides allow/deny for a destination at time now.
 func EvaluateEgress(p EgressPolicy, dest string, now time.Time) EgressDecision {
 	d := EgressDecision{Destination: dest, At: now}
-	if hostMatches(AlwaysDenied, dest) {
+	if isAlwaysDenied(dest) {
 		d.Reason = "metadata/cluster endpoint always denied"
 		return d
 	}
-	if hostMatches(p.Deny, dest) {
+	norm := normalizeHost(dest)
+	if hostMatches(p.Deny, norm) {
 		d.Reason = "deny list"
 		return d
 	}
-	if hostMatches(p.Allow, dest) {
+	if hostMatches(p.Allow, norm) {
 		d.Allowed = true
 		d.Reason = "allow list"
 		return d

@@ -345,6 +345,13 @@ func (m *Manager) reconcileInnerLocked() error {
 			}
 			continue
 		}
+		// An execution whose incarnation verified alive in the sandbox pass
+		// above is still genuinely running: leave it RUNNING so its client
+		// can complete it (and its workspace writes commit under its own
+		// cause) rather than failing it by assumption.
+		if h, live := m.handles[ex.SandboxID]; live && m.rt.Alive(h) {
+			continue
+		}
 		if err := domain.TransitionExecution(ex.State, domain.ExecutionFailed); err != nil {
 			return err
 		}
@@ -390,6 +397,11 @@ func (m *Manager) emit(sb *domain.Sandbox, aggregateID string, et domain.EventTy
 }
 
 func (m *Manager) transition(sb *domain.Sandbox, to domain.SandboxState) error {
+	if sb.ObservedState == to {
+		// Already in the target state: a true no-op, never a silent
+		// version bump.
+		return nil
+	}
 	if err := domain.TransitionSandbox(sb.ObservedState, to); err != nil {
 		return err
 	}
@@ -523,7 +535,9 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 			"victim_priority":    victim.Priority,
 			"requester_priority": sb.Priority,
 		})
-		if serr := m.suspendLocked(victim); serr != nil {
+		// Preemption must reclaim the victim's capacity: workspace-only
+		// suspend, never a RAM-retaining checkpoint.
+		if serr := m.suspendWithReasonLocked(victim, "preempted", false); serr != nil {
 			break
 		}
 		h, err = m.rt.Create(spec)
@@ -639,6 +653,17 @@ func (m *Manager) checkQuotaLocked(sb *domain.Sandbox) error {
 	}
 	if q.MaxCPUWeight > 0 && live+1 > q.MaxCPUWeight {
 		return deny("cpu_weight", q.MaxCPUWeight)
+	}
+	return nil
+}
+
+// authorizeTenant enforces per-tenant ownership (INV-028): a request that
+// asserts a tenant must assert the sandbox's owner. An empty tenant defaults
+// to the owner (single-tenant/dev callers); authenticating the principal
+// itself remains a gateway concern (DESIGN §6.1).
+func authorizeTenant(sb *domain.Sandbox, tenantID string) error {
+	if tenantID != "" && tenantID != sb.TenantID {
+		return &domain.UnauthorizedError{TenantID: tenantID, OwnerID: sb.TenantID, SandboxID: sb.SandboxID}
 	}
 	return nil
 }
@@ -855,6 +880,9 @@ func (m *Manager) StartExecution(req api.StartExecutionRequest) (*domain.Executi
 	if !ok {
 		return nil, domain.ErrNotFound
 	}
+	if err := authorizeTenant(sb, req.TenantID); err != nil {
+		return nil, err
+	}
 	if req.IdempotencyKey != "" {
 		if existingID, dup := m.idem[req.SandboxID+"|"+req.IdempotencyKey]; dup {
 			ex := m.executions[existingID]
@@ -881,7 +909,10 @@ func (m *Manager) StartExecution(req api.StartExecutionRequest) (*domain.Executi
 			return nil, fmt.Errorf("%w: %s (%s)", domain.ErrEgressDenied, dest, decision.Reason)
 		}
 	}
-	if req.DependsOnVolatileState && req.ExpectedEpoch != sb.ExecutionEpoch {
+	// Fence whenever the caller supplies an expected epoch (INV-008);
+	// DependsOnVolatileState only documents intent, it does not gate the
+	// fence itself.
+	if req.ExpectedEpoch != 0 && req.ExpectedEpoch != sb.ExecutionEpoch {
 		return nil, &domain.EpochConflictError{
 			SandboxID: sb.SandboxID, Expected: req.ExpectedEpoch, Actual: sb.ExecutionEpoch,
 		}
@@ -1098,7 +1129,14 @@ func (m *Manager) commitLocked(sb *domain.Sandbox, h backendinterface.Handle, ca
 		return err
 	}
 	if causeExecutionID != nil && head.CauseExecutionID != nil && *head.CauseExecutionID == *causeExecutionID {
-		sb.WorkspaceGeneration = head.Generation
+		// Idempotent replay: the commit already happened, but the sandbox's
+		// persisted generation may have regressed (e.g. recovered from a
+		// pre-commit journal) — persist the corrected value.
+		if sb.WorkspaceGeneration != head.Generation {
+			sb.WorkspaceGeneration = head.Generation
+			sb.Version++
+			m.txSandbox(sb)
+		}
 		return nil
 	}
 	if !m.rt.Dirty(h) {
@@ -1134,6 +1172,9 @@ func (m *Manager) CommitWorkspace(req api.CommitWorkspaceRequest) (*domain.Works
 	if !ok {
 		return nil, domain.ErrNotFound
 	}
+	if err := authorizeTenant(sb, req.TenantID); err != nil {
+		return nil, err
+	}
 	h, ok := m.handles[req.SandboxID]
 	if !ok {
 		return nil, domain.ErrIllegalState
@@ -1155,13 +1196,19 @@ func (m *Manager) CommitWorkspace(req api.CommitWorkspaceRequest) (*domain.Works
 	return &head, nil
 }
 
-// CancelExecution cancels a non-terminal execution (FR-EX-007).
+// CancelExecution cancels a non-terminal execution (FR-EX-007). Cancelling
+// an already-terminal execution is an idempotent read: it returns the
+// existing terminal state without re-emitting events.
 func (m *Manager) CancelExecution(executionID string) (*domain.Execution, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ex, ok := m.executions[executionID]
 	if !ok {
 		return nil, domain.ErrNotFound
+	}
+	if ex.State.Terminal() {
+		cp := *ex
+		return &cp, nil
 	}
 	sb := m.sandboxes[ex.SandboxID]
 	if err := domain.TransitionExecution(ex.State, domain.ExecutionCancelled); err != nil {
@@ -1223,7 +1270,25 @@ func (m *Manager) Suspend(sandboxID string) error {
 // suspendLocked is the lock-free suspend body, shared by the public API and
 // scheduler preemption.
 func (m *Manager) suspendLocked(sb *domain.Sandbox) error {
+	return m.suspendWithReasonLocked(sb, "", true)
+}
+
+// suspendWithReasonLocked is THE suspend path (explicit Suspend, preemption,
+// and wall-deadline enforcement all route through it): incarnation records,
+// endpoint-binding suspension, and handle cleanup are identical regardless
+// of trigger (INV-017). allowCheckpoint distinguishes intent: an explicit
+// Suspend prefers EXECUTION_STATE checkpoint continuity, while
+// enforcement-triggered suspends (preemption, deadlines) must RECLAIM
+// resources, so they take the workspace-only path — a checkpoint keeps RAM
+// allocated and would defeat the enforcement.
+func (m *Manager) suspendWithReasonLocked(sb *domain.Sandbox, reason string, allowCheckpoint bool) error {
 	sandboxID := sb.SandboxID
+	payloadReason := func(p map[string]any) map[string]any {
+		if reason != "" {
+			p["reason"] = reason
+		}
+		return p
+	}
 	if err := m.transition(sb, domain.SandboxSuspending); err != nil {
 		return err
 	}
@@ -1241,8 +1306,8 @@ func (m *Manager) suspendLocked(sb *domain.Sandbox) error {
 		if err := m.commitLocked(sb, h, nil); err != nil {
 			return err
 		}
-		if m.rt.Capabilities().SupportsCheckpoint {
-			if err := m.checkpointSuspendLocked(sb, h); err == nil {
+		if allowCheckpoint && m.rt.Capabilities().SupportsCheckpoint {
+			if err := m.checkpointSuspendLocked(sb, h, payloadReason); err == nil {
 				return m.flushTx()
 			}
 			// Checkpoint failed: fall back to workspace-only suspend.
@@ -1262,11 +1327,11 @@ func (m *Manager) suspendLocked(sb *domain.Sandbox) error {
 		if err := m.transition(sb, domain.SandboxSuspended); err != nil {
 			return err
 		}
-		m.emit(sb, sb.SandboxID, domain.EventSandboxSuspended, map[string]any{
+		m.emit(sb, sb.SandboxID, domain.EventSandboxSuspended, payloadReason(map[string]any{
 			"mode":                 "workspace_only",
 			"workspace_generation": sb.WorkspaceGeneration,
 			"lost_processes":       lost,
-		})
+		}))
 		return m.flushTx()
 	}
 	if sb.RuntimeIncarnationID != nil {
@@ -1279,17 +1344,17 @@ func (m *Manager) suspendLocked(sb *domain.Sandbox) error {
 	if err := m.transition(sb, domain.SandboxSuspended); err != nil {
 		return err
 	}
-	m.emit(sb, sb.SandboxID, domain.EventSandboxSuspended, map[string]any{
+	m.emit(sb, sb.SandboxID, domain.EventSandboxSuspended, payloadReason(map[string]any{
 		"mode":                 "workspace_only",
 		"workspace_generation": sb.WorkspaceGeneration,
-	})
+	}))
 	return m.flushTx()
 }
 
 // checkpointSuspendLocked pauses the incarnation (SIGSTOP class) and records
 // an EXECUTION_STATE checkpoint; RAM stays allocated, which Usage keeps
 // reporting honestly. The handle stays live for a continuity resume.
-func (m *Manager) checkpointSuspendLocked(sb *domain.Sandbox, h backendinterface.Handle) error {
+func (m *Manager) checkpointSuspendLocked(sb *domain.Sandbox, h backendinterface.Handle, payloadReason func(map[string]any) map[string]any) error {
 	if err := m.rt.Pause(h); err != nil {
 		return err
 	}
@@ -1320,12 +1385,12 @@ func (m *Manager) checkpointSuspendLocked(sb *domain.Sandbox, h backendinterface
 	if err := m.transition(sb, domain.SandboxSuspended); err != nil {
 		return err
 	}
-	m.emit(sb, sb.SandboxID, domain.EventSandboxSuspended, map[string]any{
+	m.emit(sb, sb.SandboxID, domain.EventSandboxSuspended, payloadReason(map[string]any{
 		"mode":                 "execution_state",
 		"checkpoint_id":        cpID,
 		"workspace_generation": sb.WorkspaceGeneration,
 		"ram_reclaimed_bytes":  int64(0),
-	})
+	}))
 	return nil
 }
 
@@ -1444,6 +1509,9 @@ func (m *Manager) CreateEndpointBinding(req api.CreateEndpointBindingRequest) (*
 	sb, ok := m.sandboxes[req.SandboxID]
 	if !ok {
 		return nil, domain.ErrNotFound
+	}
+	if err := authorizeTenant(sb, req.TenantID); err != nil {
+		return nil, err
 	}
 	b := &domain.EndpointBinding{
 		BindingID:      m.ids.Next("bind"),
@@ -1693,24 +1761,11 @@ func (m *Manager) enforceLeaseLocked(sb *domain.Sandbox) error {
 	}
 	now := m.clock.Now()
 	h, live := m.handles[sb.SandboxID]
-	if live && sb.ObservedState != domain.SandboxSuspended && now.After(lease.WallDeadline) {
-		if err := m.transition(sb, domain.SandboxSuspending); err != nil {
-			return err
-		}
-		if err := m.commitLocked(sb, h, nil); err != nil {
-			return err
-		}
-		if err := m.rt.Terminate(h); err != nil {
-			return err
-		}
-		delete(m.handles, sb.SandboxID)
-		if err := m.transition(sb, domain.SandboxSuspended); err != nil {
-			return err
-		}
-		m.emit(sb, sb.SandboxID, domain.EventSandboxSuspended, map[string]any{
-			"reason": "wall_deadline",
-		})
-		return nil
+	if live && execStartable[sb.ObservedState] && now.After(lease.WallDeadline) {
+		// Wall-deadline enforcement routes through the shared suspend path
+		// so incarnation records, binding suspension, and handle cleanup
+		// match an explicit Suspend exactly.
+		return m.suspendWithReasonLocked(sb, "wall_deadline", false)
 	}
 	if !live {
 		return nil

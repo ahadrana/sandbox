@@ -401,3 +401,96 @@ func TestConcurrentDuplicateCreateAtomic(t *testing.T) {
 		t.Fatalf("memory charged %d, want 64", v.UsedMemory)
 	}
 }
+
+// M10 regression: fleet capabilities are the honest intersection — an empty
+// fleet declares zero-value capabilities, and Restore (which Fleet does not
+// route) is never over-declared.
+func TestFleetCapabilitiesHonest(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC))
+	ws := workspace.NewMemory(clock, domain.NewIDGen())
+	empty := hostagent.NewFleet(clock, nil, ws)
+	caps := empty.Capabilities()
+	if caps != (backendinterface.Capabilities{}) {
+		t.Fatalf("empty fleet capabilities = %+v, want zero value", caps)
+	}
+
+	fs := newFleetSystem(t, 2, 4)
+	caps = fs.fleet.Capabilities()
+	if caps.IsolationClass != backendinterface.IsolationProcess {
+		t.Fatalf("fleet isolation class = %s, want PROCESS (weakest host)", caps.IsolationClass)
+	}
+	if caps.SupportsRestore {
+		t.Fatal("SupportsRestore over-declared: Fleet.Restore returns ErrUnsupported")
+	}
+}
+
+// M14 regression: View reads cache state under the cache lock — concurrent
+// View during creates must not race ("concurrent map iteration and map
+// write").
+func TestViewConcurrentWithCreate(t *testing.T) {
+	fs := newFleetSystem(t, 1, 8)
+	agent := fs.hosts["host-1"]
+	wsID := createWSForTest(t, fs)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = agent.View()
+			}
+		}
+	}()
+	for i := 0; i < 8; i++ {
+		_, err := agent.Create(hostagent.CreateRequest{
+			SandboxID: fmt.Sprintf("sb-view-%d", i), IncarnationID: fmt.Sprintf("inc-view-%d", i),
+			Fence: 1, Epoch: 1, WorkspaceID: wsID, WorkspaceGeneration: 1, MemoryBytes: 16,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// M15 regression: an incarnation terminated via the fleet while its host is
+// lost is scrubbed when the host re-registers — the orphaned compute is
+// owned and accounted again, not left running unroutable.
+func TestOrphanScrubbedOnHostReregister(t *testing.T) {
+	fs := newFleetSystem(t, 1, 4)
+	req := hostagent.CreateRequest{
+		SandboxID: "sb-orphan", IncarnationID: "inc-orphan-1", Fence: 1, Epoch: 1,
+		WorkspaceID: createWSForTest(t, fs), WorkspaceGeneration: 1, MemoryBytes: 32,
+	}
+	handle, err := fs.fleet.Create(backendinterface.Spec{
+		SandboxID: req.SandboxID, IncarnationID: req.IncarnationID, Epoch: 1,
+		WorkspaceID: req.WorkspaceID, WorkspaceGeneration: 1, MemoryBytes: 32,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.fleet.SimulateHostLoss("host-1")
+	// Terminate via the fleet while the host is down: the fleet forgets the
+	// incarnation, but the host (unreachable) keeps running it.
+	if err := fs.fleet.Terminate(handle); err != nil {
+		t.Fatal(err)
+	}
+	// Host restarts with an intact backend: it adopts the still-live
+	// incarnation the fleet no longer tracks.
+	restarted := hostagent.New("host-1", fs.backends["host-1"], nil, fs.ws, 1<<20, fs.slots, 16)
+	if len(restarted.IncarnationIDs()) != 1 {
+		t.Fatalf("restarted host incarnations = %v", restarted.IncarnationIDs())
+	}
+	fs.fleet.RegisterHost(restarted)
+	if got := fs.fleet.OrphansScrubbed(); got != 1 {
+		t.Fatalf("orphans scrubbed = %d, want 1", got)
+	}
+	if got := restarted.IncarnationIDs(); len(got) != 0 {
+		t.Fatalf("orphan still running on host after scrub: %v", got)
+	}
+}

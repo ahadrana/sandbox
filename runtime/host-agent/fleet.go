@@ -31,10 +31,11 @@ type Fleet struct {
 	lostDeclared map[string]bool
 	lastSeen     map[string]time.Time
 
-	byIncarnation map[string]string // incarnationID -> hostID
-	fenceOf       map[string]int64  // incarnationID -> fence
-	pendingLost   []string          // incarnation IDs awaiting manager reconciliation
-	DefaultMemory int64
+	byIncarnation   map[string]string // incarnationID -> hostID
+	fenceOf         map[string]int64  // incarnationID -> fence
+	pendingLost     []string          // incarnation IDs awaiting manager reconciliation
+	orphansScrubbed int               // host incarnations scrubbed at re-registration
+	DefaultMemory   int64
 
 	capacityFailures int // consecutive capacity-caused placement failures
 	lowUtilTicks     int // consecutive ticks with utilization below threshold
@@ -87,8 +88,23 @@ func NewFleet(clock domain.Clock, envs EnvironmentSource, ws WorkspaceStore) *Fl
 	}
 }
 
-// RegisterHost registers (or re-registers, e.g. after a host restart) a host.
+// RegisterHost registers (or re-registers, e.g. after a host restart) a
+// host. On re-registration, any incarnation the host still runs that the
+// fleet no longer tracks — for example terminated via the fleet while the
+// host was lost — is an orphan: it is scrubbed (terminated) and counted so
+// the compute is owned and accounted again (INV-016).
 func (f *Fleet) RegisterHost(h *HostAgent) {
+	for _, incID := range h.IncarnationIDs() {
+		f.mu.Lock()
+		_, known := f.byIncarnation[incID]
+		f.mu.Unlock()
+		if !known {
+			h.Terminate(backendinterface.Handle{IncarnationID: incID})
+			f.mu.Lock()
+			f.orphansScrubbed++
+			f.mu.Unlock()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hosts[h.HostID()] = h
@@ -96,6 +112,14 @@ func (f *Fleet) RegisterHost(h *HostAgent) {
 	f.missed[h.HostID()] = 0
 	f.lostDeclared[h.HostID()] = false
 	f.lastSeen[h.HostID()] = f.clock.Now()
+}
+
+// OrphansScrubbed reports how many orphaned host incarnations the fleet has
+// terminated at host (re-)registration.
+func (f *Fleet) OrphansScrubbed() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.orphansScrubbed
 }
 
 // SimulateHostLoss cuts heartbeats and reachability for a host.
@@ -363,32 +387,42 @@ func (f *Fleet) Alive(h backendinterface.Handle) bool {
 	return host.Alive(h)
 }
 
-// Capabilities returns the weakest declared surface across the fleet.
+// Capabilities returns the honest intersection of the fleet's declared
+// surfaces: the weakest isolation class and only the features every host
+// supports. An empty fleet has zero-value capabilities (declaring VM-class
+// with no hosts would be a lie). Restore is declared unsupported because
+// Fleet.Restore has no placement routing and returns ErrUnsupported.
 func (f *Fleet) Capabilities() backendinterface.Capabilities {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	caps := backendinterface.Capabilities{
-		IsolationClass:     backendinterface.IsolationVM,
-		SupportsPause:      true,
-		SupportsSnapshot:   true,
-		SupportsRestore:    true,
-		NetworkIsolated:    true,
-		HostCredentialFree: true,
+	if len(f.hosts) == 0 {
+		return backendinterface.Capabilities{}
 	}
+	classRank := map[backendinterface.IsolationClass]int{
+		backendinterface.IsolationProcess:   0,
+		backendinterface.IsolationNamespace: 1,
+		backendinterface.IsolationVM:        2,
+	}
+	var caps backendinterface.Capabilities
+	first := true
 	for _, h := range f.hosts {
 		c := h.Capabilities()
+		if first {
+			caps = c
+			first = false
+			continue
+		}
 		caps.SupportsPause = caps.SupportsPause && c.SupportsPause
 		caps.SupportsSnapshot = caps.SupportsSnapshot && c.SupportsSnapshot
 		caps.SupportsRestore = caps.SupportsRestore && c.SupportsRestore
 		caps.SupportsCheckpoint = caps.SupportsCheckpoint && c.SupportsCheckpoint
 		caps.NetworkIsolated = caps.NetworkIsolated && c.NetworkIsolated
 		caps.HostCredentialFree = caps.HostCredentialFree && c.HostCredentialFree
-		if c.IsolationClass == backendinterface.IsolationProcess {
-			caps.IsolationClass = backendinterface.IsolationProcess
-		} else if c.IsolationClass == backendinterface.IsolationNamespace && caps.IsolationClass == backendinterface.IsolationVM {
-			caps.IsolationClass = backendinterface.IsolationNamespace
+		if classRank[c.IsolationClass] < classRank[caps.IsolationClass] {
+			caps.IsolationClass = c.IsolationClass
 		}
 	}
+	caps.SupportsRestore = false
 	return caps
 }
 

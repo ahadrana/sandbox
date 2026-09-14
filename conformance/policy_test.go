@@ -463,8 +463,17 @@ func TestWallDeadlineSuspend(t *testing.T) {
 	}
 
 	report := mustMaterialize(t, d, sb.SandboxID)
+	// Wall-deadline enforcement reclaims resources (M7): the suspend is
+	// workspace-only, so rematerialization is an epoch-incrementing reset.
 	if report.NewEpoch != 2 {
 		t.Fatalf("rematerialize epoch = %d, want 2", report.NewEpoch)
+	}
+	// Enforcement is idempotent across further ticks (no repeated
+	// transitions or errors).
+	for i := 0; i < 2; i++ {
+		if err := s.mgr.Tick(time.Second); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

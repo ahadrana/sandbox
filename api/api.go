@@ -31,9 +31,12 @@ type CreateSandboxResponse struct {
 
 // StartExecutionRequest launches an Execution. IdempotencyKey makes launch
 // retry-safe; ExpectedEpoch fences volatile-state-dependent operations.
+// TenantID is the caller's asserted tenant context: when set, it must match
+// the sandbox's owning tenant (INV-028).
 type StartExecutionRequest struct {
 	Version                int
 	SandboxID              string
+	TenantID               string
 	PrincipalID            string
 	IdempotencyKey         string
 	Operation              domain.Operation
@@ -64,6 +67,7 @@ type RestoreReport struct {
 type CommitWorkspaceRequest struct {
 	Version          int
 	SandboxID        string
+	TenantID         string
 	CauseExecutionID string
 }
 
@@ -73,6 +77,7 @@ type CommitWorkspaceRequest struct {
 type CreateEndpointBindingRequest struct {
 	Version     int
 	SandboxID   string
+	TenantID    string
 	TargetPort  int
 	LogicalName string
 	AuthPolicy  string

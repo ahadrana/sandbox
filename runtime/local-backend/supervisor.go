@@ -107,6 +107,12 @@ func (s *localSupervisor) Exec(req supervisor.ExecRequest) error {
 	if err := cmd.Start(); err != nil {
 		stdout.Close()
 		stderr.Close()
+		// Do not leak the exec entry: a start failure must leave no
+		// permanent waiter and must not consume the execution ID — a retry
+		// with the same ID is a fresh attempt.
+		s.mu.Lock()
+		delete(s.execs, req.ExecutionID)
+		s.mu.Unlock()
 		return err
 	}
 	t.startedAt = time.Now()

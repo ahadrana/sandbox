@@ -467,9 +467,52 @@ func TestIllegalTransitionsRejected(t *testing.T) {
 	if err := domain.TransitionExecution(domain.ExecutionCompleted, domain.ExecutionRunning); !errors.Is(err, domain.ErrIllegalTransition) {
 		t.Fatalf("COMPLETED->RUNNING: %v", err)
 	}
+	// M1: self-transitions are illegal from every state, including terminal.
+	for _, st := range []domain.SandboxState{
+		domain.SandboxUnmaterialized, domain.SandboxStarting, domain.SandboxRunning,
+		domain.SandboxQuiescent, domain.SandboxSuspended, domain.SandboxFailed, domain.SandboxTerminated,
+	} {
+		if err := domain.TransitionSandbox(st, st); !errors.Is(err, domain.ErrIllegalTransition) {
+			t.Fatalf("self-transition %s->%s: %v", st, st, err)
+		}
+	}
+	for _, st := range []domain.ExecutionState{
+		domain.ExecutionPending, domain.ExecutionRunning, domain.ExecutionCompleted, domain.ExecutionCancelled,
+	} {
+		if err := domain.TransitionExecution(st, st); !errors.Is(err, domain.ErrIllegalTransition) {
+			t.Fatalf("execution self-transition %s->%s: %v", st, st, err)
+		}
+	}
 	if err := domain.TransitionSandbox(domain.SandboxRunning, domain.SandboxQuiescent); err != nil {
 		t.Fatalf("legal RUNNING->QUIESCENT rejected: %v", err)
 	}
+}
+
+// M1 regression: cancelling an already-terminal execution is an idempotent
+// read — it returns the terminal state without a duplicate event.
+func TestCancelTerminalExecutionIdempotent(t *testing.T) {
+	runBoth(t, func(t *testing.T, s *system) {
+		d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 51)
+		sb, _ := d.CreateSandbox("task-cancel-terminal")
+		mustMaterialize(t, d, sb.SandboxID)
+		ex, err := d.ExecSync(sb.SandboxID, domain.Operation{Command: "true"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, _ := s.outbox.Replay(0)
+		cancelEventsBefore := len(eventsOfType(before, domain.EventExecutionCancelled))
+		got, err := s.mgr.CancelExecution(ex.ExecutionID)
+		if err != nil {
+			t.Fatalf("cancel of terminal execution errored: %v", err)
+		}
+		if got.State != domain.ExecutionCompleted {
+			t.Fatalf("state = %s, want COMPLETED (unchanged)", got.State)
+		}
+		after, _ := s.outbox.Replay(0)
+		if got := len(eventsOfType(after, domain.EventExecutionCancelled)); got != cancelEventsBefore {
+			t.Fatalf("duplicate cancel event emitted: %d -> %d", cancelEventsBefore, got)
+		}
+	})
 }
 
 // Consumer dedup: replayed events with duplicate IDs are delivered once.
@@ -941,6 +984,78 @@ func TestRuntimeLossFinalizesExecutions(t *testing.T) {
 		events, _ := s.outbox.Replay(0)
 		if len(eventsOfType(events, domain.EventExecutionFailed)) == 0 {
 			t.Fatal("no ExecutionFailed event emitted")
+		}
+	})
+}
+
+// M2 regression: ExpectedEpoch fences even when DependsOnVolatileState is
+// unset — supplying an expected epoch is itself the fence request.
+func TestEpochFenceWithoutVolatileFlag(t *testing.T) {
+	runBoth(t, func(t *testing.T, s *system) {
+		d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 38)
+		sb, _ := d.CreateSandbox("task-epoch-fence")
+		mustMaterialize(t, d, sb.SandboxID)
+		if err := s.mgr.KillRuntime(sb.SandboxID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.mgr.Materialize(sb.SandboxID); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.mgr.StartExecution(api.StartExecutionRequest{
+			Version:        api.SchemaVersionV1,
+			SandboxID:      sb.SandboxID,
+			PrincipalID:    d.PrincipalID,
+			IdempotencyKey: d.NewKey(),
+			Operation:      domain.Operation{Command: "true"},
+			ExpectedEpoch:  1,
+		})
+		if !errors.Is(err, domain.ErrEpochConflict) {
+			t.Fatalf("expected epoch conflict without volatile flag, got %v", err)
+		}
+	})
+}
+
+// M3 regression: cross-tenant access is denied with a typed error; an
+// omitted tenant defaults to the owner (INV-028).
+func TestCrossTenantAccessDenied(t *testing.T) {
+	runBoth(t, func(t *testing.T, s *system) {
+		d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 61)
+		sb, _ := d.CreateSandbox("task-authz")
+		mustMaterialize(t, d, sb.SandboxID)
+
+		_, err := s.mgr.StartExecution(api.StartExecutionRequest{
+			Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "tenant-2",
+			PrincipalID: "mallory", Operation: domain.Operation{Command: "true"},
+		})
+		var unauth *domain.UnauthorizedError
+		if !errors.As(err, &unauth) || !errors.Is(err, domain.ErrUnauthorized) {
+			t.Fatalf("cross-tenant exec not denied with UnauthorizedError: %v", err)
+		}
+		if _, err := s.mgr.CommitWorkspace(api.CommitWorkspaceRequest{
+			Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "tenant-2",
+		}); !errors.Is(err, domain.ErrUnauthorized) {
+			t.Fatalf("cross-tenant commit not denied: %v", err)
+		}
+		if _, err := s.mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+			Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "tenant-2",
+			TargetPort: 8080, LogicalName: "web",
+		}); !errors.Is(err, domain.ErrUnauthorized) {
+			t.Fatalf("cross-tenant binding not denied: %v", err)
+		}
+		// Same-tenant and omitted-tenant requests still work.
+		if _, err := s.mgr.StartExecution(api.StartExecutionRequest{
+			Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "tenant-1",
+			PrincipalID: "principal-1", IdempotencyKey: d.NewKey(),
+			Operation: domain.Operation{Command: "true"},
+		}); err != nil {
+			t.Fatalf("owner-tenant exec denied: %v", err)
+		}
+		if _, err := s.mgr.StartExecution(api.StartExecutionRequest{
+			Version: api.SchemaVersionV1, SandboxID: sb.SandboxID,
+			PrincipalID: "principal-1", IdempotencyKey: d.NewKey(),
+			Operation: domain.Operation{Command: "true"},
+		}); err != nil {
+			t.Fatalf("omitted-tenant exec denied: %v", err)
 		}
 	})
 }
