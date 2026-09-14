@@ -1,18 +1,23 @@
 //go:build linux
 
-// Command guest-supervisor is the in-guest data-plane daemon for VM-class
-// backends (DESIGN §6.8). It runs inside the microVM, listens on a vsock
-// port, and executes commands under /workspace with the same semantics as
-// the local backend's in-process supervisor: /bin/sh -c, Setpgid, output
-// spilled to files, wait4 rusage, AGENT_SANDBOX_INCARNATION ownership marker.
+// Command guest-supervisor is the data-plane daemon for VM-class backends
+// (DESIGN §6.8) and the single supervisor implementation for every process
+// backend (ADR 004): inside a microVM it listens on a vsock port; the local
+// and isolated backends run the same binary on the host, listening on a unix
+// socket (-listen unix://...). It executes commands under -workdir with the
+// same semantics everywhere: /bin/sh -c, Setpgid, output spilled to files,
+// wait4 rusage, AGENT_SANDBOX_INCARNATION ownership marker.
 package main
 
 import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +27,7 @@ import (
 func main() {
 	port := flag.Uint("port", 5000, "vsock port to listen on")
 	cid := flag.Uint("cid", 0xFFFFFFFF, "vsock CID to bind (default ANY)")
+	listen := flag.String("listen", "", "listen on a unix socket instead of vsock (unix:///path/supervisor.sock)")
 	connect := flag.String("connect", "", "debug: dial cid:port and exchange a health frame instead of serving")
 	workDir := flag.String("workdir", "/workspace", "working directory for executions")
 	outDir := flag.String("outdir", "/tmp/guest-supervisor/output", "output spill directory")
@@ -47,6 +53,35 @@ func main() {
 	}
 	agent := newAgent(*workDir, *outDir, incarnationID)
 
+	if *listen != "" {
+		if !strings.HasPrefix(*listen, "unix://") {
+			log.Fatalf("-listen: unsupported address %q (want unix:///path)", *listen)
+		}
+		path := strings.TrimPrefix(*listen, "unix://")
+		ln, err := net.Listen("unix", path)
+		if err != nil {
+			log.Fatalf("listen %s: %v", *listen, err)
+		}
+		log.Printf("guest-supervisor listening on %s (incarnation %s)", *listen, incarnationID)
+		// AF_UNIX works with the stdlib netpoller; the SIGURG live-lock that
+		// forces the vsock side onto raw-syscall poll loops does not apply.
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+					log.Printf("accept: %v (fd exhaustion; backing off)", err)
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+				log.Printf("accept: %v", err)
+				continue
+			}
+			conn := unixConn{Conn: c}
+			conn.setDeadline(time.Now().Add(30 * time.Second))
+			go serveConn(agent, conn)
+		}
+	}
+
 	ln, err := listenVsock(uint32(*port), uint32(*cid))
 	if err != nil {
 		log.Fatalf("listen vsock port %d: %v", *port, err)
@@ -66,21 +101,31 @@ func main() {
 		}
 		// FL5: a stalled peer gets 30s to deliver its first frame before the
 		// connection (goroutine + fd + busy-poll vCPU) is reclaimed.
-		conn.deadline = time.Now().Add(30 * time.Second)
+		conn.setDeadline(time.Now().Add(30 * time.Second))
 		go serveConn(agent, conn)
 	}
 }
 
+// conn is one accepted supervisor connection, either transport.
+type conn interface {
+	io.ReadWriteCloser
+	setDeadline(t time.Time)
+}
+
+type unixConn struct{ net.Conn }
+
+func (u unixConn) setDeadline(t time.Time) { u.Conn.SetDeadline(t) }
+
 // serveConn handles one request/response pair per connection (the host opens
 // a fresh connection per request, so a blocking Wait never starves Status).
-func serveConn(agent *agent, conn *vsockConn) {
+func serveConn(agent *agent, conn conn) {
 	defer conn.Close()
 	var req supervisor.Request
 	if err := supervisor.ReadFrame(conn, &req); err != nil {
 		log.Printf("read request: %v", err)
 		return
 	}
-	conn.deadline = time.Time{} // first frame received; long Waits may idle
+	conn.setDeadline(time.Time{}) // first frame received; long Waits may idle
 	resp := agent.dispatch(req)
 	if err := supervisor.WriteFrame(conn, resp); err != nil {
 		log.Printf("write response: %v", err)
@@ -157,6 +202,8 @@ func (a *agent) dispatch(req supervisor.Request) supervisor.Response {
 			return fail(err)
 		}
 		return supervisor.Response{OK: true, Files: files}
+	case supervisor.OpUsage:
+		return supervisor.Response{OK: true, UsageCPU: a.UsageCPU()}
 	}
 	return fail(fmt.Errorf("unknown op %q", req.Op))
 }

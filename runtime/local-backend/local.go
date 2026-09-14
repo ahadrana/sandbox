@@ -1,3 +1,11 @@
+// Package localbackend is a dev/test RuntimeBackend that runs real OS
+// processes on the host with process-group isolation. Each incarnation gets
+// a working directory materialized from a committed workspace generation and
+// a supervisor daemon — the same guest-supervisor binary the VM backend runs
+// inside the microVM (ADR 004: one supervisor implementation), spawned on
+// the host and driven over the wire protocol via a unix socket. The backend
+// itself keeps host-side bookkeeping: directories, manifests, STOP/CONT
+// signals, and /proc-based usage accounting.
 package localbackend
 
 import (
@@ -8,22 +16,22 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/agent-sandbox/platform/domain"
 	"github.com/agent-sandbox/platform/runtime/backend-interface"
 	"github.com/agent-sandbox/platform/runtime/guest-supervisor"
 )
 
-// CommandWrapper rewrites the argv/env of every spawned command, allowing
-// stronger-isolation variants (e.g. bubblewrap) to confine the process while
-// keeping identical lifecycle semantics.
+// CommandWrapper rewrites the argv/env of the spawned supervisor daemon,
+// allowing stronger-isolation variants (e.g. bubblewrap) to confine the
+// daemon — and with it every command it spawns — while keeping identical
+// lifecycle semantics.
 type CommandWrapper func(argv, env []string, wsDir string) (newArgv, newEnv []string)
 
 // Option configures a Backend.
 type Option func(*Backend)
 
-// WithCommandWrapper confines all spawned commands through w.
+// WithCommandWrapper confines the supervisor daemon through w.
 func WithCommandWrapper(w CommandWrapper) Option {
 	return func(b *Backend) { b.wrapper = w }
 }
@@ -33,11 +41,24 @@ func WithCapabilities(c backendinterface.Capabilities) Option {
 	return func(b *Backend) { b.caps = c }
 }
 
+// WithDaemonBin pins the supervisor daemon binary (default: build once per
+// process with `go build`; LOCAL_BACKEND_DAEMON_BIN overrides too).
+func WithDaemonBin(path string) Option {
+	return func(b *Backend) { b.daemonBin = path }
+}
+
+// incarnationEnvMarker tags every process owned by an incarnation; it
+// survives fork/setsid/daemonization and is the ownership boundary for
+// inventory and termination (INV-013).
+const incarnationEnvMarker = "AGENT_SANDBOX_INCARNATION="
+
 type incarnation struct {
 	id      string
 	spec    backendinterface.Spec
+	dir     string
 	wsDir   string
-	sup     *localSupervisor
+	sup     *supervisor.Client
+	daemon  *daemonProc
 	started bool
 	paused  bool
 	dead    bool
@@ -47,11 +68,12 @@ type incarnation struct {
 
 // Backend is a local process-based RuntimeBackend (dev/test).
 type Backend struct {
-	mu      sync.Mutex
-	root    string
-	incs    map[string]*incarnation
-	wrapper CommandWrapper
-	caps    backendinterface.Capabilities
+	mu        sync.Mutex
+	root      string
+	incs      map[string]*incarnation
+	wrapper   CommandWrapper
+	daemonBin string
+	caps      backendinterface.Capabilities
 	// CorruptCheckpoint is a test fault hook: Restore fails as if the
 	// checkpoint metadata were corrupt or incompatible (INV-009).
 	CorruptCheckpoint bool
@@ -74,6 +96,9 @@ func New(root string, opts ...Option) (*Backend, error) {
 	for _, opt := range opts {
 		opt(b)
 	}
+	// A previous backend over the same root must not leave daemons behind:
+	// kill any stray still bound to this root before serving.
+	sweepStrayDaemons(root)
 	return b, nil
 }
 
@@ -92,8 +117,6 @@ func (b *Backend) get(h backendinterface.Handle) (*incarnation, error) {
 }
 
 func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	dir := filepath.Join(b.root, spec.IncarnationID)
 	wsDir := filepath.Join(dir, "workspace")
 	outDir := filepath.Join(dir, "output")
@@ -108,16 +131,29 @@ func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, e
 			return backendinterface.Handle{}, err
 		}
 	}
-	sup := newLocalSupervisor(wsDir, outDir, spec.IncarnationID, b.wrapper)
-	for k, v := range spec.Env {
-		sup.extraEnv = append(sup.extraEnv, k+"="+v)
+	bin, err := resolveDaemonBin(b.daemonBin)
+	if err != nil {
+		return backendinterface.Handle{}, err
 	}
+	daemon, err := spawnDaemon(bin, dir, wsDir, outDir, spec.IncarnationID, spec.Env, b.wrapper)
+	if err != nil {
+		return backendinterface.Handle{}, err
+	}
+	sup := daemon.client(dir)
+	if err := waitHealth(sup); err != nil {
+		daemon.Kill()
+		return backendinterface.Handle{}, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.incs[spec.IncarnationID] = &incarnation{
-		id:    spec.IncarnationID,
-		spec:  spec,
-		wsDir: wsDir,
-		sup:   sup,
-		ops:   map[string]domain.Operation{},
+		id:     spec.IncarnationID,
+		spec:   spec,
+		dir:    dir,
+		wsDir:  wsDir,
+		sup:    sup,
+		daemon: daemon,
+		ops:    map[string]domain.Operation{},
 	}
 	return backendinterface.Handle{IncarnationID: spec.IncarnationID}, nil
 }
@@ -149,7 +185,9 @@ func (b *Backend) Start(h backendinterface.Handle) error {
 }
 
 // Pause SIGSTOPs every owned process: CPU is reclaimed, RAM is not (STOP/CONT
-// class checkpointing — the honest capability boundary).
+// class checkpointing — the honest capability boundary). The daemon itself
+// keeps running: it is idle on accept, and keeping it answerable means
+// liveness probes stay truthful while the workload is frozen.
 func (b *Backend) Pause(h backendinterface.Handle) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -160,7 +198,7 @@ func (b *Backend) Pause(h backendinterface.Handle) error {
 	if !inc.started || inc.paused {
 		return backendinterface.ErrIllegalState
 	}
-	for _, p := range mustInventory(inc.sup) {
+	for _, p := range mustInventory(inc.marker()) {
 		syscall.Kill(p.PID, syscall.SIGSTOP)
 	}
 	inc.paused = true
@@ -178,12 +216,14 @@ func (b *Backend) Resume(h backendinterface.Handle) error {
 	if !inc.paused {
 		return backendinterface.ErrIllegalState
 	}
-	for _, p := range mustInventory(inc.sup) {
+	for _, p := range mustInventory(inc.marker()) {
 		syscall.Kill(p.PID, syscall.SIGCONT)
 	}
 	inc.paused = false
 	return nil
 }
+
+func (inc *incarnation) marker() string { return incarnationEnvMarker + inc.id }
 
 // Snapshot records the STOP/CONT checkpoint: the paused process inventory
 // plus the workspace view. No memory image is captured — RAM state is the
@@ -198,7 +238,7 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 	if !inc.paused {
 		return backendinterface.CheckpointData{}, backendinterface.ErrIllegalState
 	}
-	inv := mustInventory(inc.sup)
+	inv := mustInventory(inc.marker())
 	pids := make([]string, 0, len(inv))
 	for _, p := range inv {
 		pids = append(pids, strconv.Itoa(p.PID))
@@ -238,7 +278,7 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 	if inc.dead {
 		return backendinterface.Handle{}, fmt.Errorf("incarnation terminated while checkpointed")
 	}
-	marker := incarnationEnvMarker + cp.IncarnationID
+	marker := inc.marker()
 	for _, pidStr := range strings.Split(cp.Metadata["pids"], ",") {
 		if pidStr == "" {
 			continue
@@ -252,15 +292,16 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 			return backendinterface.Handle{}, fmt.Errorf("checkpointed pid %d no longer alive and owned", pid)
 		}
 	}
-	for _, p := range mustInventory(inc.sup) {
+	for _, p := range mustInventory(marker) {
 		syscall.Kill(p.PID, syscall.SIGCONT)
 	}
 	inc.paused = false
 	return backendinterface.Handle{IncarnationID: cp.IncarnationID}, nil
 }
 
-// Terminate kills every process owned by the incarnation (process groups and
-// daemonized descendants alike) and removes its working directory.
+// Terminate kills the supervisor daemon and every process owned by the
+// incarnation (process groups and daemonized descendants alike) and removes
+// its working directory.
 func (b *Backend) Terminate(h backendinterface.Handle) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -270,60 +311,29 @@ func (b *Backend) Terminate(h backendinterface.Handle) error {
 	}
 	b.killProcesses(inc)
 	inc.dead = true
-	os.RemoveAll(filepath.Join(b.root, inc.id))
+	os.RemoveAll(inc.dir)
 	return nil
 }
 
-// markerOwned re-verifies, immediately before a kill, that pid still carries
-// the incarnation marker — closing the PID-reuse window between the
-// inventory scan and the SIGKILL. /proc environ reads are not atomic across
-// an execve: a live process (e.g. sh exec'ing its command tail) briefly
-// exposes an empty or TRUNCATED environ. A verdict is taken only from two
-// consecutive identical non-empty reads; anything unstable (mid-exec) is
-// retried, and a persistently empty environ (zombie) is not owned.
-func markerOwned(marker string, pid int) bool {
-	prev := ""
-	for i := 0; i < 5; i++ {
-		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
-		if err != nil {
-			return false
-		}
-		cur := string(data)
-		if len(cur) > 0 && cur == prev {
-			return hasEnvEntry(cur, marker)
-		}
-		prev = cur
-		time.Sleep(2 * time.Millisecond)
-	}
-	return false
-}
-
+// killProcesses kills the daemon first (so nothing answers or spawns
+// mid-teardown), then every still-owned marked process group, and reaps the
+// daemon so no stray or zombie survives (INV-013).
 func (b *Backend) killProcesses(inc *incarnation) {
-	marker := inc.sup.marker
-	for _, p := range mustInventory(inc.sup) {
-		if markerOwned(marker, p.PID) {
-			syscall.Kill(p.PID, syscall.SIGKILL)
+	marker := inc.marker()
+	inc.daemon.Kill()
+	for _, p := range mustInventory(marker) {
+		if !markerOwned(marker, p.PID) {
+			continue
 		}
-	}
-	inc.sup.mu.Lock()
-	for _, t := range inc.sup.execs {
-		if t.cmd.Process != nil && markerOwned(marker, t.cmd.Process.Pid) {
-			syscall.Kill(-t.cmd.Process.Pid, syscall.SIGKILL)
+		if p.PGID > 0 {
+			syscall.Kill(-p.PGID, syscall.SIGKILL)
 		}
+		syscall.Kill(p.PID, syscall.SIGKILL)
 	}
-	inc.sup.mu.Unlock()
 }
 
-func mustInventory(s *localSupervisor) []supervisor.ProcessInfo {
-	inv, err := s.ProcessInventory()
-	if err != nil {
-		return nil
-	}
-	return inv
-}
-
-// Stats reports host-side usage: live CPU/RSS from /proc plus finished-exec
-// rusage accumulated by the supervisor (INV-016).
+// Stats reports host-side usage: live CPU/RSS from /proc for the owned
+// inventory plus finished-exec rusage accumulated by the daemon (INV-016).
 func (b *Backend) Stats(h backendinterface.Handle) (backendinterface.Stats, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -331,12 +341,16 @@ func (b *Backend) Stats(h backendinterface.Handle) (backendinterface.Stats, erro
 	if err != nil {
 		return backendinterface.Stats{}, err
 	}
-	inv := mustInventory(inc.sup)
+	inv, err := inc.sup.ProcessInventory()
+	if err != nil {
+		return backendinterface.Stats{}, err
+	}
 	cpu, rss := hostUsage(inv)
-	inc.sup.mu.Lock()
-	cpu += inc.sup.finishedCPU
-	inc.sup.mu.Unlock()
-	return backendinterface.Stats{CPUSeconds: cpu, MemoryBytes: rss, ProcessCount: len(inv)}, nil
+	finished, err := inc.sup.UsageCPU()
+	if err != nil {
+		return backendinterface.Stats{}, err
+	}
+	return backendinterface.Stats{CPUSeconds: cpu + finished, MemoryBytes: rss, ProcessCount: len(inv)}, nil
 }
 
 // LiveNonBaselineDescendants counts live owned processes excluding baseline
@@ -348,9 +362,12 @@ func (b *Backend) LiveNonBaselineDescendants(h backendinterface.Handle) int {
 	if err != nil {
 		return 0
 	}
-	baseline := inc.sup.baselinePGIDs()
+	inv, baseline, err := inc.sup.Inventory()
+	if err != nil {
+		return 0
+	}
 	n := 0
-	for _, p := range mustInventory(inc.sup) {
+	for _, p := range inv {
 		if !baseline[p.PGID] {
 			n++
 		}
@@ -367,27 +384,12 @@ func (b *Backend) TerminateBackground(h backendinterface.Handle) error {
 	if err != nil {
 		return err
 	}
-	baseline := inc.sup.baselinePGIDs()
-	killedPGID := map[int]bool{}
-	for _, p := range mustInventory(inc.sup) {
-		if baseline[p.PGID] {
-			continue
-		}
-		if !markerOwned(inc.sup.marker, p.PID) {
-			continue // PID reused by an unowned process since the scan
-		}
-		if p.PGID > 0 && !killedPGID[p.PGID] {
-			syscall.Kill(-p.PGID, syscall.SIGKILL)
-			killedPGID[p.PGID] = true
-		}
-		syscall.Kill(p.PID, syscall.SIGKILL)
-	}
-	return nil
+	return inc.sup.TerminateBackground()
 }
 
 // Exec applies the operation: scripted Writes are materialized to the
 // workspace dir, SpawnBackground maps to real sleep processes, and Command
-// runs via the supervisor.
+// runs via the supervisor daemon.
 func (b *Backend) Exec(h backendinterface.Handle, executionID string, op domain.Operation) error {
 	b.mu.Lock()
 	inc, err := b.get(h)
@@ -449,7 +451,12 @@ func (b *Backend) WaitExecution(h backendinterface.Handle, executionID string) (
 	if op.Command == "" {
 		return supervisor.Result{ExitCode: op.ExitCode}, nil
 	}
-	return inc.sup.Wait(executionID)
+	res, err := inc.sup.Wait(executionID)
+	// The daemon runs on the host, so its spill paths are host-readable:
+	// present them as file:// refs (the local backend's ref scheme).
+	res.StdoutRef = strings.Replace(res.StdoutRef, "guest://", "file://", 1)
+	res.StderrRef = strings.Replace(res.StderrRef, "guest://", "file://", 1)
+	return res, err
 }
 
 // ProcessInventory exposes the incarnation's live owned processes.
@@ -470,7 +477,11 @@ func (b *Backend) LiveDescendants(h backendinterface.Handle) int {
 	if err != nil {
 		return 0
 	}
-	return len(mustInventory(inc.sup))
+	inv, err := inc.sup.ProcessInventory()
+	if err != nil {
+		return 0
+	}
+	return len(inv)
 }
 
 // WorkspaceFiles reads the incarnation workspace dir into a manifest.
@@ -533,7 +544,7 @@ func (b *Backend) KillRuntime(h backendinterface.Handle) {
 	}
 	b.killProcesses(inc)
 	inc.dead = true
-	os.RemoveAll(filepath.Join(b.root, inc.id))
+	os.RemoveAll(inc.dir)
 }
 
 // LiveHandles lists incarnations still present in this backend; a restarted

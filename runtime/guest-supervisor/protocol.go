@@ -30,6 +30,7 @@ const (
 	OpWriteFile           = "write_file"
 	OpReadFile            = "read_file"
 	OpWorkspaceFiles      = "workspace_files"
+	OpUsage               = "usage"
 )
 
 // Request is the single host→guest message shape; only the fields relevant
@@ -71,6 +72,9 @@ type Response struct {
 	// workspace_files (map values are []byte → base64 on the wire, so
 	// binary files survive the JSON boundary unmangled)
 	Files map[string][]byte `json:"files,omitempty"`
+
+	// usage: CPU seconds accumulated by finished executions (INV-016)
+	UsageCPU float64 `json:"usage_cpu,omitempty"`
 }
 
 // Well-known error strings so the host can map back to sentinel errors.

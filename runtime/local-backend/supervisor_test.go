@@ -10,36 +10,56 @@ import (
 	"testing"
 	"time"
 
+	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
 	supervisor "github.com/agent-sandbox/platform/runtime/guest-supervisor"
 )
 
-func newTestSupervisor(t *testing.T) *localSupervisor {
+// TestMain fails the package if a daemon the backend terminated is still
+// present in /proc (teardown failed to reap). Daemons of never-terminated
+// incarnations die with this process via Pdeathsig.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if leaked := LeakedDaemons(); len(leaked) > 0 {
+		fmt.Fprintf(os.Stderr, "FAIL: %d unreaped guest-supervisor daemon(s) after tests: pids %v\n", len(leaked), leaked)
+		os.Exit(1)
+	}
+	os.Exit(code)
+}
+
+// newTestIncarnation builds a backend with one live incarnation and cleans
+// it up (exercising the daemon teardown path) at test end.
+func newTestIncarnation(t *testing.T, spec backendinterface.Spec) (*Backend, *incarnation) {
 	t.Helper()
-	root := t.TempDir()
-	wsDir := filepath.Join(root, "workspace")
-	outDir := filepath.Join(root, "output")
-	if err := os.MkdirAll(wsDir, 0o755); err != nil {
+	if spec.IncarnationID == "" {
+		// Unique marker per test: the inventory scans all of /proc, and a
+		// shared marker would pick up other tests' transient processes.
+		spec.IncarnationID = "inc-" + strings.NewReplacer("/", "-", "_", "-").Replace(t.Name())
+	}
+	b, err := New(t.TempDir())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
+	h, err := b.Create(spec)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// Unique marker per test: the inventory scans all of /proc, and a shared
-	// marker would pick up other tests' transient processes mid-exec.
-	marker := "inc-" + strings.NewReplacer("/", "-", "_", "-").Replace(t.Name())
-	return newLocalSupervisor(wsDir, outDir, marker, nil)
+	t.Cleanup(func() { b.Terminate(h) })
+	b.mu.Lock()
+	inc := b.incs[h.IncarnationID]
+	b.mu.Unlock()
+	return b, inc
 }
 
 // L1: the PID-reuse guard accepts owned processes and rejects unowned ones.
 func TestMarkerOwnedGuard(t *testing.T) {
-	s := newTestSupervisor(t)
-	if markerOwned(s.marker, os.Getpid()) {
+	_, inc := newTestIncarnation(t, backendinterface.Spec{})
+	if markerOwned(inc.marker(), os.Getpid()) {
 		t.Fatal("unowned process (no marker) accepted by markerOwned")
 	}
-	if err := s.Exec(supervisor.ExecRequest{ExecutionID: "ex-mark", Command: "sleep 30"}); err != nil {
+	if err := inc.sup.Exec(supervisor.ExecRequest{ExecutionID: "ex-mark", Command: "sleep 30"}); err != nil {
 		t.Fatal(err)
 	}
-	inv, err := s.ProcessInventory()
+	inv, err := inc.sup.ProcessInventory()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +72,7 @@ func TestMarkerOwnedGuard(t *testing.T) {
 		// genuinely foreign pid never becomes owned.
 		owned := false
 		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-			if markerOwned(s.marker, p.PID) {
+			if markerOwned(inc.marker(), p.PID) {
 				owned = true
 				break
 			}
@@ -61,7 +81,7 @@ func TestMarkerOwnedGuard(t *testing.T) {
 			t.Fatalf("owned pid %d rejected by markerOwned", p.PID)
 		}
 	}
-	if err := s.Cancel("ex-mark"); err != nil {
+	if err := inc.sup.Cancel("ex-mark"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -69,23 +89,23 @@ func TestMarkerOwnedGuard(t *testing.T) {
 // L2: ReadOutput rejects negative offset/maxBytes instead of panicking, and
 // serves valid reads.
 func TestReadOutputValidation(t *testing.T) {
-	s := newTestSupervisor(t)
-	if err := s.Exec(supervisor.ExecRequest{ExecutionID: "ex-out", Command: "echo hello"}); err != nil {
+	_, inc := newTestIncarnation(t, backendinterface.Spec{})
+	if err := inc.sup.Exec(supervisor.ExecRequest{ExecutionID: "ex-out", Command: "echo hello"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Wait("ex-out"); err != nil {
+	if _, err := inc.sup.Wait("ex-out"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ReadOutput("ex-out", false, 0, -1); err == nil {
+	if _, err := inc.sup.ReadOutput("ex-out", false, 0, -1); err == nil {
 		t.Fatal("negative maxBytes accepted")
 	}
-	if _, err := s.ReadOutput("ex-out", false, -1, 10); err == nil {
+	if _, err := inc.sup.ReadOutput("ex-out", false, -1, 10); err == nil {
 		t.Fatal("negative offset accepted")
 	}
-	if _, err := s.ReadOutput("ex-out", false, 0, supervisor.MaxChunkBytes+1); !errors.Is(err, supervisor.ErrTooLarge) {
+	if _, err := inc.sup.ReadOutput("ex-out", false, 0, supervisor.MaxChunkBytes+1); !errors.Is(err, supervisor.ErrTooLarge) {
 		t.Fatalf("oversized read: err = %v", err)
 	}
-	chunk, err := s.ReadOutput("ex-out", false, 0, 64)
+	chunk, err := inc.sup.ReadOutput("ex-out", false, 0, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,28 +114,87 @@ func TestReadOutputValidation(t *testing.T) {
 	}
 }
 
-// L3: per-execution env overrides ambient env (last-wins per key).
+// L3: per-execution env overrides the incarnation's spec env (last-wins per
+// key); spec env is ambient for every execution of the incarnation.
 func TestExecEnvOverridesAmbient(t *testing.T) {
-	t.Setenv("OVERRIDE_ME", "ambient")
-	s := newTestSupervisor(t)
-	s.extraEnv = append(s.extraEnv, "EXTRA_ENV_KEY=extra")
-	if err := s.Exec(supervisor.ExecRequest{
+	_, inc := newTestIncarnation(t, backendinterface.Spec{
+		Env: map[string]string{"OVERRIDE_ME": "spec-value", "EXTRA_ENV_KEY": "extra"},
+	})
+	if err := inc.sup.Exec(supervisor.ExecRequest{
 		ExecutionID: "ex-env",
 		Command:     `echo -n "$OVERRIDE_ME,$EXTRA_ENV_KEY" > env-result.txt`,
 		Env:         map[string]string{"OVERRIDE_ME": "exec-wins"},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Wait("ex-env"); err != nil {
+	if _, err := inc.sup.Wait("ex-env"); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(filepath.Join(s.wsDir, "env-result.txt"))
+	data, err := os.ReadFile(filepath.Join(inc.wsDir, "env-result.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(data) != "exec-wins,extra" {
-		t.Fatalf("env = %q, want exec-wins override with extraEnv preserved", data)
+		t.Fatalf("env = %q, want exec-wins override with spec env preserved", data)
 	}
+}
+
+// The daemon answers the wire protocol and Terminate reaps it: no live
+// process and no zombie may survive teardown.
+func TestTerminateReapsDaemon(t *testing.T) {
+	b, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := b.Create(backendinterface.Spec{IncarnationID: "inc-reap"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	daemon := b.incs[h.IncarnationID].daemon
+	b.mu.Unlock()
+	if !daemon.Alive() {
+		t.Fatal("daemon not alive after Create")
+	}
+	if err := b.Terminate(h); err != nil {
+		t.Fatal(err)
+	}
+	if daemon.Alive() {
+		t.Fatal("daemon still alive after Terminate")
+	}
+	if _, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", daemon.pgid)); err == nil {
+		t.Fatalf("daemon pid %d still present in /proc after Terminate (unreaped)", daemon.pgid)
+	}
+}
+
+// A fresh backend over a root with a live stray daemon (owner crashed before
+// Terminate) sweeps it instead of leaking it.
+func TestNewSweepsStrayDaemon(t *testing.T) {
+	root := t.TempDir()
+	b, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := b.Create(backendinterface.Spec{IncarnationID: "inc-stray"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	stray := b.incs[h.IncarnationID].daemon
+	b.incs[h.IncarnationID].dead = true // simulate a crashed owner: forget it
+	b.mu.Unlock()
+	if !stray.Alive() {
+		t.Fatal("daemon not alive")
+	}
+	if _, err := New(root); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if !stray.Alive() {
+			return
+		}
+	}
+	t.Fatal("stray daemon survived backend reconstruction")
 }
 
 // markerOwned must stay true for a live owned process even across an execve

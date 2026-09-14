@@ -139,7 +139,7 @@ type incarnation struct {
 	results      map[string]supervisor.Result
 	resultsOrder []string
 	vsockCID     uint32
-	sup          *vsockSupervisor
+	sup          *supervisor.Client
 	jailed       bool
 	jailRoot     string
 	net          *netState
@@ -454,8 +454,8 @@ func tailConsole(dir string) string {
 // after snapshot restore (Firecracker restores vsock; fresh dials reconnect
 // transparently).
 func (b *Backend) attachSupervisor(inc *incarnation) error {
-	sup := newVsockSupervisor(b.layoutFor(inc).hostVsock, b.cfg.SupervisorPort, b.cfg.APITimeout)
-	sup.alive = func() bool {
+	sup := supervisor.NewClient(vsockDial(b.layoutFor(inc).hostVsock, b.cfg.SupervisorPort, b.cfg.APITimeout), b.cfg.APITimeout)
+	sup.Alive = func() bool {
 		// Read under b.mu: spawn reassigns inc.exited on (re)boot.
 		b.mu.Lock()
 		defer b.mu.Unlock()
@@ -490,7 +490,7 @@ func (b *Backend) attachSupervisor(inc *incarnation) error {
 
 // supFor returns the incarnation's supervisor transport or
 // supervisor.ErrUnsupported when no guest agent was injected (stage-2 mode).
-func (b *Backend) supFor(inc *incarnation) (*vsockSupervisor, error) {
+func (b *Backend) supFor(inc *incarnation) (*supervisor.Client, error) {
 	if inc.sup == nil {
 		return nil, supervisor.ErrUnsupported
 	}
@@ -1244,7 +1244,7 @@ func (b *Backend) LiveNonBaselineDescendants(h backendinterface.Handle) int {
 	if supErr != nil {
 		return 0
 	}
-	inv, baseline, err := sup.inventory()
+	inv, baseline, err := sup.Inventory()
 	if err != nil {
 		return 0
 	}

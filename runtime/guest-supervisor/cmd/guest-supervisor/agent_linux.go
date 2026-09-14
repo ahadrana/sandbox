@@ -16,9 +16,9 @@ import (
 	"github.com/agent-sandbox/platform/runtime/guest-supervisor"
 )
 
-// agent mirrors runtime/local-backend/supervisor.go's semantics inside the
-// guest: same ownership marker, env last-wins, process-group isolation,
-// output spill files, wait4 rusage.
+// agent is the single supervisor implementation for every backend
+// (ADR 004): same ownership marker, env last-wins, process-group isolation,
+// output spill files, wait4 rusage — inside the guest and on the host alike.
 type agent struct {
 	workDir  string
 	outDir   string
@@ -303,6 +303,13 @@ func (a *agent) baselinePGIDList() []int {
 		out = append(out, pgid)
 	}
 	return out
+}
+
+// UsageCPU reports CPU seconds accumulated by finished executions (INV-016).
+func (a *agent) UsageCPU() float64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.finished
 }
 
 // TerminateBackground kills every live non-baseline descendant (policy

@@ -38,6 +38,19 @@ type system struct {
 	backend string // "fake" | "local"
 }
 
+// TestMain fails the suite if a daemon the local/isolated backend
+// terminated is still present in /proc: a leak means Terminate/KillRuntime
+// stopped reaping (ADR 004 follow-up). Daemons of never-terminated
+// incarnations die with this process via Pdeathsig / --die-with-parent.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if leaked := localbackend.LeakedDaemons(); len(leaked) > 0 {
+		fmt.Fprintf(os.Stderr, "FAIL: %d unreaped guest-supervisor daemon(s) after conformance: pids %v\n", len(leaked), leaked)
+		os.Exit(1)
+	}
+	os.Exit(code)
+}
+
 func newSystem(t *testing.T, backend string) *system {
 	t.Helper()
 	clock := domain.NewManualClock(time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC))

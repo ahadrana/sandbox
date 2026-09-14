@@ -82,6 +82,8 @@ func (c *vsockConn) Write(p []byte) (int, error) {
 
 func (c *vsockConn) Close() error { return syscall.Close(c.fd) }
 
+func (c *vsockConn) setDeadline(t time.Time) { c.deadline = t }
+
 // sockaddrVM packs struct sockaddr_vm { family u16; reserved u16; port u32;
 // cid u32; flags u8; zero[3]; } into RawSockaddrAny, native endianness
 // (little on all supported KVM targets here).

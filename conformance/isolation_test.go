@@ -252,17 +252,13 @@ func TestWaitExecutionUnknownIDNotFound(t *testing.T) {
 	}
 }
 
-// M12 regression: a command that fails to START leaves no leaked exec entry:
-// Wait returns ErrNotFound (never hangs) and a retry with the same execution
-// ID is a fresh attempt.
+// M12 regression: a command that fails to START leaves no hung waiter: the
+// supervisor (one implementation for all backends, ADR 004) records the
+// failed start as a terminal result (exit -1), so Wait returns promptly and
+// a retry with the same execution ID observes the same recorded failure
+// (idempotent terminal record — Exec IDs are not reusable).
 func TestExecStartFailureNoLeak(t *testing.T) {
-	lb, err := localbackend.New(t.TempDir(), localbackend.WithCommandWrapper(
-		func(argv, env []string, wsDir string) ([]string, []string) {
-			if strings.Contains(argv[2], "start-fails") {
-				return []string{"/nonexistent/binary"}, env
-			}
-			return argv, env
-		}))
+	lb, err := localbackend.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,32 +269,53 @@ func TestExecStartFailureNoLeak(t *testing.T) {
 	if err := lb.Start(h); err != nil {
 		t.Fatal(err)
 	}
-	if err := lb.Exec(h, "ex-retry", domain.Operation{Command: "start-fails"}); err == nil {
+	// Break every subsequent cmd.Start: remove the workspace (the daemon's
+	// exec chdir target) from inside the incarnation itself.
+	if err := lb.Exec(h, "ex-break", domain.Operation{Command: `cd /; rm -rf "$OLDPWD"`}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lb.WaitExecution(h, "ex-break"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lb.Exec(h, "ex-retry", domain.Operation{Command: "true"}); err == nil {
 		t.Fatal("expected start failure")
 	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := lb.WaitExecution(h, "ex-retry")
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if !errors.Is(err, supervisor.ErrNotFound) {
-			t.Fatalf("Wait after start failure: err = %v, want ErrNotFound", err)
+	waitResult := func() (supervisor.Result, error) {
+		type out struct {
+			res supervisor.Result
+			err error
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Wait hung after start failure (leaked exec entry)")
+		done := make(chan out, 1)
+		go func() {
+			res, err := lb.WaitExecution(h, "ex-retry")
+			done <- out{res, err}
+		}()
+		select {
+		case o := <-done:
+			return o.res, o.err
+		case <-time.After(2 * time.Second):
+			t.Fatal("Wait hung after start failure (leaked exec entry)")
+		}
+		return supervisor.Result{}, nil
 	}
-	// Retry with the same ID succeeds.
+	res, err := waitResult()
+	if err != nil {
+		t.Fatalf("Wait after start failure: %v", err)
+	}
+	if res.ExitCode != -1 {
+		t.Fatalf("start failure exit code = %d, want -1", res.ExitCode)
+	}
+	// Retry with the same ID is an idempotent no-op returning the recorded
+	// failure, not a fresh attempt.
 	if err := lb.Exec(h, "ex-retry", domain.Operation{Command: "true"}); err != nil {
 		t.Fatalf("retry with same ID: %v", err)
 	}
-	res, err := lb.WaitExecution(h, "ex-retry")
+	res2, err := waitResult()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.ExitCode != 0 {
-		t.Fatalf("retry exit code = %d", res.ExitCode)
+	if res2.ExitCode != -1 {
+		t.Fatalf("retry observed exit %d, want the recorded -1", res2.ExitCode)
 	}
 }
 

@@ -1,7 +1,9 @@
 // Package supervisor defines the guest-supervisor protocol: the data-plane
 // contract between the control plane and a runtime incarnation (DESIGN §6.8).
-// It is transport-agnostic; the local backend provides an in-process
-// implementation and a remote transport can replace it later.
+// The daemon (cmd/guest-supervisor) is the single implementation for every
+// backend (ADR 004); Client is the host-side transport, dialed over vsock by
+// the Firecracker backend and over a unix socket by the local/isolated
+// backends.
 package supervisor
 
 import (

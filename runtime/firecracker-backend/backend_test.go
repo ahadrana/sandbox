@@ -319,7 +319,7 @@ func execOp(t *testing.T, b *Backend, h backendinterface.Handle, id, command str
 
 type supervisorResult struct{ ExitCode int }
 
-func supOf(t *testing.T, b *Backend, id string) *vsockSupervisor {
+func supOf(t *testing.T, b *Backend, id string) *supervisor.Client {
 	t.Helper()
 	b.mu.Lock()
 	inc := b.incs[id]

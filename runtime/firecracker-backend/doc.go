@@ -29,8 +29,10 @@
 //     The host transport dials Firecracker's vsock UDS (CONNECT handshake),
 //     one connection per request, so blocking Waits don't starve other calls
 //     and snapshot-restore reconnect is transparent. Exec/Wait/Status/
-//     Cancel/ReadOutput/ProcessInventory/TerminateBackground mirror the local
-//     backend's semantics; WorkspaceFiles reads the live guest /workspace
+//     Cancel/ReadOutput/ProcessInventory/TerminateBackground run through the
+//     shared wire client (runtime/guest-supervisor/client.go) — the same
+//     semantics the local/isolated backends get from the same daemon;
+//     WorkspaceFiles reads the live guest /workspace
 //     (host-side mirror kept as pre-boot/no-agent fallback). Writes also
 //     update the mirror for dirty tracking (INV-006).
 //   - Snapshots are full Firecracker snapshots (paused VM: mem + state +
