@@ -24,6 +24,9 @@ func newAPIClient(sock string, timeout time.Duration) *apiClient {
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: timeout}).DialContext(ctx, "unix", sock)
 		},
+		// Each apiClient is per-call; idle keep-alive connections would pile
+		// up on the Firecracker API server ("Too many open connections").
+		DisableKeepAlives: true,
 	}
 	return &apiClient{hc: &http.Client{Transport: tr, Timeout: timeout}, sock: sock}
 }
@@ -107,6 +110,14 @@ func (c *apiClient) setVsock(cid uint32, udsPath string) error {
 	return c.call("PUT", "/vsock", map[string]interface{}{
 		"guest_cid": cid,
 		"uds_path":  udsPath,
+	})
+}
+
+func (c *apiClient) addNIC(id, hostDev, guestMAC string) error {
+	return c.call("PUT", "/network-interfaces/"+id, map[string]interface{}{
+		"iface_id":      id,
+		"host_dev_name": hostDev,
+		"guest_mac":     guestMAC,
 	})
 }
 

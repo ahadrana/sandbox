@@ -183,6 +183,29 @@ func injectGuestAgent(rootfsPath, binPath, incarnationID string, port uint32) er
 	return nil
 }
 
+// injectNetworkUnit writes the guest NIC bring-up unit into a rootfs image.
+func injectNetworkUnit(rootfsPath, guestIP, hostIP string) error {
+	tmp, err := os.MkdirTemp("", "fc-net-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	unit := filepath.Join(tmp, "unit")
+	if err := os.WriteFile(unit, []byte(fmt.Sprintf(networkUnitTemplate, guestIP, hostIP)), 0o644); err != nil {
+		return err
+	}
+	script := filepath.Join(tmp, "cmds")
+	body := "write " + unit + " /etc/systemd/system/agent-network.service\n" +
+		"symlink /etc/systemd/system/multi-user.target.wants/agent-network.service /etc/systemd/system/agent-network.service\n"
+	if err := os.WriteFile(script, []byte(body), 0o600); err != nil {
+		return err
+	}
+	if out, err := exec.Command("debugfs", "-w", "-f", script, rootfsPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("debugfs network unit inject: %v: %s", err, out)
+	}
+	return nil
+}
+
 // copyFile copies src to dst, preferring reflink (CoW) where the filesystem
 // supports it and falling back to a full copy.
 func copyFile(dst, src string) error {

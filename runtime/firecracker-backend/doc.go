@@ -7,8 +7,13 @@
 //
 //   - VMM lifecycle: one `firecracker --api-sock` process per incarnation,
 //     with a per-incarnation directory (api.sock, console.log, a copy of the
-//     rootfs, a generated workspace ext4 image). Jailer wrapping is a
-//     follow-up; Config.JailerBin is accepted but unused (see Config docs).
+//     rootfs, a generated workspace ext4 image). When Config.JailerBin is
+//     set, VMMs spawn through the Firecracker jailer (chroot + namespaces +
+//     cgroup v2, via passwordless sudo); if the jailer cannot be used the
+//     backend falls back to raw spawns and reports why via JailerStatus.
+//     aarch64 note: the stock jailer (<= v1.17) hard-fails on hosts whose
+//     kernel lacks CONFIG_ARM64_CPUID_REGS (no sysfs midr_el1); a jailer
+//     patched to skip the missing file is required there.
 //   - Rootfs is a full per-incarnation copy (~300MB); copy-on-write overlays
 //     (qcow2/reflink) are a noted improvement.
 //   - Workspace materialization: Spec.WorkspaceManifest is baked into a
@@ -29,12 +34,19 @@
 //     (host-side mirror kept as pre-boot/no-agent fallback). Writes also
 //     update the mirror for dirty tracking (INV-006).
 //   - Snapshots are full Firecracker snapshots (paused VM: mem + state +
-//     reflink copies of both drives) stored under <root>/snapshots/<inc> so
-//     they survive Terminate/KillRuntime of the source VM. Snapshot GC is a
-//     retention follow-up.
-//   - No network device is attached: guests have no network at all, so
-//     NetworkIsolated is declared false (nothing to isolate) and stage 4
-//     adds the egress-policy datapath.
+//     reflink copies of both drives) stored under <root>/snapshots/<inc>/<ts>
+//     so they survive Terminate/KillRuntime of the source VM. Oldest
+//     snapshots beyond Config.MaxSnapshotsPerIncarnation (default 3) are
+//     garbage-collected after each Snapshot.
+//   - Networking (stage 4, Config.Networking): each incarnation gets a
+//     deterministic TAP device and /30 pair in 192.168.0.0/16, host NAT
+//     (MASQUERADE via the default uplink, ip_forward enabled once), and a
+//     per-incarnation iptables FORWARD chain enforcing the
+//     network.EgressPolicy carried in Spec.Env["AGENT_SANDBOX_EGRESS"] —
+//     169.254.169.254 is always dropped first, then deny entries, then
+//     allows, with a final DROP when DefaultAllow is false. With Networking
+//     off no NIC is attached at all and NetworkIsolated is declared false.
+//     Requires passwordless sudo and ip/iptables on the host.
 //
 // Readiness: Create/Start wait for the API socket to answer and for the
 // serial console log to reach the login prompt (boot) or the workspace
