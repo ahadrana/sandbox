@@ -349,17 +349,14 @@ func atoi(s string) (int, error) {
 	return n, nil
 }
 
-// checkWorkspacePath rejects absolute and escaping relative paths.
+// checkWorkspacePath rejects absolute/escaping paths and names with
+// control/whitespace/backslash characters (shared rule: debugfs safety).
 func checkWorkspacePath(path string) error {
-	clean := filepath.Clean(path)
-	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("unsafe workspace path: %q", path)
-	}
-	return nil
+	return supervisor.CheckWorkspacePath(path)
 }
 
 // WriteFile materializes a workspace file under the work dir.
-func (a *agent) WriteFile(path, content string) error {
+func (a *agent) WriteFile(path string, content []byte) error {
 	if err := checkWorkspacePath(path); err != nil {
 		return err
 	}
@@ -367,7 +364,7 @@ func (a *agent) WriteFile(path, content string) error {
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(full, []byte(content), 0o644)
+	return os.WriteFile(full, content, 0o644)
 }
 
 func (a *agent) ReadFile(path string) ([]byte, error) {
@@ -377,9 +374,10 @@ func (a *agent) ReadFile(path string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(a.workDir, filepath.Clean(path)))
 }
 
-// WorkspaceFiles walks the work dir into a manifest map.
-func (a *agent) WorkspaceFiles() (map[string]string, error) {
-	out := map[string]string{}
+// WorkspaceFiles walks the work dir into a manifest map. Values stay raw
+// bytes: the wire encodes them base64, so binary files round-trip intact.
+func (a *agent) WorkspaceFiles() (map[string][]byte, error) {
+	out := map[string][]byte{}
 	err := filepath.Walk(a.workDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return err
@@ -392,7 +390,7 @@ func (a *agent) WorkspaceFiles() (map[string]string, error) {
 		if err != nil {
 			return err
 		}
-		out[rel] = string(data)
+		out[rel] = data
 		return nil
 	})
 	return out, err

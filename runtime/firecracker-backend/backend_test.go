@@ -1,6 +1,7 @@
 package firecrackerbackend
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/http"
@@ -818,5 +819,178 @@ func TestSnapshotGC(t *testing.T) {
 	res := execOp(t, b, h2, "gc1", "echo gc-restore-ok")
 	if res.ExitCode != 0 {
 		t.Fatal("exec after GC'd restore failed")
+	}
+}
+
+// --- FH1/FM8/FM13 regression tests (CODE-REVIEW-FC-2026-09-14) ---
+
+// FH1: the shared path rule rejects script metacharacters. Ungated: pure
+// host-side validation.
+func TestCheckWorkspacePathStrict(t *testing.T) {
+	valid := []string{"a.txt", "dir/nested.go", "unicode-é/文件.txt", "dots.../x", "a-b_c.d"}
+	for _, p := range valid {
+		if err := checkWorkspacePath(p); err != nil {
+			t.Fatalf("valid path %q rejected: %v", p, err)
+		}
+	}
+	invalid := []string{
+		"x\nrm /tmp/pwn", "x\ry", "x\ty", "with space/name", "back\\slash",
+		"ctrl\x01char", "del\x7fchar", "/abs", "../escape", "a/../../b",
+	}
+	for _, p := range invalid {
+		if err := checkWorkspacePath(p); err == nil {
+			t.Fatalf("dangerous path %q accepted", p)
+		}
+	}
+}
+
+// FH1: the image builder refuses metacharacter paths before debugfs runs.
+func TestBuildWorkspaceImageRejectsMetachars(t *testing.T) {
+	img := filepath.Join(t.TempDir(), "ws.img")
+	if err := buildWorkspaceImage(img, map[string]string{"x\nrm /tmp/pwn": "x"}); err == nil {
+		t.Fatal("newline path accepted by image builder")
+	}
+	if _, err := os.Stat(img); !os.IsNotExist(err) {
+		t.Fatal("image created despite rejected manifest")
+	}
+	if err := buildWorkspaceImage(img, map[string]string{"with space/f": "x"}); err == nil {
+		t.Fatal("space path accepted by image builder")
+	}
+	// Valid paths still build.
+	if err := buildWorkspaceImage(img, map[string]string{"ok/a.txt": "content"}); err != nil {
+		t.Fatalf("valid manifest rejected: %v", err)
+	}
+}
+
+// FM8: incarnation IDs are whitelisted before any filesystem/sudo use.
+func TestIncarnationIDValidation(t *testing.T) {
+	root := t.TempDir()
+	b, err := New(Config{Root: root, KernelPath: "k", RootfsPath: "r", FirecrackerBin: "f"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := []string{"", "../escape", "a/b", "new\nline", "with space", "..", "a..b", "/abs"}
+	for _, id := range bad {
+		if _, err := b.Create(createSpec(id, nil)); err == nil {
+			t.Fatalf("incarnation ID %q accepted", id)
+		}
+	}
+	entries, _ := os.ReadDir(root)
+	for _, e := range entries {
+		if e.Name() != "snapshots" {
+			t.Fatalf("directory created for rejected ID: %s", e.Name())
+		}
+	}
+	// Restore validates too.
+	_, err = b.Restore(backendinterface.CheckpointData{
+		IncarnationID: "../evil",
+		Metadata:      map[string]string{"class": snapshotClass, "snapshot_dir": "x"},
+	})
+	if err == nil {
+		t.Fatal("Restore accepted invalid incarnation ID")
+	}
+}
+
+// FM13: binary file content round-trips byte-identically through the
+// supervisor wire (write → WorkspaceFiles → next incarnation's image).
+func TestBinaryWorkspaceRoundTrip(t *testing.T) {
+	b := newBackend(t)
+	var buf []byte
+	for i := 0; i < 256; i++ {
+		buf = append(buf, byte(i))
+	}
+	buf = append(buf, 0xff, 0xfe, 0x80, 0x80, 0x00, 0xc0, 0xaf) // invalid UTF-8
+	content := string(buf)
+	h, err := b.Create(createSpec("inc-bin", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := b.Exec(h, "b1", domain.Operation{Writes: map[string]string{"bin.dat": content}}); err != nil {
+		t.Fatal(err)
+	}
+	files, err := b.WorkspaceFiles(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := files["bin.dat"]; []byte(got) == nil || !bytes.Equal([]byte(got), buf) {
+		t.Fatalf("binary content corrupted on the wire: %d bytes, prefix %q", len(got), firstBytes([]byte(got), 16))
+	}
+	if err := b.Terminate(h); err != nil {
+		t.Fatal(err)
+	}
+	// Commit → rematerialize: the returned manifest becomes the next
+	// incarnation's workspace image; content must still be byte-identical.
+	h2, err := b.Create(createSpec("inc-bin2", map[string]string{"bin.dat": files["bin.dat"]}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h2); err != nil {
+		t.Fatalf("Start 2: %v", err)
+	}
+	defer b.Terminate(h2)
+	files2, err := b.WorkspaceFiles(h2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := files2["bin.dat"]; !bytes.Equal([]byte(got), buf) {
+		t.Fatalf("binary content corrupted across rematerialize: %d bytes, prefix %q", len(got), firstBytes([]byte(got), 16))
+	}
+	// And the guest filesystem itself agrees (independent of the walk).
+	res := execOp(t, b, h2, "b2", "wc -c < bin.dat")
+	if res.ExitCode != 0 {
+		t.Fatal("wc failed")
+	}
+	chunk, _ := supOf(t, b, "inc-bin2").ReadOutput("b2", false, 0, 1<<10)
+	if strings.TrimSpace(string(chunk.Data)) != fmt.Sprint(len(buf)) {
+		t.Fatalf("guest file size = %q, want %d", chunk.Data, len(buf))
+	}
+}
+
+func firstBytes(b []byte, n int) []byte {
+	if len(b) > n {
+		return b[:n]
+	}
+	return b
+}
+
+// FH1 round-trip: a metacharacter name minted by root inside the guest
+// (shell exec bypasses WriteFile validation) is rejected cleanly at the
+// next materialization boundary — no debugfs injection, explicit error.
+func TestWorkspaceInjectionRoundTrip(t *testing.T) {
+	b := newBackend(t)
+	h, err := b.Create(createSpec("inc-inj", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Terminate(h)
+	// The direct write path rejects metacharacter names up front.
+	if err := b.Exec(h, "i1", domain.Operation{Writes: map[string]string{"x\nrm /tmp/pwn": "x"}}); err == nil {
+		t.Fatal("Exec accepted newline filename")
+	}
+	// Guest root can still create one via the shell; it lands in the walk.
+	res := execOp(t, b, h, "i2", "printf pwn > 'evil\nname'")
+	if res.ExitCode != 0 {
+		t.Fatal("guest shell write failed")
+	}
+	files, err := b.WorkspaceFiles(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := files["evil\nname"]; !ok {
+		t.Fatalf("poison name missing from walk: %v", files)
+	}
+	// The materialization boundary (next image build) rejects it cleanly.
+	img := filepath.Join(t.TempDir(), "ws.img")
+	if err := buildWorkspaceImage(img, files); err == nil {
+		t.Fatal("image builder accepted guest-minted poison name")
+	}
+	if _, err := os.Stat("/tmp/pwn"); !os.IsNotExist(err) {
+		t.Fatal("injected debugfs command created /tmp/pwn")
 	}
 }

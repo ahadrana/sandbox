@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/agent-sandbox/platform/runtime/guest-supervisor"
 )
 
 // workspaceMountUnit is injected into each per-incarnation rootfs copy. It
@@ -26,13 +28,14 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 `
 
-// checkWorkspacePath rejects absolute and escaping relative paths.
+// checkWorkspacePath validates manifest paths before they are interpolated
+// into a debugfs command script (shared strict rule: no control chars,
+// whitespace, or backslash — debugfs tokenizes on whitespace and splits
+// commands on newlines, with no quoting). The host validates independently
+// of the guest: manifests can arrive from the workspace store, whose
+// contents may have been minted by root inside a VM.
 func checkWorkspacePath(path string) error {
-	clean := filepath.Clean(path)
-	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("unsafe workspace path: %q", path)
-	}
-	return nil
+	return supervisor.CheckWorkspacePath(path)
 }
 
 // buildWorkspaceImage creates an ext4 image at imgPath containing the

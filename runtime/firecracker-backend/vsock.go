@@ -151,7 +151,9 @@ func (s *vsockSupervisor) TerminateBackground() error {
 }
 
 func (s *vsockSupervisor) WriteFile(path, content string) error {
-	resp, err := s.call(supervisor.Request{Op: supervisor.OpWriteFile, Path: path, Content: content}, false)
+	// The wire carries []byte (base64); string<->[]byte conversion is
+	// lossless for arbitrary bytes, unlike JSON string marshaling.
+	resp, err := s.call(supervisor.Request{Op: supervisor.OpWriteFile, Path: path, Content: []byte(content)}, false)
 	return s.checked(resp, err)
 }
 
@@ -160,5 +162,9 @@ func (s *vsockSupervisor) WorkspaceFiles() (map[string]string, error) {
 	if err := s.checked(resp, err); err != nil {
 		return nil, err
 	}
-	return resp.Files, nil
+	files := make(map[string]string, len(resp.Files))
+	for k, v := range resp.Files {
+		files[k] = string(v)
+	}
+	return files, nil
 }

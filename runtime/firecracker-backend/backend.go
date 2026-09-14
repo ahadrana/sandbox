@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +16,18 @@ import (
 	"github.com/agent-sandbox/platform/runtime/backend-interface"
 	"github.com/agent-sandbox/platform/runtime/guest-supervisor"
 )
+
+// incarnationIDPattern whitelists IDs before they touch filesystem paths,
+// jailer arguments, systemd unit injection, or `sudo rm -rf` jail cleanup.
+// The `..` check is defense in depth on top of the character class.
+var incarnationIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+func validateIncarnationID(id string) error {
+	if !incarnationIDPattern.MatchString(id) || strings.Contains(id, "..") {
+		return fmt.Errorf("firecrackerbackend: invalid incarnation ID %q", id)
+	}
+	return nil
+}
 
 const (
 	defaultBootArgs    = "console=ttyS0 reboot=k panic=1 pci=off"
@@ -200,8 +213,8 @@ func (b *Backend) get(h backendinterface.Handle) (*incarnation, error) {
 func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if spec.IncarnationID == "" {
-		return backendinterface.Handle{}, fmt.Errorf("firecrackerbackend: empty IncarnationID")
+	if err := validateIncarnationID(spec.IncarnationID); err != nil {
+		return backendinterface.Handle{}, err
 	}
 	if _, exists := b.incs[spec.IncarnationID]; exists {
 		return backendinterface.Handle{}, fmt.Errorf("firecrackerbackend: incarnation %q already exists", spec.IncarnationID)
@@ -635,6 +648,9 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
 	if cp.Metadata["class"] != snapshotClass {
 		return backendinterface.Handle{}, fmt.Errorf("unsupported checkpoint class %q", cp.Metadata["class"])
+	}
+	if err := validateIncarnationID(cp.IncarnationID); err != nil {
+		return backendinterface.Handle{}, err
 	}
 	snapDir := cp.Metadata["snapshot_dir"]
 	metaBytes, err := os.ReadFile(filepath.Join(snapDir, "meta.json"))

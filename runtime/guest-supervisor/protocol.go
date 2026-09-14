@@ -44,7 +44,9 @@ type Request struct {
 	Offset      int64             `json:"offset,omitempty"`
 	MaxBytes    int               `json:"max_bytes,omitempty"`
 	Path        string            `json:"path,omitempty"`
-	Content     string            `json:"content,omitempty"`
+	// Content is file content for write_file; []byte so binary data
+	// marshals to base64 instead of being mangled as UTF-8.
+	Content []byte `json:"content,omitempty"`
 }
 
 // Response is the single guest→host message shape. Error carries the
@@ -66,8 +68,9 @@ type Response struct {
 	Processes     []ProcessInfo `json:"processes,omitempty"`
 	BaselinePGIDs []int         `json:"baseline_pgids,omitempty"`
 
-	// workspace_files
-	Files map[string]string `json:"files,omitempty"`
+	// workspace_files (map values are []byte → base64 on the wire, so
+	// binary files survive the JSON boundary unmangled)
+	Files map[string][]byte `json:"files,omitempty"`
 }
 
 // Well-known error strings so the host can map back to sentinel errors.
