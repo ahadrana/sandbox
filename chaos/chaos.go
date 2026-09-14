@@ -11,7 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"strings"
+	"sort"
 	"testing"
 	"time"
 
@@ -51,11 +51,15 @@ type flakyWS struct {
 	injected int
 }
 
+// ErrTransientWS is the typed transient workspace-store failure the chaos
+// harness injects; classification is by errors.Is, never by substring.
+var ErrTransientWS = errors.New("chaos: transient workspace-store failure")
+
 func (f *flakyWS) fail() error {
 	if f.failNext > 0 {
 		f.failNext--
 		f.injected++
-		return errors.New("chaos: transient workspace-store failure")
+		return ErrTransientWS
 	}
 	return nil
 }
@@ -249,8 +253,9 @@ func (r *runState) tolerate(kind string, err error) bool {
 		r.failures[kind]++
 		return false
 	}
-	if strings.Contains(err.Error(), "transient workspace-store failure") ||
-		strings.Contains(err.Error(), "supervisor") {
+	if errors.Is(err, ErrTransientWS) ||
+		errors.Is(err, backendinterface.ErrSupervisorDead) ||
+		errors.Is(err, backendinterface.ErrResponseDropped) {
 		r.failures[kind]++
 		return false
 	}
@@ -474,8 +479,14 @@ func (r *runState) currentRuntime() sandboxmanager.Runtime {
 func (r *runState) opSupervisorKill() {
 	if r.cfg.Fleet {
 		// Fleet mode: declare a host lost; the manager must reconcile and
-		// rematerialize elsewhere.
+		// rematerialize elsewhere. Host choice is deterministic per seed
+		// (sorted order), never map-order random.
+		hostIDs := make([]string, 0, len(r.hosts))
 		for hostID := range r.hosts {
+			hostIDs = append(hostIDs, hostID)
+		}
+		sort.Strings(hostIDs)
+		for _, hostID := range hostIDs {
 			r.fleet.SimulateHostLoss(hostID)
 			for i := 0; i < 4; i++ {
 				if err := r.mgr.Tick(50); err != nil {
@@ -540,10 +551,11 @@ func (r *runState) opCacheLoss() {
 		agent.Cache().Flush()
 	}
 	r.faults["cache_flush"]++
-	// Refetch path: rematerialize any lost sandbox.
+	// Refetch path: rematerialize every live sandbox that was materialized.
 	for _, id := range r.live() {
-		r.materialize(id)
-		return
+		if r.materialized[id] {
+			r.materialize(id)
+		}
 	}
 }
 

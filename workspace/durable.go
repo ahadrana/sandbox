@@ -95,7 +95,20 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// syncDir fsyncs a directory so a rename inside it survives a crash.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func (d *Durable) wsDir(id string) string { return filepath.Join(d.root, "workspaces", id) }
@@ -111,7 +124,10 @@ func (d *Durable) blobPath(digest string) string { return filepath.Join(d.root, 
 func (d *Durable) readHead(id string) (*headFile, error) {
 	data, err := os.ReadFile(d.headPath(id))
 	if err != nil {
-		return nil, domain.ErrNotFound
+		if os.IsNotExist(err) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
 	}
 	var h headFile
 	if err := json.Unmarshal(data, &h); err != nil {
@@ -134,7 +150,10 @@ func (d *Durable) writeHead(h *headFile) error {
 func (d *Durable) readManifestFile(id string, gen int64) (*manifestFile, error) {
 	data, err := os.ReadFile(d.manifestPath(id, gen))
 	if err != nil {
-		return nil, domain.ErrNotFound
+		if os.IsNotExist(err) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
 	}
 	var m manifestFile
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -203,7 +222,10 @@ func (d *Durable) Commit(workspaceID string, parentGeneration int64, manifest ma
 	m.ParentGeneration = &parent
 	for path, content := range manifest {
 		digest := blobDigest(content)
-		if _, err := os.Stat(d.blobPath(digest)); os.IsNotExist(err) {
+		if _, err := os.Stat(d.blobPath(digest)); err != nil {
+			if !os.IsNotExist(err) {
+				return domain.WorkspaceGeneration{}, err
+			}
 			if err := writeFileAtomic(d.blobPath(digest), []byte(content)); err != nil {
 				return domain.WorkspaceGeneration{}, err
 			}
@@ -298,9 +320,10 @@ func (d *Durable) Unpin(workspaceID string, generation int64) error {
 	if err != nil {
 		return err
 	}
-	if head.Pins[generation] > 0 {
-		head.Pins[generation]--
+	if head.Pins[generation] <= 0 {
+		return domain.ErrNotFound
 	}
+	head.Pins[generation]--
 	return d.writeHead(head)
 }
 

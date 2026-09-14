@@ -494,3 +494,34 @@ func TestOrphanScrubbedOnHostReregister(t *testing.T) {
 		t.Fatalf("orphan still running on host after scrub: %v", got)
 	}
 }
+
+// L7 regression: a restarted host agent rebuilds ownership and fence state
+// from adopted spec metadata, so a replayed pre-restart Create is idempotent
+// — same incarnation, capacity charged once.
+func TestAdoptedIncarnationFenceIdempotent(t *testing.T) {
+	fs := newFleetSystem(t, 1, 4)
+	req := hostagent.CreateRequest{
+		SandboxID: "sb-adopt", IncarnationID: "inc-adopt-1", Fence: 7, Epoch: 1,
+		WorkspaceID: createWSForTest(t, fs), WorkspaceGeneration: 1, MemoryBytes: 48,
+	}
+	agent := fs.hosts["host-1"]
+	h1, err := agent.Create(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Host agent restart: new instance over the same backend (adoption).
+	restarted := hostagent.New("host-1", fs.backends["host-1"], nil, fs.ws, 1<<20, fs.slots, 16)
+	h2, err := restarted.Create(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 != h2 {
+		t.Fatalf("replayed pre-restart create duplicated incarnation: %v vs %v", h1, h2)
+	}
+	if got := restarted.IncarnationIDs(); len(got) != 1 {
+		t.Fatalf("incarnations after replay = %v, want exactly 1", got)
+	}
+	if v := restarted.View(); v.UsedSlots != 1 || v.UsedMemory != 48 {
+		t.Fatalf("capacity after adoption+replay = %d slots/%d mem, want 1/48", v.UsedSlots, v.UsedMemory)
+	}
+}

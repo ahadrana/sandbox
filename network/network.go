@@ -130,13 +130,18 @@ type AuditEntry struct {
 	At      time.Time `json:"at"`
 }
 
-// AuditLog is an in-memory audit trail optionally mirrored to a durable
-// JSON-lines file.
+// AuditLog is an audit trail optionally mirrored to a durable JSON-lines
+// file. In-memory growth is bounded: when the cap is reached the oldest
+// entries are dropped and counted (see Dropped).
 type AuditLog struct {
 	mu      sync.Mutex
 	entries []AuditEntry
+	dropped int
 	file    *os.File
 }
+
+// maxAuditEntries bounds in-memory retention; the file mirror is uncapped.
+const maxAuditEntries = 10000
 
 // NewAuditLog opens an audit log; path "" means memory-only.
 func NewAuditLog(path string) (*AuditLog, error) {
@@ -151,15 +156,34 @@ func NewAuditLog(path string) (*AuditLog, error) {
 	return l, nil
 }
 
-func (l *AuditLog) Record(kind, subject, detail string, at time.Time) {
+// Record appends an audit entry, mirroring it to the durable file when
+// configured. File write failures are surfaced to the caller — an audit
+// component must not silently lose audit records.
+func (l *AuditLog) Record(kind, subject, detail string, at time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	entry := AuditEntry{Kind: kind, Subject: subject, Detail: detail, At: at}
 	l.entries = append(l.entries, entry)
+	if len(l.entries) > maxAuditEntries {
+		excess := len(l.entries) - maxAuditEntries
+		l.entries = append([]AuditEntry{}, l.entries[excess:]...)
+		l.dropped += excess
+	}
 	if l.file != nil {
 		data, _ := json.Marshal(entry)
-		l.file.Write(append(data, '\n'))
+		if _, err := l.file.Write(append(data, '\n')); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// Dropped reports how many in-memory entries were evicted by the retention
+// cap (file-mirrored entries are never lost).
+func (l *AuditLog) Dropped() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.dropped
 }
 
 func (l *AuditLog) Entries() []AuditEntry {
@@ -223,7 +247,15 @@ func (g *Gateway) Route(bindingID string) RouteDecision {
 	if b.State != domain.EndpointActive {
 		return deny(fmt.Sprintf("binding %s", b.State))
 	}
-	if !view.Now.IsZero() && !b.ExpiresAt.IsZero() && view.Now.After(b.ExpiresAt) {
+	// Fail closed whenever expiry cannot be evaluated, and at the exact
+	// expiry instant (routable strictly before ExpiresAt only).
+	if view.Now.IsZero() {
+		return deny("cannot evaluate expiry: no clock")
+	}
+	if b.ExpiresAt.IsZero() {
+		return deny("cannot evaluate expiry: binding has no TTL")
+	}
+	if !view.Now.Before(b.ExpiresAt) {
 		return deny("binding expired")
 	}
 	if b.ExecutionEpoch != view.CurrentEpoch {

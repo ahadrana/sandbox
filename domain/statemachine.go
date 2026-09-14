@@ -40,6 +40,10 @@ func (e *QuotaExceededError) Error() string {
 // ErrUnauthorized marks cross-tenant access rejection (INV-028).
 var ErrUnauthorized = errors.New("cross-tenant access denied")
 
+// ErrInvalidRequest marks a request that fails schema validation (e.g.
+// Priority out of range, unknown workload Class).
+var ErrInvalidRequest = errors.New("invalid request")
+
 // UnauthorizedError reports a request whose asserted tenant does not own the
 // target sandbox. Authentication of the principal itself remains a gateway
 // concern (DESIGN §6.1); this is ownership enforcement only.

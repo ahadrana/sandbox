@@ -111,13 +111,13 @@ func (a *AgentRuntime) execOp(sandboxID string, op domain.Operation) (*domain.Ex
 		obs.ExitCode = *ex.ExitCode
 	}
 	files, err := a.Mgr.RuntimeFiles(sandboxID)
-	if err == nil {
+	if err == nil && op.Command != "" {
 		if out, ok := files[captureFile]; ok {
 			obs.Output = truncate(out, a.budget())
 			if len(out) > a.budget() {
 				obs.Note = fmt.Sprintf("output truncated to %d bytes", a.budget())
 			}
-		} else if op.Command != "" {
+		} else {
 			obs.Note = "command output unavailable on this backend"
 		}
 	}

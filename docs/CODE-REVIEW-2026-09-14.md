@@ -40,19 +40,19 @@
 
 ## Low severity
 
-- [ ] **L1 — PID-reuse window** in `TerminateBackground`/`killProcesses`/`Restore` kill paths (no marker re-check immediately before SIGKILL).
-- [ ] **L2 — `supervisor.go:190` — negative `maxBytes` panics** `ReadOutput`; `f.Stat()` error ignored.
-- [ ] **L3 — `supervisor.go:74` — per-exec env can't override ambient env** (append order; shadows broker-injected credentials).
-- [ ] **L4 — `control-plane/scheduler/scheduler.go:58,66` — NaN score with zero-capacity hosts; placement fences memory-only** (rejected as stale after control-plane rebuild against warm hosts); fences map grows unbounded.
-- [ ] **L5 — `network/network.go:184,112` — gateway fail-open when clock unset; audit writes drop errors** (audit-durability gap for an audit component); audit memory grows unbounded.
-- [ ] **L6 — `chaos/chaos.go:250,507` — error classification by substring; `opCacheLoss` returns inside first loop iteration** (dead loop / single coverage).
-- [ ] **L7 — `hostagent.go:180` — adopted-incarnation fence gap**: replayed pre-restart Create can create a second incarnation for one sandbox.
-- [ ] **L8 — `domain/domain.go:39` — `itoa(math.MinInt64)` returns `"-0"`**; `IDGen`/`ManualClock` not goroutine-safe (currently serialized — undocumented assumption).
-- [ ] **L9 — `api/api.go:19` — `Priority`/`Class` never validated** (`"Interactive"` typo silently becomes preemptible background).
-- [ ] **L10 — `manager.go:516,631,824,1130` — preemption event emitted before victim suspend succeeds; `deny` ignores flushTx error; idempotency-hit nil-deref risk; `CancelExecution` assumes sandbox exists.**
-- [ ] **L11 — `integration/llm.go:113` — stale `agent-last-output.txt` misattributed to non-shell observations**; `integration/adapters.go:48` silent empty read for missing files; `Coordinator.SandboxFor` shared flag describes cache-hit, not policy.
-- [ ] **L12 — `workspace/durable.go:78,111,206,294` — no dir fsync on rename-publish; all read errors collapsed to `ErrNotFound`; non-NotExist `os.Stat` error silently skipped; `Unpin` never validates generation.**
-- [ ] **L13 — `environment-builder/builder.go:189,265` — `Open` loses `installRuns` and FAILED records; reuse path activates artifact without digest verification.**
+- [x] **L1 — PID-reuse window** in `TerminateBackground`/`killProcesses`/`Restore` kill paths (no marker re-check immediately before SIGKILL).
+- [x] **L2 — `supervisor.go:190` — negative `maxBytes` panics** `ReadOutput`; `f.Stat()` error ignored.
+- [x] **L3 — `supervisor.go:74` — per-exec env can't override ambient env** (append order; shadows broker-injected credentials).
+- [x] **L4 — `control-plane/scheduler/scheduler.go:58,66` — NaN score with zero-capacity hosts; placement fences memory-only** (rejected as stale after control-plane rebuild against warm hosts); fences map grows unbounded.
+- [x] **L5 — `network/network.go:184,112` — gateway fail-open when clock unset; audit writes drop errors** (audit-durability gap for an audit component); audit memory grows unbounded.
+- [x] **L6 — `chaos/chaos.go:250,507` — error classification by substring; `opCacheLoss` returns inside first loop iteration** (dead loop / single coverage).
+- [x] **L7 — `hostagent.go:180` — adopted-incarnation fence gap**: replayed pre-restart Create can create a second incarnation for one sandbox.
+- [x] **L8 — `domain/domain.go:39` — `itoa(math.MinInt64)` returns `"-0"`**; `IDGen`/`ManualClock` not goroutine-safe (currently serialized — undocumented assumption).
+- [x] **L9 — `api/api.go:19` — `Priority`/`Class` never validated** (`"Interactive"` typo silently becomes preemptible background).
+- [x] **L10 — `manager.go:516,631,824,1130` — preemption event emitted before victim suspend succeeds; `deny` ignores flushTx error; idempotency-hit nil-deref risk; `CancelExecution` assumes sandbox exists.**
+- [x] **L11 — `integration/llm.go:113` — stale `agent-last-output.txt` misattributed to non-shell observations**; `integration/adapters.go:48` silent empty read for missing files; `Coordinator.SandboxFor` shared flag describes cache-hit, not policy.
+- [x] **L12 — `workspace/durable.go:78,111,206,294` — no dir fsync on rename-publish; all read errors collapsed to `ErrNotFound`; non-NotExist `os.Stat` error silently skipped; `Unpin` never validates generation.**
+- [x] **L13 — `environment-builder/builder.go:189,265` — `Open` loses `installRuns` and FAILED records; reuse path activates artifact without digest verification.**
 
 ## Overall assessment
 

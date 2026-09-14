@@ -190,13 +190,43 @@ func New(hostID string, backend *localbackend.Backend, envs EnvironmentSource, w
 		bySandbox: map[string]string{},
 	}
 	// Host restart with an intact backend: adopt still-live incarnations so
-	// they remain supervised. Memory/fence bookkeeping is rebuilt
-	// conservatively (adopted fences start at 0).
-	for _, handle := range backend.LiveHandles() {
-		h.incarnations[handle.IncarnationID] = &incRecord{}
+	// they remain supervised. Ownership and fence state are rebuilt from the
+	// retained create-spec metadata, so a replayed pre-restart Create is
+	// idempotent (same sandbox, same fence -> same incarnation), never a
+	// duplicate.
+	for _, spec := range backend.LiveSpecs() {
+		fence := adoptedFence(spec)
+		h.incarnations[spec.IncarnationID] = &incRecord{
+			sandboxID: spec.SandboxID, fence: fence,
+			memory: spec.MemoryBytes, envID: spec.EnvironmentID,
+		}
+		if spec.SandboxID != "" {
+			h.bySandbox[spec.SandboxID] = spec.IncarnationID
+			if fence > h.fences[spec.SandboxID] {
+				h.fences[spec.SandboxID] = fence
+			}
+		}
 		h.slotsUsed++
+		h.memUsed += spec.MemoryBytes
+	}
+	for _, handle := range backend.LiveHandles() {
+		if _, ok := h.incarnations[handle.IncarnationID]; !ok {
+			h.incarnations[handle.IncarnationID] = &incRecord{}
+			h.slotsUsed++
+		}
 	}
 	return h
+}
+
+// fenceEnvKey carries the placement fence in the backend-retained spec
+// metadata, surviving host-agent restarts.
+const fenceEnvKey = "AGENT_SANDBOX_PLACEMENT_FENCE"
+
+// adoptedFence recovers the placement fence recorded at create time.
+func adoptedFence(spec backendinterface.Spec) int64 {
+	var n int64
+	fmt.Sscanf(spec.Env[fenceEnvKey], "%d", &n)
+	return n
 }
 
 func (h *HostAgent) HostID() string { return h.hostID }
@@ -259,6 +289,7 @@ func (h *HostAgent) Create(req CreateRequest) (backendinterface.Handle, error) {
 		WorkspaceGeneration: req.WorkspaceGeneration,
 		WorkspaceManifest:   manifest,
 		MemoryBytes:         req.MemoryBytes,
+		Env:                 map[string]string{fenceEnvKey: fmt.Sprintf("%d", req.Fence)},
 	})
 	if err != nil {
 		if req.EnvironmentID != "" {

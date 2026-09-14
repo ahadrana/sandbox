@@ -230,7 +230,69 @@ func Open(root string, repos RepoSource, clock domain.Clock, ids *domain.IDGen) 
 		b.envs[envCopy.EnvironmentID] = &envCopy
 		b.byKey[envCopy.Name+"|"+envCopy.ConfigDigest] = envCopy.EnvironmentID
 	}
+	// Builder state holds what artifacts cannot: FAILED/BUILDING records
+	// (they have no artifact directory), their specs, and install-run counts.
+	if data, err := os.ReadFile(filepath.Join(root, "builder-state.json")); err == nil {
+		var st builderState
+		if err := json.Unmarshal(data, &st); err == nil {
+			for id, env := range st.Envs {
+				if _, ok := b.envs[id]; ok {
+					continue
+				}
+				envCopy := *env
+				b.envs[id] = &envCopy
+				if envCopy.Status == domain.EnvironmentBuilding {
+					b.byKey[envCopy.Name+"|"+envCopy.ConfigDigest] = id
+				}
+			}
+			for id, spec := range st.Specs {
+				if _, ok := b.specs[id]; !ok {
+					b.specs[id] = spec
+				}
+			}
+			for digest, n := range st.InstallRuns {
+				b.installRuns[digest] = n
+			}
+		}
+	}
 	return b, nil
+}
+
+// builderState is the durable registry state (root/builder-state.json).
+type builderState struct {
+	Envs        map[string]*domain.Environment `json:"envs"`
+	Specs       map[string]EnvironmentSpec     `json:"specs"`
+	InstallRuns map[string]int                 `json:"install_runs"`
+}
+
+// persistStateLocked rewrites builder-state.json with the environments that
+// have no artifact directory (BUILDING/FAILED), their specs, and the
+// install-run counts. Caller holds b.mu.
+func (b *Builder) persistStateLocked() error {
+	st := builderState{
+		Envs:        map[string]*domain.Environment{},
+		Specs:       map[string]EnvironmentSpec{},
+		InstallRuns: b.installRuns,
+	}
+	for id, env := range b.envs {
+		if env.Status == domain.EnvironmentBuilding || env.Status == domain.EnvironmentFailed {
+			cp := *env
+			st.Envs[id] = &cp
+			if spec, ok := b.specs[id]; ok {
+				st.Specs[id] = spec
+			}
+		}
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(b.root, "builder-state.json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // StartBuild registers a build and returns immediately with status BUILDING.
@@ -261,6 +323,9 @@ func (b *Builder) StartBuild(family string, spec EnvironmentSpec) (*domain.Envir
 	b.envs[env.EnvironmentID] = env
 	b.byKey[key] = env.EnvironmentID
 	b.specs[env.EnvironmentID] = spec
+	if err := b.persistStateLocked(); err != nil {
+		return nil, err
+	}
 	cp := *env
 	return &cp, nil
 }
@@ -314,9 +379,14 @@ func (b *Builder) CompleteBuild(environmentID string) error {
 
 	digest := env.ConfigDigest
 	artifactDir := filepath.Join(b.root, "artifacts", digest)
-	if _, err := os.Stat(filepath.Join(artifactDir, "manifest.json")); err == nil {
-		// Artifact already built from identical inputs: reuse, no install re-run.
-		return b.finish(env, artifactDir, true, "")
+	if data, err := os.ReadFile(filepath.Join(artifactDir, "manifest.json")); err == nil {
+		var m artifactManifest
+		if json.Unmarshal(data, &m) == nil && digestFileSet(m.Files) == m.IntegrityDigest {
+			// Artifact already built from identical inputs and verified:
+			// reuse, no install re-run.
+			return b.finish(env, artifactDir, true, "")
+		}
+		// Corrupt manifest: fall through and rebuild the artifact.
 	}
 
 	buildDir := filepath.Join(b.root, "build", env.EnvironmentID)
@@ -347,6 +417,12 @@ func (b *Builder) CompleteBuild(environmentID string) error {
 		b.installRuns[digest]++
 		b.mu.Unlock()
 		installErr = runInstall(buildDir, cmd, b.InstallTimeout, logPath)
+		b.mu.Lock()
+		if err := b.persistStateLocked(); err != nil {
+			b.mu.Unlock()
+			return err
+		}
+		b.mu.Unlock()
 	}
 	if installErr != nil {
 		return b.failBuild(env, logPath, installErr)
@@ -361,6 +437,9 @@ func (b *Builder) failBuild(env *domain.Environment, logRef string, cause error)
 	env.Status = domain.EnvironmentFailed
 	env.LogRef = logRef
 	delete(b.byKey, env.Name+"|"+env.ConfigDigest)
+	if err := b.persistStateLocked(); err != nil {
+		return err
+	}
 	return fmt.Errorf("%w: %v", ErrBuildFailed, cause)
 }
 
@@ -421,7 +500,7 @@ func (b *Builder) finish(env *domain.Environment, artifactDir string, reused boo
 	if err := os.WriteFile(filepath.Join(artifactDir, "environment.json"), record, 0o644); err != nil {
 		return err
 	}
-	return nil
+	return b.persistStateLocked()
 }
 
 // persistRecordLocked rewrites the environment's environment.json inside its

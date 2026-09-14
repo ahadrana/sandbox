@@ -419,6 +419,20 @@ func (m *Manager) transition(sb *domain.Sandbox, to domain.SandboxState) error {
 func (m *Manager) CreateSandbox(req api.CreateSandboxRequest) (*domain.Sandbox, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Validate placement fields: an out-of-range priority or an unknown
+	// class must fail loudly, never silently become preemptible background.
+	if req.Priority < 0 || req.Priority > 100 {
+		return nil, fmt.Errorf("%w: priority %d out of range 0-100", domain.ErrInvalidRequest, req.Priority)
+	}
+	class := req.Class
+	if class == "" {
+		// Documented safe default: INTERACTIVE (never preemptible by
+		// another tenant's interactive work).
+		class = domain.ClassInteractive
+	}
+	if class != domain.ClassInteractive && class != domain.ClassBackground {
+		return nil, fmt.Errorf("%w: unknown class %q", domain.ErrInvalidRequest, req.Class)
+	}
 	ws, err := m.ws.Create(req.TenantID, req.EnvironmentID)
 	if err != nil {
 		return nil, err
@@ -435,7 +449,7 @@ func (m *Manager) CreateSandbox(req api.CreateSandboxRequest) (*domain.Sandbox, 
 		WorkspaceGeneration: ws.HeadGeneration,
 		PolicyRef:           req.PolicyRef,
 		Priority:            req.Priority,
-		WorkloadClass:       req.Class,
+		WorkloadClass:       class,
 		StartupCommands:     append([]string{}, req.StartupCommands...),
 		BaselineCommands:    append([]string{}, req.BaselineCommands...),
 		Version:             1,
@@ -530,16 +544,18 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 		if victim == nil {
 			break
 		}
+		// Preemption must reclaim the victim's capacity: workspace-only
+		// suspend, never a RAM-retaining checkpoint. The preemption event is
+		// emitted only after the victim's suspend actually succeeds — never
+		// for a preemption that did not happen.
+		if serr := m.suspendWithReasonLocked(victim, "preempted", false); serr != nil {
+			break
+		}
 		m.emit(victim, victim.SandboxID, domain.EventSandboxPreempted, map[string]any{
 			"preempted_by":       sb.SandboxID,
 			"victim_priority":    victim.Priority,
 			"requester_priority": sb.Priority,
 		})
-		// Preemption must reclaim the victim's capacity: workspace-only
-		// suspend, never a RAM-retaining checkpoint.
-		if serr := m.suspendWithReasonLocked(victim, "preempted", false); serr != nil {
-			break
-		}
 		h, err = m.rt.Create(spec)
 	}
 	if err != nil {
@@ -642,8 +658,13 @@ func (m *Manager) checkQuotaLocked(sb *domain.Sandbox) error {
 			"resource":  resource,
 			"limit":     limit,
 		})
-		m.flushTx()
-		return &domain.QuotaExceededError{TenantID: sb.TenantID, Resource: resource, Limit: limit}
+		qerr := &domain.QuotaExceededError{TenantID: sb.TenantID, Resource: resource, Limit: limit}
+		if ferr := m.flushTx(); ferr != nil {
+			// The caller-facing error stays the quota error; the
+			// persistence failure is surfaced alongside it.
+			return fmt.Errorf("%w (denial event not persisted: %v)", qerr, ferr)
+		}
+		return qerr
 	}
 	if q.MaxLiveSandboxes > 0 && live+1 > int64(q.MaxLiveSandboxes) {
 		return deny("live_sandboxes", int64(q.MaxLiveSandboxes))
@@ -885,9 +906,13 @@ func (m *Manager) StartExecution(req api.StartExecutionRequest) (*domain.Executi
 	}
 	if req.IdempotencyKey != "" {
 		if existingID, dup := m.idem[req.SandboxID+"|"+req.IdempotencyKey]; dup {
-			ex := m.executions[existingID]
-			cp := *ex
-			return &cp, nil
+			if ex, ok := m.executions[existingID]; ok {
+				cp := *ex
+				return &cp, nil
+			}
+			// Stale idempotency record (execution gone): drop it and treat
+			// the request as new rather than dereferencing nil.
+			delete(m.idem, req.SandboxID+"|"+req.IdempotencyKey)
 		}
 	}
 	if !execStartable[sb.ObservedState] {
@@ -1016,6 +1041,9 @@ func (m *Manager) CompleteExecution(executionID string) (*domain.Execution, erro
 		return nil, domain.ErrNotFound
 	}
 	sb := m.sandboxes[ex.SandboxID]
+	if sb == nil {
+		return nil, domain.ErrNotFound
+	}
 	h, live := m.handles[sb.SandboxID]
 	if !live {
 		return nil, domain.ErrIllegalState
@@ -1211,6 +1239,9 @@ func (m *Manager) CancelExecution(executionID string) (*domain.Execution, error)
 		return &cp, nil
 	}
 	sb := m.sandboxes[ex.SandboxID]
+	if sb == nil {
+		return nil, domain.ErrNotFound
+	}
 	if err := domain.TransitionExecution(ex.State, domain.ExecutionCancelled); err != nil {
 		return nil, err
 	}
@@ -1643,6 +1674,11 @@ func (m *Manager) terminateLocked(sb *domain.Sandbox) error {
 	}
 	if err := m.transition(sb, domain.SandboxTerminated); err != nil {
 		return err
+	}
+	// Drop per-sandbox scheduler state (placement fence) so it does not
+	// outlive the sandbox.
+	if rs, ok := m.rt.(interface{ ReleaseSandbox(string) }); ok {
+		rs.ReleaseSandbox(sandboxID)
 	}
 	return m.flushTx()
 }

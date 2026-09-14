@@ -426,6 +426,13 @@ func (f *Fleet) Capabilities() backendinterface.Capabilities {
 	return caps
 }
 
+// ReleaseSandbox drops per-sandbox scheduling state (the placement fence
+// counter) when a sandbox terminates, so the fences map does not grow
+// unboundedly.
+func (f *Fleet) ReleaseSandbox(sandboxID string) {
+	f.sched.ReleaseFence(sandboxID)
+}
+
 // Tick receives heartbeats from healthy hosts and declares hosts lost after
 // heartbeatMissThreshold consecutive misses.
 func (f *Fleet) Tick() {

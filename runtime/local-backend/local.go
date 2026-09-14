@@ -34,6 +34,7 @@ func WithCapabilities(c backendinterface.Capabilities) Option {
 
 type incarnation struct {
 	id      string
+	spec    backendinterface.Spec
 	wsDir   string
 	sup     *localSupervisor
 	started bool
@@ -112,6 +113,7 @@ func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, e
 	}
 	b.incs[spec.IncarnationID] = &incarnation{
 		id:    spec.IncarnationID,
+		spec:  spec,
 		wsDir: wsDir,
 		sup:   sup,
 		ops:   map[string]domain.Operation{},
@@ -271,13 +273,24 @@ func (b *Backend) Terminate(h backendinterface.Handle) error {
 	return nil
 }
 
+// markerOwned re-verifies, immediately before a kill, that pid still carries
+// the incarnation marker — closing the PID-reuse window between the
+// inventory scan and the SIGKILL.
+func markerOwned(marker string, pid int) bool {
+	environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	return err == nil && hasEnvEntry(string(environ), marker)
+}
+
 func (b *Backend) killProcesses(inc *incarnation) {
+	marker := inc.sup.marker
 	for _, p := range mustInventory(inc.sup) {
-		syscall.Kill(p.PID, syscall.SIGKILL)
+		if markerOwned(marker, p.PID) {
+			syscall.Kill(p.PID, syscall.SIGKILL)
+		}
 	}
 	inc.sup.mu.Lock()
 	for _, t := range inc.sup.execs {
-		if t.cmd.Process != nil {
+		if t.cmd.Process != nil && markerOwned(marker, t.cmd.Process.Pid) {
 			syscall.Kill(-t.cmd.Process.Pid, syscall.SIGKILL)
 		}
 	}
@@ -342,6 +355,9 @@ func (b *Backend) TerminateBackground(h backendinterface.Handle) error {
 	for _, p := range mustInventory(inc.sup) {
 		if baseline[p.PGID] {
 			continue
+		}
+		if !markerOwned(inc.sup.marker, p.PID) {
+			continue // PID reused by an unowned process since the scan
 		}
 		if p.PGID > 0 && !killedPGID[p.PGID] {
 			syscall.Kill(-p.PGID, syscall.SIGKILL)
@@ -512,6 +528,21 @@ func (b *Backend) LiveHandles() []backendinterface.Handle {
 	for id, inc := range b.incs {
 		if !inc.dead {
 			out = append(out, backendinterface.Handle{IncarnationID: id})
+		}
+	}
+	return out
+}
+
+// LiveSpecs returns the retained create-spec metadata of every live
+// incarnation, so a restarted host agent can rebuild ownership and fencing
+// state at adoption (INV-016).
+func (b *Backend) LiveSpecs() []backendinterface.Spec {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []backendinterface.Spec
+	for _, inc := range b.incs {
+		if !inc.dead {
+			out = append(out, inc.spec)
 		}
 	}
 	return out

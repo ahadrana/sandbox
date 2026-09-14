@@ -973,3 +973,28 @@ func TestReconcilerKeepsLiveExecutionsRunning(t *testing.T) {
 		t.Fatalf("workspace write misattributed: %+v", head.CauseExecutionID)
 	}
 }
+
+// Unpin of an unknown generation or at refcount zero fails instead of
+// silently succeeding (L12).
+func TestUnpinValidation(t *testing.T) {
+	d, _, _ := newDurableWS(t, t.TempDir())
+	ws, err := d.Create("tenant-1", "env-base-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Unpin(ws.WorkspaceID, 99); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("unpin unknown generation: %v", err)
+	}
+	if err := d.Unpin(ws.WorkspaceID, ws.HeadGeneration); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("unpin at refcount zero: %v", err)
+	}
+	if err := d.Pin(ws.WorkspaceID, ws.HeadGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Unpin(ws.WorkspaceID, ws.HeadGeneration); err != nil {
+		t.Fatalf("unpin after pin: %v", err)
+	}
+	if err := d.Unpin(ws.WorkspaceID, ws.HeadGeneration); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("second unpin: %v", err)
+	}
+}

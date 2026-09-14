@@ -107,7 +107,9 @@ func (b *Broker) Issue(tenantID, taskRef string, capabilities []string, ttl time
 		return "", Claims{}, err
 	}
 	token := base64.RawURLEncoding.EncodeToString(payload) + "." + b.sign(payload)
-	b.audit.Record("issue", claims.TokenID, fmt.Sprintf("tenant=%s task=%s caps=%v expires=%s", tenantID, taskRef, capabilities, claims.ExpiresAt), now)
+	if err := b.audit.Record("issue", claims.TokenID, fmt.Sprintf("tenant=%s task=%s caps=%v expires=%s", tenantID, taskRef, capabilities, claims.ExpiresAt), now); err != nil {
+		return "", Claims{}, err
+	}
 	return token, claims, nil
 }
 
@@ -138,23 +140,28 @@ func (b *Broker) Verify(token string, now time.Time) (Claims, error) {
 		return Claims{}, ErrMalformed
 	}
 	if b.revoked[claims.TokenID] {
-		b.audit.Record("use", claims.TokenID, "denied: revoked", now)
+		_ = b.audit.Record("use", claims.TokenID, "denied: revoked", now)
 		return Claims{}, ErrRevoked
 	}
 	if now.After(claims.ExpiresAt) {
-		b.audit.Record("use", claims.TokenID, "denied: expired", now)
+		_ = b.audit.Record("use", claims.TokenID, "denied: expired", now)
 		return Claims{}, ErrExpired
 	}
-	b.audit.Record("use", claims.TokenID, "verified", now)
+	if err := b.audit.Record("use", claims.TokenID, "verified", now); err != nil {
+		return Claims{}, err
+	}
 	return claims, nil
 }
 
-// Revoke adds a token ID to the revocation list.
-func (b *Broker) Revoke(tokenID string, now time.Time) {
+// Revoke adds a token ID to the revocation list. The revocation is durable
+// (it lands in the audit file that New reloads); a file-write failure is
+// returned, in which case the in-memory revocation still holds for this
+// broker instance.
+func (b *Broker) Revoke(tokenID string, now time.Time) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.revoked[tokenID] = true
-	b.audit.Record("revoke", tokenID, "revoked", now)
+	return b.audit.Record("revoke", tokenID, "revoked", now)
 }
 
 // AuditEntries returns the broker audit trail (token IDs, never values).

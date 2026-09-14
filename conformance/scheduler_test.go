@@ -341,3 +341,31 @@ func TestSchedulerLocalityScoring(t *testing.T) {
 		t.Fatalf("high-pressure host won placement: %s", p.HostID)
 	}
 }
+
+// L9 regression: CreateSandbox validates Priority (0-100) and Class
+// (INTERACTIVE|BACKGROUND); empty Class defaults to INTERACTIVE.
+func TestCreateSandboxValidation(t *testing.T) {
+	s := newSystem(t, "fake")
+	for _, req := range []api.CreateSandboxRequest{
+		{Version: api.SchemaVersionV1, TenantID: "t", TaskRef: "x", Priority: -1},
+		{Version: api.SchemaVersionV1, TenantID: "t", TaskRef: "x", Priority: 101},
+		{Version: api.SchemaVersionV1, TenantID: "t", TaskRef: "x", Class: "Interactive"}, // case typo
+		{Version: api.SchemaVersionV1, TenantID: "t", TaskRef: "x", Class: "BATCH"},
+	} {
+		if _, err := s.mgr.CreateSandbox(req); !errors.Is(err, domain.ErrInvalidRequest) {
+			t.Fatalf("request %+v: err = %v, want ErrInvalidRequest", req, err)
+		}
+	}
+	sb, err := s.mgr.CreateSandbox(api.CreateSandboxRequest{
+		Version: api.SchemaVersionV1, TenantID: "t", TaskRef: "x", Priority: 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.WorkloadClass != domain.ClassInteractive {
+		t.Fatalf("default class = %q, want INTERACTIVE", sb.WorkloadClass)
+	}
+	if sb.Priority != 50 {
+		t.Fatalf("priority = %d, want 50", sb.Priority)
+	}
+}

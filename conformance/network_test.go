@@ -396,3 +396,78 @@ func TestEgressEnforcementDeclarationOnlyGap(t *testing.T) {
 		t.Fatalf("declared egress not policy-enforced: %v", err)
 	}
 }
+
+// L5 regression: the gateway fails closed when expiry cannot be evaluated
+// and is unroutable at the exact expiry instant.
+func TestGatewayExpiryFailClosed(t *testing.T) {
+	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	b := domain.EndpointBinding{
+		BindingID: "b1", SandboxID: "sb1", State: domain.EndpointActive,
+		ExecutionEpoch: 1, ExpiresAt: now.Add(time.Minute),
+	}
+	src := &staticBindingSource{view: network.BindingView{
+		Binding: b, CurrentEpoch: 1, SandboxActive: true, Now: now,
+	}}
+	gw := network.NewGateway(src)
+	if r := gw.Route("b1"); !r.Allowed {
+		t.Fatalf("fresh binding denied: %+v", r)
+	}
+	// Exact expiry instant: unroutable.
+	src.view.Now = now.Add(time.Minute)
+	if r := gw.Route("b1"); r.Allowed {
+		t.Fatal("routable at the exact expiry instant")
+	}
+	// No clock: fail closed.
+	src.view.Now = time.Time{}
+	if r := gw.Route("b1"); r.Allowed {
+		t.Fatal("routable with no clock")
+	}
+	// No TTL: fail closed.
+	src.view.Now = now
+	src.view.Binding.ExpiresAt = time.Time{}
+	if r := gw.Route("b1"); r.Allowed {
+		t.Fatal("routable with no TTL")
+	}
+}
+
+type staticBindingSource struct{ view network.BindingView }
+
+func (s *staticBindingSource) BindingView(string) (network.BindingView, bool) {
+	return s.view, true
+}
+
+// L5 regression: audit Record surfaces file write errors and in-memory
+// retention is capped with a dropped counter.
+func TestAuditLogErrorsAndCap(t *testing.T) {
+	l, err := network.NewAuditLog("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for i := 0; i < 10050; i++ {
+		if err := l.Record("k", "s", "d", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(l.Entries()); got != 10000 {
+		t.Fatalf("entries = %d, want capped at 10000", got)
+	}
+	if got := l.Dropped(); got != 50 {
+		t.Fatalf("dropped = %d, want 50", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	l2, err := network.NewAuditLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.Record("k", "s", "d", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.Record("k", "s", "d", now); err == nil {
+		t.Fatal("write error after close not surfaced")
+	}
+}

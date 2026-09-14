@@ -1,6 +1,7 @@
 package conformance
 
 import (
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -496,5 +497,76 @@ func TestRepoRefContainment(t *testing.T) {
 	}
 	if err := repos.Checkout("ok", "", t.TempDir()); err != nil {
 		t.Fatalf("legitimate checkout rejected: %v", err)
+	}
+}
+
+// FAILED records, specs, and install-run counts survive a builder reopen
+// (L13).
+func TestBuilderStatePersistsAcrossReopen(t *testing.T) {
+	f := newEnvFixture(t)
+	f.repos.AddVersion("base-go", "", map[string]string{"bin/go": "binary"})
+	f.repos.AddVersion("app", "sha-app-1", map[string]string{"main.go": "v1"})
+	f.repos.AddVersion("app", "sha-app-2", map[string]string{"main.go": "broken"})
+	good := mustBuild(t, f, "coding", baseSpec())
+
+	bad := baseSpec()
+	bad.RepoInputs[0].SHA = "sha-app-2"
+	bad.InstallCommand = "exit 1"
+	failed, err := f.builder.StartBuild("coding", bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.builder.CompleteBuild(failed.EnvironmentID); err == nil {
+		t.Fatal("expected build failure")
+	}
+
+	reopened, err := environmentbuilder.Open(f.root, f.repos, domain.NewManualClock(time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC)), domain.NewIDGen())
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := reopened.Get(failed.EnvironmentID)
+	if err != nil {
+		t.Fatalf("FAILED record lost across reopen: %v", err)
+	}
+	if env.Status != domain.EnvironmentFailed || env.LogRef == "" {
+		t.Fatalf("FAILED record wrong after reopen: %+v", env)
+	}
+	if got := reopened.InstallRuns(good.ConfigDigest); got != 1 {
+		t.Fatalf("install runs lost across reopen: %d", got)
+	}
+	if active, err := reopened.Active("coding"); err != nil || active.EnvironmentID != good.EnvironmentID {
+		t.Fatalf("ACTIVE default wrong after reopen: %v %v", active, err)
+	}
+}
+
+// A corrupt artifact manifest is not reused: CompleteBuild rebuilds instead
+// of activating it (L13).
+func TestCorruptArtifactManifestRebuilt(t *testing.T) {
+	f := newEnvFixture(t)
+	f.repos.AddVersion("base-go", "", map[string]string{"bin/go": "binary"})
+	f.repos.AddVersion("app", "sha-app-1", map[string]string{"main.go": "v1"})
+	env := mustBuild(t, f, "coding", baseSpec())
+	artifactDir := env.ArtifactRefs[0]
+	if err := os.WriteFile(artifactDir+"/manifest.json", []byte(`{"files":{},"integrity_digest":"bogus"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A different family with an identical spec produces a new BUILDING env
+	// whose completion would reuse the (now corrupt) artifact.
+	other, err := f.builder.StartBuild("other", baseSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Status != domain.EnvironmentBuilding {
+		t.Fatalf("status = %s, want BUILDING", other.Status)
+	}
+	if err := f.builder.CompleteBuild(other.EnvironmentID); err != nil {
+		t.Fatalf("complete build with corrupt artifact: %v", err)
+	}
+	if got := f.builder.InstallRuns(env.ConfigDigest); got != 2 {
+		t.Fatalf("corrupt artifact was reused: install runs = %d, want 2", got)
+	}
+	if _, err := f.builder.ArtifactManifest(other.EnvironmentID); err != nil {
+		t.Fatalf("artifact still corrupt after rebuild: %v", err)
 	}
 }

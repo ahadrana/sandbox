@@ -2,57 +2,54 @@
 // state machines of the Agent Sandbox Platform.
 package domain
 
-import "time"
+import (
+	"strconv"
+	"sync"
+	"time"
+)
 
 // Clock supplies time to logic paths; implementations must be injectable.
 type Clock interface {
 	Now() time.Time
 }
 
-// ManualClock is a deterministic Clock for tests and the conformance harness.
+// ManualClock is a deterministic Clock for tests and the conformance
+// harness. It is goroutine-safe.
 type ManualClock struct {
-	t time.Time
+	mu sync.Mutex
+	t  time.Time
 }
 
 func NewManualClock(start time.Time) *ManualClock { return &ManualClock{t: start} }
 
-func (c *ManualClock) Now() time.Time { return c.t }
+func (c *ManualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
 
-func (c *ManualClock) Advance(d time.Duration) { c.t = c.t.Add(d) }
+func (c *ManualClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
 
-// IDGen generates deterministic, unique IDs.
+// IDGen generates deterministic, unique IDs. It is goroutine-safe.
 type IDGen struct {
-	n int64
+	mu sync.Mutex
+	n  int64
 }
 
 func NewIDGen() *IDGen { return &IDGen{} }
 
 func (g *IDGen) Next(prefix string) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.n++
 	return prefix + "-" + itoa(g.n)
 }
 
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
 type EnvironmentStatus string
 

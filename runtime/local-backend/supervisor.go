@@ -84,10 +84,25 @@ func (s *localSupervisor) Exec(req supervisor.ExecRequest) error {
 		s.mu.Unlock()
 		return err
 	}
-	env := append([]string{}, os.Environ()...)
-	env = append(env, s.marker)
-	env = append(env, s.extraEnv...)
+	// Build the process env as a key->value map so per-execution req.Env
+	// overrides inherited/ambient entries (last-wins per key) instead of
+	// appending shadowed duplicates.
+	envMap := map[string]string{}
+	for _, e := range os.Environ() {
+		if k, v, ok := strings.Cut(e, "="); ok {
+			envMap[k] = v
+		}
+	}
+	for _, e := range append([]string{s.marker}, s.extraEnv...) {
+		if k, v, ok := strings.Cut(e, "="); ok {
+			envMap[k] = v
+		}
+	}
 	for k, v := range req.Env {
+		envMap[k] = v
+	}
+	env := make([]string, 0, len(envMap))
+	for k, v := range envMap {
 		env = append(env, k+"="+v)
 	}
 	argv := []string{"/bin/sh", "-c", req.Command}
@@ -194,6 +209,9 @@ func (s *localSupervisor) ReadOutput(executionID string, stderr bool, offset int
 	if err := validateExecutionID(executionID); err != nil {
 		return supervisor.OutputChunk{}, err
 	}
+	if maxBytes < 0 || offset < 0 {
+		return supervisor.OutputChunk{}, fmt.Errorf("negative offset/maxBytes")
+	}
 	if maxBytes > supervisor.MaxChunkBytes {
 		return supervisor.OutputChunk{}, supervisor.ErrTooLarge
 	}
@@ -206,12 +224,15 @@ func (s *localSupervisor) ReadOutput(executionID string, stderr bool, offset int
 		return supervisor.OutputChunk{}, err
 	}
 	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return supervisor.OutputChunk{}, err
+	}
 	if _, err := f.Seek(offset, 0); err != nil {
 		return supervisor.OutputChunk{}, err
 	}
 	buf := make([]byte, maxBytes)
 	n, _ := f.Read(buf)
-	st, _ := f.Stat()
 	eof := offset+int64(n) >= st.Size()
 	if t, err := s.get(executionID); err == nil {
 		select {

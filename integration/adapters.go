@@ -45,7 +45,12 @@ func (a *AgentRuntime) RunActions(sandboxID string, actions []OHAction) ([]Obser
 			if err != nil {
 				return out, err
 			}
-			out = append(out, Observation{Output: truncate(files[act.Path], a.budget())})
+			content, ok := files[act.Path]
+			if !ok {
+				out = append(out, Observation{Note: fmt.Sprintf("read: %s not found", act.Path)})
+				continue
+			}
+			out = append(out, Observation{Output: truncate(content, a.budget())})
 		case "finish":
 			return out, nil
 		default:
@@ -163,7 +168,7 @@ func (c *Coordinator) SandboxFor(task CoordinatorTask, existing map[string]strin
 			return "", false, err
 		}
 		c.shared[task.Group] = id
-		return id, false, nil
+		return id, true, nil
 	}
 	if id, ok := existing[task.TaskID]; ok {
 		return id, false, nil

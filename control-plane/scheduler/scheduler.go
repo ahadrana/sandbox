@@ -45,6 +45,13 @@ type Placement struct {
 }
 
 // Scheduler is a deterministic scoring placement engine.
+//
+// Fence limitation: per-sandbox fence counters are memory-only. After a
+// control-plane rebuild against warm hosts, a replayed create carrying an
+// older persisted fence can be rejected as stale even though it is
+// legitimate; persisting the fence counter in the manager store is future
+// work. Callers must release sandbox fences via ReleaseFence at sandbox
+// termination so the map does not grow unboundedly.
 type Scheduler struct {
 	mu     sync.Mutex
 	fences map[string]int64
@@ -60,11 +67,26 @@ func (s *Scheduler) nextFence(sandboxID string) int64 {
 	return s.fences[sandboxID]
 }
 
+// ReleaseFence drops the per-sandbox fence counter; called when a sandbox
+// terminates.
+func (s *Scheduler) ReleaseFence(sandboxID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.fences, sandboxID)
+}
+
 // score ranks a host: capacity dominates, cache locality is a bonus,
-// pressure a penalty. Locality never gates correctness.
+// pressure a penalty. Locality never gates correctness. Zero-capacity
+// dimensions score 0 — never NaN.
 func score(req Request, h HostView) float64 {
-	freeSlots := float64(h.CapacitySlots-h.UsedSlots) / float64(h.CapacitySlots)
-	freeMem := float64(h.CapacityMemory-h.UsedMemory) / float64(h.CapacityMemory)
+	freeSlots := 0.0
+	if h.CapacitySlots > 0 {
+		freeSlots = float64(h.CapacitySlots-h.UsedSlots) / float64(h.CapacitySlots)
+	}
+	freeMem := 0.0
+	if h.CapacityMemory > 0 {
+		freeMem = float64(h.CapacityMemory-h.UsedMemory) / float64(h.CapacityMemory)
+	}
 	score := 3*freeSlots + 2*freeMem - 2*h.Pressure
 	if h.CachedEnvironments[req.EnvironmentID] && req.EnvironmentID != "" {
 		score += 4

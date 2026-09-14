@@ -342,3 +342,65 @@ func TestExecutionStateResetTranslated(t *testing.T) {
 	}
 	_ = rt
 }
+
+// A write op must not report the stale capture file left behind by a prior
+// shell op (L11).
+func TestWriteOpNoStaleShellOutput(t *testing.T) {
+	s := newSystem(t, "local")
+	rt := newAgentRuntime(s)
+	sandboxID := createAgentSandbox(t, s, "task-stale")
+	_, shellObs, err := rt.ExecShell(sandboxID, "echo shell-output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(shellObs.Output, "shell-output") {
+		t.Fatalf("shell observation missing output: %+v", shellObs)
+	}
+	_, writeObs, err := rt.WriteFiles(sandboxID, map[string]string{"other.txt": "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writeObs.Output != "" {
+		t.Fatalf("write op reported stale shell output: %+v", writeObs)
+	}
+}
+
+// Reading a missing file yields an explicit error observation, not silent
+// empty output (L11).
+func TestRunActionsReadMissingFile(t *testing.T) {
+	s := newSystem(t, "local")
+	rt := newAgentRuntime(s)
+	sandboxID := createAgentSandbox(t, s, "task-read-missing")
+	obs, err := rt.RunActions(sandboxID, []integration.OHAction{
+		{Kind: "read", Path: "nope.txt"},
+		{Kind: "finish"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs) != 1 || !strings.Contains(obs[0].Note, "not found") {
+		t.Fatalf("missing-file read observation wrong: %+v", obs)
+	}
+}
+
+// SandboxFor reports the shared policy on creation as well as on cache hit
+// (L11).
+func TestSandboxForSharedFlag(t *testing.T) {
+	s := newSystem(t, "fake")
+	rt := newAgentRuntime(s)
+	coord := integration.NewCoordinator(rt)
+	create := func() (string, error) { return createAgentSandbox(t, s, "task-share"), nil }
+	sharedTask := integration.CoordinatorTask{TaskID: "s1", ShareSandbox: true, Group: "g"}
+	_, shared, err := coord.SandboxFor(sharedTask, map[string]string{}, create)
+	if err != nil || !shared {
+		t.Fatalf("first shared create: shared=%v err=%v", shared, err)
+	}
+	_, shared, err = coord.SandboxFor(integration.CoordinatorTask{TaskID: "s2", ShareSandbox: true, Group: "g"}, map[string]string{}, create)
+	if err != nil || !shared {
+		t.Fatalf("cache hit: shared=%v err=%v", shared, err)
+	}
+	_, shared, err = coord.SandboxFor(integration.CoordinatorTask{TaskID: "x1"}, map[string]string{}, create)
+	if err != nil || shared {
+		t.Fatalf("non-shared task: shared=%v err=%v", shared, err)
+	}
+}
