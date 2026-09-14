@@ -21,16 +21,16 @@ import (
 // jail-relative ("/rootfs.ext4" etc.), host paths are the jail-root paths.
 
 type vmmLayout struct {
-	hostDir    string // host-side dir holding console.log and drive files
-	hostSock   string // host-side api.sock
-	hostVsock  string // host-side vsock uds
-	apiSock    string // api path as the (possibly jailed) VMM sees it
-	apiVsock   string
-	apiKernel  string
-	apiRootfs  string
-	apiWS      string
-	jailed     bool
-	jailRoot   string
+	hostDir   string // host-side dir holding console.log and drive files
+	hostSock  string // host-side api.sock
+	hostVsock string // host-side vsock uds
+	apiSock   string // api path as the (possibly jailed) VMM sees it
+	apiVsock  string
+	apiKernel string
+	apiRootfs string
+	apiWS     string
+	jailed    bool
+	jailRoot  string
 }
 
 func (b *Backend) jailerUsable() bool {

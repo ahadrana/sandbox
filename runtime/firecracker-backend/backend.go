@@ -50,7 +50,7 @@ type Config struct {
 	// on Terminate (default false: committed checkpoints survive).
 	DeleteSnapshotsOnTerminate bool
 	BootArgs                   string // default: smoke-tested "console=ttyS0 reboot=k panic=1 pci=off"
-	VCPUs     int64  // default 1
+	VCPUs                      int64  // default 1
 	// DefaultMemMiB applies when Spec.MemoryBytes is 0; default 256.
 	DefaultMemMiB int64
 	BootTimeout   time.Duration // default 90s
