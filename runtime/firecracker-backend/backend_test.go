@@ -2,6 +2,7 @@ package firecrackerbackend
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/agent-sandbox/platform/domain"
 	"github.com/agent-sandbox/platform/network"
 	"github.com/agent-sandbox/platform/runtime/backend-interface"
+	"github.com/agent-sandbox/platform/runtime/guest-supervisor"
 )
 
 // Real-VM tests run only on the KVM host: FC_TEST=1, linux/arm64 (or any
@@ -1208,5 +1210,133 @@ func TestWorkspaceInjectionRoundTrip(t *testing.T) {
 	}
 	if _, err := os.Stat("/tmp/pwn"); !os.IsNotExist(err) {
 		t.Fatal("injected debugfs command created /tmp/pwn")
+	}
+}
+
+// TestExecSnapshotRace (FM5): an Exec mid-flight while Snapshot pauses the
+// VM must either fully land in the guest before the pause or fail with
+// ErrIllegalState — never half-apply, and the wsMirror must never record a
+// write the guest never confirmed (INV-006).
+func TestExecSnapshotRace(t *testing.T) {
+	b := newBackend(t)
+	h, err := b.Create(createSpec("inc-race", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Terminate(h)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errs := map[int]error{}
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				id := w*10000 + i
+				path := fmt.Sprintf("race-%d.txt", id)
+				err := b.Exec(h, fmt.Sprintf("race-exec-%d", id), domain.Operation{
+					Writes: map[string]string{path: fmt.Sprint(id)},
+				})
+				mu.Lock()
+				errs[id] = err
+				mu.Unlock()
+			}
+		}(w)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if _, err := b.Snapshot(h); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+	if err := b.Resume(h); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+
+	for id, err := range errs {
+		if err != nil && !errors.Is(err, backendinterface.ErrIllegalState) {
+			t.Fatalf("exec %d failed with non-state error: %v", id, err)
+		}
+	}
+	guest, err := b.WorkspaceFiles(h)
+	if err != nil {
+		t.Fatalf("WorkspaceFiles: %v", err)
+	}
+	b.mu.Lock()
+	inc := b.incs["inc-race"]
+	mirror := map[string]string{}
+	for k, v := range inc.wsMirror {
+		mirror[k] = v
+	}
+	b.mu.Unlock()
+	for id, err := range errs {
+		path := fmt.Sprintf("race-%d.txt", id)
+		want := fmt.Sprint(id)
+		if err == nil {
+			if guest[path] != want || mirror[path] != want {
+				t.Fatalf("successful exec %d not visible in guest/mirror: guest=%q mirror=%q", id, guest[path], mirror[path])
+			}
+		} else if _, ok := mirror[path]; ok {
+			t.Fatalf("failed exec %d recorded in wsMirror (guest never saw it)", id)
+		}
+	}
+}
+
+// TestWedgedSupervisorWaitReturns (FM10): a blocked WaitExecution must not
+// hang forever when the guest supervisor wedges with the VMM still alive —
+// the liveness watchdog aborts it with supervisor.ErrUnhealthy.
+func TestWedgedSupervisorWaitReturns(t *testing.T) {
+	b := newBackend(t)
+	h, err := b.Create(createSpec("inc-wedge", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Terminate(h)
+
+	if err := b.Exec(h, "wedge-long", domain.Operation{Command: "sleep 300"}); err != nil {
+		t.Fatalf("Exec long command: %v", err)
+	}
+	waitDone := make(chan error, 1)
+	go func() {
+		_, err := b.WaitExecution(h, "wedge-long")
+		waitDone <- err
+	}()
+	// Let the wait settle, then freeze the guest agent from inside: the VMM
+	// stays alive, the stopped process keeps the vsock connection open, and
+	// only the watchdog can notice. (SIGKILL instead drops the connection
+	// and the wait fails fast with EOF — the easy case.)
+	time.Sleep(2 * time.Second)
+	// The signal stops the supervisor before it can answer this very exec
+	// (its shell matches the -f pattern too); either outcome is fine.
+	_ = b.Exec(h, "wedge-kill", domain.Operation{Command: "pkill -STOP -f guest-supervisor || true"})
+
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, supervisor.ErrUnhealthy) {
+			t.Fatalf("WaitExecution error = %v, want supervisor.ErrUnhealthy", err)
+		}
+	case <-time.After(90 * time.Second):
+		t.Fatal("WaitExecution still blocked 90s after guest supervisor died")
+	}
+	// The backend itself must stay responsive: liveness reflects the dead
+	// agent, and Terminate works.
+	if b.Alive(h) {
+		t.Log("VMM still alive (expected: only the guest agent was killed)")
+	}
+	if err := b.Terminate(h); err != nil {
+		t.Fatalf("Terminate after wedged wait: %v", err)
 	}
 }

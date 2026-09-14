@@ -539,8 +539,11 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 	h, err := m.rt.Create(spec)
 	// Fleet full: preempt (suspend) strictly-lower-priority BACKGROUND
 	// sandboxes until placement succeeds or no victim remains (PLAN §13).
+	// A victim whose suspend fails is excluded and the next-lowest-priority
+	// victim is tried rather than abandoning or retrying the same victim.
+	excluded := map[string]bool{}
 	for preempts := 0; err != nil && preempts < 8; preempts++ {
-		victim := m.preemptableLocked(sb)
+		victim := m.preemptableLocked(sb, excluded)
 		if victim == nil {
 			break
 		}
@@ -549,7 +552,8 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 		// emitted only after the victim's suspend actually succeeds — never
 		// for a preemption that did not happen.
 		if serr := m.suspendWithReasonLocked(victim, "preempted", false); serr != nil {
-			break
+			excluded[victim.SandboxID] = true
+			continue
 		}
 		m.emit(victim, victim.SandboxID, domain.EventSandboxPreempted, map[string]any{
 			"preempted_by":       sb.SandboxID,
@@ -691,14 +695,15 @@ func authorizeTenant(sb *domain.Sandbox, tenantID string) error {
 
 // preemptableLocked picks the lowest-priority live BACKGROUND-class victim
 // for an INTERACTIVE requester; strictly lower priority only, so equal
-// priority never preempts.
-func (m *Manager) preemptableLocked(requester *domain.Sandbox) *domain.Sandbox {
+// priority never preempts. Sandboxes in excluded (earlier victims whose
+// suspend failed) are skipped.
+func (m *Manager) preemptableLocked(requester *domain.Sandbox, excluded map[string]bool) *domain.Sandbox {
 	if requester.WorkloadClass != domain.ClassInteractive {
 		return nil
 	}
 	var victim *domain.Sandbox
 	for id, other := range m.sandboxes {
-		if id == requester.SandboxID || other.WorkloadClass != domain.ClassBackground {
+		if id == requester.SandboxID || excluded[id] || other.WorkloadClass != domain.ClassBackground {
 			continue
 		}
 		if _, live := m.handles[id]; !live {
@@ -1032,25 +1037,49 @@ func isAckLost(err error) bool {
 
 // CompleteExecution finishes a RUNNING execution successfully: commits a new
 // workspace generation when writes are pending and recomputes quiescence
-// (INV-012).
+// (INV-012). The runtime wait is guest-paced and unbounded, so m.mu is
+// released across it — a wedged guest must never wedge the control plane —
+// and the execution state is re-validated before finalizing.
 func (m *Manager) CompleteExecution(executionID string) (*domain.Execution, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	ex, ok := m.executions[executionID]
 	if !ok {
+		m.mu.Unlock()
 		return nil, domain.ErrNotFound
 	}
 	sb := m.sandboxes[ex.SandboxID]
 	if sb == nil {
+		m.mu.Unlock()
 		return nil, domain.ErrNotFound
 	}
 	h, live := m.handles[sb.SandboxID]
 	if !live {
+		m.mu.Unlock()
 		return nil, domain.ErrIllegalState
 	}
+	m.mu.Unlock()
+
 	outcome, err := m.rt.WaitExecution(h, executionID)
 	if err != nil {
 		return nil, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ex, ok = m.executions[executionID]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	sb = m.sandboxes[ex.SandboxID]
+	if sb == nil {
+		return nil, domain.ErrNotFound
+	}
+	if ex.State == domain.ExecutionCompleted {
+		// Finalized concurrently while the wait was in flight (reconciler
+		// or a duplicate CompleteExecution): return the recorded state
+		// without re-appending the outcome or re-committing.
+		cp := *ex
+		return &cp, nil
 	}
 	// Persist the observed outcome before the workspace commit / state
 	// update chain so recovery can finalize exactly once (PLAN §6).
@@ -1387,7 +1416,11 @@ func (m *Manager) suspendWithReasonLocked(sb *domain.Sandbox, reason string, all
 // (honestly reported as 0 reclaimed); snapshot-class backends
 // (Capabilities.CheckpointReclaimsMemory) are terminated after capture and
 // report the reclaimed RAM — Restore boots back from the checkpoint with
-// real continuity. The handle stays live for a continuity resume.
+// real continuity. STOP/CONT-class handles stay live for a continuity
+// resume; reclaim-class handles are dropped with the terminated VM so the
+// sandbox no longer counts against live-sandbox quotas and is never picked
+// as a preemption victim (its capacity is already reclaimed). Resume
+// re-registers the handle Restore returns.
 func (m *Manager) checkpointSuspendLocked(sb *domain.Sandbox, h backendinterface.Handle, payloadReason func(map[string]any) map[string]any) error {
 	if err := m.rt.Pause(h); err != nil {
 		return err
@@ -1419,6 +1452,7 @@ func (m *Manager) checkpointSuspendLocked(sb *domain.Sandbox, h backendinterface
 		if err := m.rt.Terminate(h); err != nil {
 			return err
 		}
+		delete(m.handles, sb.SandboxID)
 		incState = domain.IncarnationTerminated
 	}
 	if sb.RuntimeIncarnationID != nil {
@@ -1471,14 +1505,20 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 	if sb.CheckpointRef != nil {
 		if record, ok := m.checkpoints[*sb.CheckpointRef]; ok {
 			h, live := m.handles[sandboxID]
-			if live {
-				if _, err := m.rt.Restore(record.data); err == nil {
+			// Reclaim-class backends drop the handle at suspend; continuity
+			// is still available via Restore from the checkpoint, and the
+			// fresh handle is re-registered.
+			if live || m.rt.Capabilities().CheckpointReclaimsMemory {
+				if newHandle, err := m.rt.Restore(record.data); err == nil {
+					m.handles[sandboxID] = newHandle
 					return m.resumeWithContinuityLocked(sb, record)
 				}
 				// Continuity broken: clean the stale incarnation and fall
 				// back to workspace-only recovery.
-				m.rt.Terminate(h)
-				delete(m.handles, sandboxID)
+				if live {
+					m.rt.Terminate(h)
+					delete(m.handles, sandboxID)
+				}
 			}
 			delete(m.checkpoints, *sb.CheckpointRef)
 		}

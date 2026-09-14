@@ -131,6 +131,12 @@ type incarnation struct {
 	jailed    bool
 	jailRoot  string
 	net       *netState
+	// opMu serializes guest-mutating operations (Exec writes/commands)
+	// against the pause/snapshot window: Snapshot holds it across
+	// pause+snapshotCreate so an Exec either fully lands in the guest before
+	// the pause, or blocks and then fails with ErrIllegalState once paused —
+	// never half-applied mid-snapshot (wsMirror/guest divergence, INV-006).
+	opMu sync.Mutex
 }
 
 // Backend is a Firecracker-microVM RuntimeBackend (IsolationClass VM).
@@ -413,6 +419,17 @@ func tailConsole(dir string) string {
 // transparently).
 func (b *Backend) attachSupervisor(inc *incarnation) error {
 	sup := newVsockSupervisor(b.layoutFor(inc).hostVsock, b.cfg.SupervisorPort, b.cfg.APITimeout)
+	sup.alive = func() bool {
+		// Read under b.mu: spawn reassigns inc.exited on (re)boot.
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		select {
+		case <-inc.exited:
+			return false
+		default:
+			return true
+		}
+	}
 	deadline := time.Now().Add(b.cfg.BootTimeout)
 	var lastErr error
 	for {
@@ -596,6 +613,12 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 	}
 	wasRunning := !inc.paused
 	b.mu.Unlock()
+
+	// Hold the op mutex across pause + drive copy + snapshotCreate so no
+	// Exec can be mid-flight against the guest while its memory and disks
+	// are captured (racing writes would be lost or half-applied, INV-006).
+	inc.opMu.Lock()
+	defer inc.opMu.Unlock()
 
 	if wasRunning {
 		if err := b.Pause(h); err != nil {
@@ -940,6 +963,19 @@ func (b *Backend) Exec(h backendinterface.Handle, executionID string, op domain.
 		return err
 	}
 	if !inc.started || inc.paused {
+		b.mu.Unlock()
+		return backendinterface.ErrIllegalState
+	}
+	b.mu.Unlock()
+
+	// Serialize against Snapshot's pause window: after acquiring opMu the
+	// state is re-checked, so an Exec racing a pause either fully lands in
+	// the guest before it or fails cleanly with ErrIllegalState — the
+	// wsMirror is never updated for writes the guest never saw (INV-006).
+	inc.opMu.Lock()
+	defer inc.opMu.Unlock()
+	b.mu.Lock()
+	if !inc.started || inc.paused || inc.dead {
 		b.mu.Unlock()
 		return backendinterface.ErrIllegalState
 	}

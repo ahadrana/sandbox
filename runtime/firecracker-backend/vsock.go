@@ -19,6 +19,10 @@ type vsockSupervisor struct {
 	udsPath string
 	port    uint32
 	timeout time.Duration
+	// alive reports whether the VMM process is still running; wired by the
+	// backend after spawn so a blocked Wait can notice a dead runtime even
+	// when the vsock connection never closes on its own.
+	alive func() bool
 }
 
 func newVsockSupervisor(udsPath string, port uint32, timeout time.Duration) *vsockSupervisor {
@@ -98,12 +102,53 @@ func (s *vsockSupervisor) Status(executionID string) (supervisor.StatusResponse,
 	return resp.Status, nil
 }
 
+// Wait blocks until the guest reports the execution's result. There is no
+// absolute timeout — long-running commands are legitimate — so a liveness
+// watchdog bounds the wait instead: every waitWatchdogInterval the VMM
+// process liveness and a Health probe on a second connection are checked,
+// and after waitWatchdogMaxFailures consecutive failures (or a dead VMM)
+// the wait aborts with supervisor.ErrUnhealthy. Without this a wedged guest
+// supervisor (still holding the vsock connection open but never answering)
+// would block Wait — and any caller waiting on it — forever.
+const (
+	waitWatchdogInterval    = 5 * time.Second
+	waitWatchdogMaxFailures = 3
+)
+
 func (s *vsockSupervisor) Wait(executionID string) (supervisor.Result, error) {
-	resp, err := s.call(supervisor.Request{Op: supervisor.OpWait, ExecutionID: executionID}, true)
-	if err := s.checked(resp, err); err != nil {
-		return supervisor.Result{}, err
+	type waitOutcome struct {
+		resp supervisor.Response
+		err  error
 	}
-	return resp.Result, nil
+	done := make(chan waitOutcome, 1)
+	go func() {
+		resp, err := s.call(supervisor.Request{Op: supervisor.OpWait, ExecutionID: executionID}, true)
+		done <- waitOutcome{resp, err}
+	}()
+	ticker := time.NewTicker(waitWatchdogInterval)
+	defer ticker.Stop()
+	failures := 0
+	for {
+		select {
+		case out := <-done:
+			if err := s.checked(out.resp, out.err); err != nil {
+				return supervisor.Result{}, err
+			}
+			return out.resp.Result, nil
+		case <-ticker.C:
+			if s.alive != nil && !s.alive() {
+				return supervisor.Result{}, fmt.Errorf("%w: runtime process gone", supervisor.ErrUnhealthy)
+			}
+			if err := s.Health(); err != nil {
+				failures++
+				if failures >= waitWatchdogMaxFailures {
+					return supervisor.Result{}, fmt.Errorf("%w: guest supervisor unresponsive after %d probes: %v", supervisor.ErrUnhealthy, failures, err)
+				}
+			} else {
+				failures = 0
+			}
+		}
+	}
 }
 
 func (s *vsockSupervisor) Cancel(executionID string) error {

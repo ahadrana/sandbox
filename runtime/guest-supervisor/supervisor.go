@@ -15,6 +15,9 @@ var (
 	ErrNotFound    = errors.New("execution not found")
 	ErrTooLarge    = errors.New("requested chunk exceeds maximum")
 	ErrUnsupported = errors.New("operation unsupported by this backend")
+	// ErrUnhealthy reports a runtime whose guest agent has stopped
+	// answering liveness probes (wedged supervisor, dead VMM).
+	ErrUnhealthy = errors.New("runtime unhealthy")
 )
 
 // MaxChunkBytes bounds a single StreamOutput read (backpressure contract).

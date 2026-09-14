@@ -323,3 +323,62 @@ func TestFirecrackerCheckpointSuspendResumeReclaimsRAM(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Snapshot-class checkpoint suspend must release the sandbox's quota slot
+// (FM9): the reclaim-class suspend terminates the VMM and drops the handle,
+// so the suspended sandbox no longer counts as live — and resume restores
+// continuity from the checkpoint with a freshly registered handle.
+func TestFirecrackerCheckpointSuspendReclaimsQuota(t *testing.T) {
+	s := newSystem(t, "firecracker")
+	fcBackend(t, s)
+	d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 74)
+	s.mgr.SetQuota(domain.Quota{TenantID: "tenant-1", MaxLiveSandboxes: 1})
+
+	sb1, err := d.CreateSandbox("task-fc-quota-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterialize(t, d, sb1.SandboxID)
+	if _, err := d.ExecSync(sb1.SandboxID, domain.Operation{
+		Command: "true",
+		Writes:  map[string]string{"quota.txt": "sb1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.mgr.Suspend(sb1.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	consumer := eventservice.NewConsumer()
+	suspended := eventsOfType(consumer.Poll(s.outbox), domain.EventSandboxSuspended)
+	if len(suspended) != 1 || suspended[0].Payload["mode"] != "execution_state" {
+		t.Fatalf("want execution_state (reclaiming) suspend: %v", suspended)
+	}
+
+	// The quota slot is reclaimed: a second sandbox materializes where a
+	// RAM-retaining suspend would have denied it with QuotaExceeded.
+	sb2, err := d.CreateSandbox("task-fc-quota-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterialize(t, d, sb2.SandboxID)
+	if got := eventsOfType(consumer.Poll(s.outbox), domain.EventQuotaExceeded); len(got) != 0 {
+		t.Fatalf("QuotaExceeded emitted after reclaiming suspend: %v", got)
+	}
+
+	// Resume re-registers the handle via Restore: continuity retained,
+	// workspace intact, and the sandbox is usable again.
+	report, err := s.mgr.Resume(sb1.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.NewEpoch != report.PriorEpoch {
+		t.Fatalf("continuity resume changed epoch %d -> %d", report.PriorEpoch, report.NewEpoch)
+	}
+	files, err := s.mgr.RuntimeFiles(sb1.SandboxID)
+	if err != nil {
+		t.Fatalf("RuntimeFiles after continuity resume: %v", err)
+	}
+	if files["quota.txt"] != "sb1" {
+		t.Fatalf("workspace not intact after quota-reclaim resume: %v", files)
+	}
+}
