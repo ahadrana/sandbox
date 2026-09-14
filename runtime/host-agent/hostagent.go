@@ -1,8 +1,8 @@
 // Package hostagent simulates a Kubernetes-fleet Runtime Host (DESIGN §6.6,
 // PLAN §8): registration, heartbeats, capacity accounting, a bounded local
 // artifact/workspace cache, fenced create/terminate, and supervision of its
-// incarnations through the local backend. Kubernetes objects never appear in
-// any public surface (INV-019).
+// incarnations through any RuntimeBackend (local process or Firecracker VM).
+// Kubernetes objects never appear in any public surface (INV-019).
 package hostagent
 
 import (
@@ -15,7 +15,6 @@ import (
 	"github.com/agent-sandbox/platform/domain"
 	"github.com/agent-sandbox/platform/runtime/backend-interface"
 	"github.com/agent-sandbox/platform/runtime/guest-supervisor"
-	localbackend "github.com/agent-sandbox/platform/runtime/local-backend"
 )
 
 var (
@@ -23,6 +22,30 @@ var (
 	ErrCapacity   = errors.New("host capacity exceeded")
 	ErrHostDown   = errors.New("host unreachable")
 )
+
+// RuntimeBackend is the backend surface a HostAgent supervises: the full
+// manager Runtime contract (backendinterface.Backend plus the execution and
+// supervision operations) plus the adoption surface — LiveHandles/LiveSpecs
+// let a restarted host agent re-adopt still-live incarnations and rebuild
+// ownership, fence, and capacity state (INV-016). The local process backend
+// and the Firecracker VM backend both satisfy it.
+type RuntimeBackend interface {
+	backendinterface.Backend
+	Exec(h backendinterface.Handle, executionID string, op domain.Operation) error
+	WaitExecution(h backendinterface.Handle, executionID string) (supervisor.Result, error)
+	LiveDescendants(h backendinterface.Handle) int
+	LiveNonBaselineDescendants(h backendinterface.Handle) int
+	ProcessInventory(h backendinterface.Handle) ([]supervisor.ProcessInfo, error)
+	TerminateBackground(h backendinterface.Handle) error
+	WorkspaceFiles(h backendinterface.Handle) (map[string]string, error)
+	Dirty(h backendinterface.Handle) bool
+	MarkCommitted(h backendinterface.Handle)
+	KillRuntime(h backendinterface.Handle)
+	Alive(h backendinterface.Handle) bool
+	Tick()
+	LiveHandles() []backendinterface.Handle
+	LiveSpecs() []backendinterface.Spec
+}
 
 // EnvironmentSource resolves prepared-environment artifacts.
 type EnvironmentSource interface {
@@ -166,7 +189,7 @@ type incRecord struct {
 type HostAgent struct {
 	mu      sync.Mutex
 	hostID  string
-	backend *localbackend.Backend
+	backend RuntimeBackend
 	envs    EnvironmentSource
 	ws      WorkspaceStore
 	cache   *artifactCache
@@ -181,7 +204,7 @@ type HostAgent struct {
 	bySandbox    map[string]string     // sandboxID -> live incarnationID
 }
 
-func New(hostID string, backend *localbackend.Backend, envs EnvironmentSource, ws WorkspaceStore, memCapacity int64, slots int, cacheSize int) *HostAgent {
+func New(hostID string, backend RuntimeBackend, envs EnvironmentSource, ws WorkspaceStore, memCapacity int64, slots int, cacheSize int) *HostAgent {
 	h := &HostAgent{
 		hostID: hostID, backend: backend, envs: envs, ws: ws,
 		cache:       newArtifactCache(cacheSize),
@@ -243,7 +266,7 @@ func (h *HostAgent) IncarnationIDs() []string {
 	return out
 }
 
-func (h *HostAgent) Backend() *localbackend.Backend { return h.backend }
+func (h *HostAgent) Backend() RuntimeBackend { return h.backend }
 
 func (h *HostAgent) Cache() *artifactCache { return h.cache }
 

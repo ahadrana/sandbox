@@ -106,7 +106,7 @@ func buildGuestSupervisor(t *testing.T) string {
 // Networking stays off here: the egress datapath has its own dedicated
 // tests in runtime/firecracker-backend (TestEgressPolicy), and the
 // conformance scenarios exercise the lifecycle contract, not packet rules.
-func firecrackerRuntime(t *testing.T) sandboxmanager.Runtime {
+func firecrackerRuntime(t *testing.T) *firecrackerbackend.Backend {
 	t.Helper()
 	if reason := firecrackerUnavailable(); reason != "" {
 		t.Skip(reason)

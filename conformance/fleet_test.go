@@ -525,3 +525,81 @@ func TestAdoptedIncarnationFenceIdempotent(t *testing.T) {
 		t.Fatalf("capacity after adoption+replay = %d slots/%d mem, want 1/48", v.UsedSlots, v.UsedMemory)
 	}
 }
+
+// FC gate (review follow-up 3): a fleet host backed by the Firecracker
+// backend runs real microVM incarnations through the same placement,
+// capacity, execution, and adoption path as the local backend — the
+// prerequisite for the real K8s fleet. Skips without FC_TEST=1/KVM.
+func TestFirecrackerHostAgent(t *testing.T) {
+	if reason := firecrackerUnavailable(); reason != "" {
+		t.Skip(reason)
+	}
+	backend := firecrackerRuntime(t)
+	clock := domain.NewManualClock(time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC))
+	ids := domain.NewIDGen()
+	ws := workspace.NewMemory(clock, ids)
+	outbox := eventservice.NewOutbox()
+	store := sandboxmanager.NewMemoryStore()
+	fleet := hostagent.NewFleet(clock, nil, ws)
+	const mem = int64(256 << 20)
+	fleet.DefaultMemory = mem
+	agent := hostagent.New("fc-host-1", backend, nil, ws, 1<<30, 4, 16)
+	fleet.RegisterHost(agent)
+	mgr := sandboxmanager.New(clock, ids, ws, fleet, outbox, store, "fc-host-1")
+	d := agentdriver.New(mgr, "tenant-1", "principal-1", 7)
+
+	// The capability intersection of an FC-backed fleet declares VM class.
+	if got := fleet.Capabilities().IsolationClass; got != backendinterface.IsolationVM {
+		t.Fatalf("fleet isolation class = %v, want VM", got)
+	}
+
+	sb, err := d.CreateSandbox("task-fc-fleet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterialize(t, d, sb.SandboxID)
+
+	// Capacity charges the VM's real memory (Spec.MemoryBytes sizes the
+	// microVM via memMiB), not a placeholder.
+	v := agent.View()
+	if v.UsedSlots != 1 || v.UsedMemory != mem {
+		t.Fatalf("host capacity = %d slots/%d bytes, want 1/%d", v.UsedSlots, v.UsedMemory, mem)
+	}
+
+	// Exec inside the microVM through the fleet -> host -> vsock path.
+	ex, err := d.ExecSync(sb.SandboxID, domain.Operation{Command: "echo fc-fleet-ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ex.State != domain.ExecutionCompleted || *ex.ExitCode != 0 {
+		t.Fatalf("exec in microVM: %+v", ex)
+	}
+
+	// Workspace commit round-trips the live guest workspace.
+	content := d.RandomContent(32)
+	if _, err := d.ExecSync(sb.SandboxID, domain.Operation{Writes: map[string]string{"fleet.txt": content}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.CommitWorkspace(api.CommitWorkspaceRequest{Version: api.SchemaVersionV1, SandboxID: sb.SandboxID}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Host-agent restart over the same backend adopts the still-live VM
+	// incarnation: ownership, fence, and capacity rebuilt from retained spec.
+	restarted := hostagent.New("fc-host-1", backend, nil, ws, 1<<30, 4, 16)
+	if got := restarted.IncarnationIDs(); len(got) != 1 {
+		t.Fatalf("adopted incarnations = %v, want 1", got)
+	}
+	if v := restarted.View(); v.UsedSlots != 1 || v.UsedMemory != mem {
+		t.Fatalf("capacity after adoption = %d slots/%d mem, want 1/%d", v.UsedSlots, v.UsedMemory, mem)
+	}
+
+	// Terminate through the manager frees the host's capacity (the fleet
+	// still routes to the originally registered agent).
+	if err := mgr.Terminate(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if v := agent.View(); v.UsedSlots != 0 || v.UsedMemory != 0 {
+		t.Fatalf("capacity after terminate = %d slots/%d mem, want 0/0", v.UsedSlots, v.UsedMemory)
+	}
+}
