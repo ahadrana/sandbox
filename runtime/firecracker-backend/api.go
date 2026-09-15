@@ -99,10 +99,11 @@ func (c *apiClient) addDrive(id, path string, root, readOnly bool) error {
 	})
 }
 
-func (c *apiClient) setMachineConfig(vcpus, memMiB int64) error {
+func (c *apiClient) setMachineConfig(vcpus, memMiB int64, trackDirty bool) error {
 	return c.call("PUT", "/machine-config", map[string]interface{}{
-		"vcpu_count":   vcpus,
-		"mem_size_mib": memMiB,
+		"vcpu_count":        vcpus,
+		"mem_size_mib":      memMiB,
+		"track_dirty_pages": trackDirty,
 	})
 }
 
@@ -129,18 +130,24 @@ func (c *apiClient) setVMState(state string) error {
 	return c.call("PATCH", "/vm", map[string]string{"state": state})
 }
 
-func (c *apiClient) snapshotCreate(memPath, statePath string) error {
+// snapshotCreate writes a snapshot; snapshotType is "Full" or "Diff"
+// (ADR-006; Diff requires dirty-page tracking enabled at boot/restore).
+func (c *apiClient) snapshotCreate(memPath, statePath, snapshotType string) error {
 	return c.call("PUT", "/snapshot/create", map[string]interface{}{
 		"mem_file_path": memPath,
 		"snapshot_path": statePath,
-		"snapshot_type": "Full",
+		"snapshot_type": snapshotType,
 	})
 }
 
-func (c *apiClient) snapshotLoad(statePath, memPath, vsockUdsPath string, resume bool) error {
+// snapshotLoad restores a snapshot. trackDirty re-arms KVM dirty-page
+// tracking for the restored VM (Firecracker does not persist the setting
+// in snapshots); required for further diff checkpoints (ADR-006).
+func (c *apiClient) snapshotLoad(statePath, memPath, vsockUdsPath string, resume, trackDirty bool) error {
 	return c.call("PUT", "/snapshot/load", map[string]interface{}{
-		"snapshot_path": statePath,
-		"resume_vm":     resume,
+		"snapshot_path":     statePath,
+		"resume_vm":         resume,
+		"track_dirty_pages": trackDirty,
 		"mem_backend": map[string]string{
 			"backend_type": "File",
 			"backend_path": memPath,

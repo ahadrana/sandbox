@@ -61,6 +61,13 @@ type Config struct {
 	// MaxSnapshotsPerIncarnation bounds retained snapshots per incarnation
 	// (oldest GC'd after each Snapshot); default 3, <=0 keeps all.
 	MaxSnapshotsPerIncarnation int
+	// IncrementalSnapshots enables diff checkpoints (ADR-006): VMs boot
+	// with KVM dirty-page tracking and Snapshot emits a sparse diff memory
+	// file when a parent checkpoint exists within the chain-depth budget.
+	IncrementalSnapshots bool
+	// MaxSnapshotChainDepth bounds consecutive diffs above a full base;
+	// reaching it collapses the next Snapshot to a new full. Default 4.
+	MaxSnapshotChainDepth int
 	// DeleteSnapshotsOnTerminate also removes the incarnation's snapshots
 	// on Terminate (default false: committed checkpoints survive).
 	DeleteSnapshotsOnTerminate bool
@@ -121,6 +128,9 @@ func (c *Config) withDefaults() Config {
 	if out.MaxSnapshotsPerIncarnation == 0 {
 		out.MaxSnapshotsPerIncarnation = 3
 	}
+	if out.MaxSnapshotChainDepth == 0 {
+		out.MaxSnapshotChainDepth = 4
+	}
 	if out.DNSMinTTL == 0 {
 		out.DNSMinTTL = 5 * time.Second
 	}
@@ -161,6 +171,16 @@ type incarnation struct {
 	// toolsSHA is the sha256 of the supervisor binary the tools image was
 	// built from (recorded in snapshot metadata, P0.4).
 	toolsSHA string
+	// lastSnap and chainDepth track the checkpoint chain tip this
+	// incarnation would extend (ADR-006): lastSnap is the snapshot dir
+	// name of the latest checkpoint the (possibly restored) VM's dirty
+	// bitmap is relative to, chainDepth its depth above the full base.
+	lastSnap   string
+	chainDepth int
+	// mergedFrom records the chain tip whose merged artifact this
+	// incarnation's RAM is backed by ("" when restored from a full
+	// snapshot or booted fresh); the GC must keep that artifact alive.
+	mergedFrom string
 	// opMu serializes guest-mutating operations (Exec writes/commands)
 	// against the pause/snapshot window: Snapshot holds it across
 	// pause+snapshotCreate so an Exec either fully lands in the guest before
@@ -436,7 +456,7 @@ func (b *Backend) configureNew(inc *incarnation) error {
 	if err := api.setBootSource(l.apiKernel, b.cfg.BootArgs); err != nil {
 		return err
 	}
-	if err := api.setMachineConfig(b.cfg.VCPUs, b.memMiB(inc.spec)); err != nil {
+	if err := api.setMachineConfig(b.cfg.VCPUs, b.memMiB(inc.spec), b.cfg.IncrementalSnapshots); err != nil {
 		return err
 	}
 	if err := api.addDrive("rootfs", l.apiRootfs, true, false); err != nil {
@@ -662,7 +682,23 @@ type snapshotMeta struct {
 	Arch               string `json:"arch,omitempty"`
 	KernelRelease      string `json:"kernel_release,omitempty"`
 	CPUPart            string `json:"cpu_part,omitempty"`
+	// Incremental chain fields (ADR-006). Kind is "full" or "diff" (empty
+	// = full for pre-ADR-006 snapshots); Parent names the parent snapshot
+	// dir within the same snapshot root; Depth counts diffs above the
+	// full base (0 for full). MemSHA256/VMStateSHA256 are recorded for
+	// every link and verified on restore (CI-3).
+	Kind          string `json:"kind,omitempty"`
+	Parent        string `json:"parent,omitempty"`
+	Depth         int    `json:"depth,omitempty"`
+	MemSHA256     string `json:"mem_sha256,omitempty"`
+	VMStateSHA256 string `json:"vm_state_sha256,omitempty"`
 }
+
+// Snapshot kinds (snapshotMeta.Kind; ADR-006).
+const (
+	snapshotKindFull = "full"
+	snapshotKindDiff = "diff"
+)
 
 // SnapshotIncompatibleError is Restore's typed failure when a
 // self-describing snapshot's recorded facts (P0.4) do not match the
@@ -778,12 +814,15 @@ func (b *Backend) snapshotDir(incarnationID string) string {
 
 // gcSnapshots retains only the newest MaxSnapshotsPerIncarnation snapshot
 // dirs for an incarnation (dir names are unix-nanosecond timestamps, so
-// lexicographic order is chronological).
+// lexicographic order is chronological). Chain safety (ADR-006): a dir
+// referenced as another checkpoint's parent is NEVER deleted (mid-chain
+// deletion is refused, not rebased), so retention can exceed the max while
+// a chain is live; after an auto-collapse the dead chain becomes
+// reclaimable from its tip backwards. Merged artifacts (.merged-<tip>) are
+// reclaimed once their tip dir is gone and no live incarnation's RAM is
+// backed by them.
 func (b *Backend) gcSnapshots(incarnationID string) {
 	max := b.cfg.MaxSnapshotsPerIncarnation
-	if max <= 0 {
-		return
-	}
 	root := b.snapshotDir(incarnationID)
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -796,9 +835,62 @@ func (b *Backend) gcSnapshots(incarnationID string) {
 		}
 	}
 	sort.Strings(dirs)
-	for len(dirs) > max {
-		os.RemoveAll(filepath.Join(root, dirs[0]))
-		dirs = dirs[1:]
+	// Referenced parents are chain-internal: refuse to delete them.
+	referenced := map[string]bool{}
+	for _, d := range dirs {
+		data, err := os.ReadFile(filepath.Join(root, d, "meta.json"))
+		if err != nil {
+			continue
+		}
+		var meta snapshotMeta
+		if json.Unmarshal(data, &meta) == nil && meta.Parent != "" {
+			referenced[meta.Parent] = true
+		}
+	}
+	if max > 0 {
+		kept := dirs
+		for _, d := range dirs {
+			if len(kept) <= max {
+				break
+			}
+			if referenced[d] {
+				continue
+			}
+			os.RemoveAll(filepath.Join(root, d))
+			for i, k := range kept {
+				if k == d {
+					kept = append(kept[:i], kept[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+	// Merged-artifact GC.
+	b.mu.Lock()
+	live := map[string]bool{}
+	for _, inc := range b.incs {
+		if inc.mergedFrom != "" && !inc.dead {
+			live[inc.mergedFrom] = true
+		}
+	}
+	b.mu.Unlock()
+	exists := map[string]bool{}
+	for _, d := range dirs {
+		exists[d] = true
+	}
+	entries, err = os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), ".merged-") || strings.HasSuffix(e.Name(), ".tmp") || strings.HasSuffix(e.Name(), ".sha256") {
+			continue
+		}
+		tip := strings.TrimPrefix(e.Name(), ".merged-")
+		if !exists[tip] && !live[tip] {
+			os.Remove(filepath.Join(root, e.Name()))
+			os.Remove(filepath.Join(root, e.Name()+".sha256"))
+		}
 	}
 }
 
@@ -859,6 +951,15 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 		return fail(err)
 	}
 	os.Chmod(filepath.Join(snapDir, "workspace.img"), 0o600)
+	// Chain decision (ADR-006): a diff extends the tip this VM's dirty
+	// bitmap is relative to, within the depth budget; anything else
+	// collapses to a new full (generation-0 base).
+	kind, parent, parentDepth := snapshotKindFull, "", 0
+	b.mu.Lock()
+	if b.cfg.IncrementalSnapshots && inc.lastSnap != "" && inc.chainDepth < b.cfg.MaxSnapshotChainDepth {
+		kind, parent, parentDepth = snapshotKindDiff, inc.lastSnap, inc.chainDepth
+	}
+	b.mu.Unlock()
 	memPath := filepath.Join(snapDir, "mem.file")
 	statePath := filepath.Join(snapDir, "vm.state")
 	if inc.jailed {
@@ -870,14 +971,28 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 		memPath = "/snap/" + ts + "/mem.file"
 		statePath = "/snap/" + ts + "/vm.state"
 	}
-	if err := b.snapshotCreateHook(inc, memPath, statePath); err != nil {
+	if err := b.snapshotCreateHook(inc, memPath, statePath, kind); err != nil {
 		return fail(err)
 	}
 	// The VMM (possibly root via the jailer) wrote these: force owner-only
-	// permissions on the full guest memory image and vCPU state (FM7).
+	// permissions on the guest memory image and vCPU state (FM7).
 	os.Chmod(filepath.Join(snapDir, "mem.file"), 0o600)
 	os.Chmod(filepath.Join(snapDir, "vm.state"), 0o600)
-	meta := snapshotMeta{Spec: inc.spec, CreatedAt: time.Now()}
+	// Integrity hashes (CI-3): recorded for every link, verified on
+	// restore, so a corrupted mid-chain diff is detected as corruption.
+	memSHA, err := sha256File(filepath.Join(snapDir, "mem.file"))
+	if err != nil {
+		return fail(err)
+	}
+	stateSHA, err := sha256File(filepath.Join(snapDir, "vm.state"))
+	if err != nil {
+		return fail(err)
+	}
+	meta := snapshotMeta{Spec: inc.spec, CreatedAt: time.Now(), Kind: kind, MemSHA256: memSHA, VMStateSHA256: stateSHA}
+	if kind == snapshotKindDiff {
+		meta.Parent = parent
+		meta.Depth = parentDepth + 1
+	}
 	b.mu.Lock()
 	if inc.net != nil {
 		slot := inc.net.slot
@@ -909,6 +1024,10 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 	if err := os.WriteFile(filepath.Join(snapDir, "meta.json"), metaBytes, 0o600); err != nil {
 		return fail(err)
 	}
+	b.mu.Lock()
+	inc.lastSnap = ts
+	inc.chainDepth = meta.Depth
+	b.mu.Unlock()
 	b.gcSnapshots(inc.id)
 	b.mu.Lock()
 	files := map[string]string{}
@@ -927,6 +1046,10 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 			"arch":           facts.Arch,
 			"kernel_release": facts.KernelRelease,
 			"cpu_part":       facts.CPUPart,
+			// Chain visibility (ADR-006): opaque to the control plane.
+			"kind":   kind,
+			"parent": meta.Parent,
+			"depth":  fmt.Sprint(meta.Depth),
 		},
 	}, nil
 }
@@ -935,13 +1058,17 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 // regression test hook).
 var snapshotCreateFault func() error
 
-func (b *Backend) snapshotCreateHook(inc *incarnation, memPath, statePath string) error {
+func (b *Backend) snapshotCreateHook(inc *incarnation, memPath, statePath, kind string) error {
 	if snapshotCreateFault != nil {
 		if err := snapshotCreateFault(); err != nil {
 			return err
 		}
 	}
-	return b.api(inc).snapshotCreate(memPath, statePath)
+	fcType := "Full"
+	if kind == snapshotKindDiff {
+		fcType = "Diff"
+	}
+	return b.api(inc).snapshotCreate(memPath, statePath, fcType)
 }
 
 // Restore boots a fresh firecracker process from a full snapshot taken by
@@ -966,6 +1093,18 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 	// P0.4: the snapshot is self-describing — reject hosts/backends whose
 	// facts differ from what the snapshot was taken under (typed error).
 	if err := b.validateSnapshotPackage(&meta); err != nil {
+		return backendinterface.Handle{}, err
+	}
+	// ADR-006: validate the whole chain (per-link package facts + hashes)
+	// and resolve the memory file to load — the tip's own file for a full
+	// snapshot, or a merged artifact for a diff tip (Firecracker v1.17
+	// cannot load diff memory files directly).
+	chain, err := b.loadSnapshotChain(snapDir)
+	if err != nil {
+		return backendinterface.Handle{}, err
+	}
+	memFile, err := b.mergeChainMem(chain)
+	if err != nil {
 		return backendinterface.Handle{}, err
 	}
 	// The restored VM must run the supervisor it was snapshotted with:
@@ -996,6 +1135,15 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 	inc.started = true
 	inc.toolsImage = toolsImage
 	inc.toolsSHA = toolsSHA
+	// The restored VM's dirty bitmap was reset by snapshotLoad, so its next
+	// checkpoint chains on top of the tip it was restored from (ADR-006).
+	inc.lastSnap = filepath.Base(snapDir)
+	inc.chainDepth = meta.Depth
+	if len(chain) > 1 {
+		inc.mergedFrom = filepath.Base(snapDir)
+	} else {
+		inc.mergedFrom = ""
+	}
 	for k, v := range cp.Files {
 		inc.wsMirror[k] = v
 	}
@@ -1059,17 +1207,25 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 	// restored with a different Root would need path rewriting (follow-up).
 	l := b.layoutFor(inc)
 	api := b.api(inc)
-	memPath := filepath.Join(snapDir, "mem.file")
+	memPath := memFile
 	statePath := filepath.Join(snapDir, "vm.state")
 	if inc.jailed {
 		if err := bindMount(b.snapshotDir(inc.id), filepath.Join(inc.jailRoot, "snap")); err != nil {
 			return backendinterface.Handle{}, fail(err)
 		}
+		// memFile is either the tip's own mem.file or the merged artifact;
+		// both live under the bind-mounted snapshot root.
+		rel, err := filepath.Rel(b.snapshotDir(inc.id), memFile)
+		if err != nil {
+			return backendinterface.Handle{}, fail(err)
+		}
 		ts := filepath.Base(snapDir)
-		memPath = "/snap/" + ts + "/mem.file"
+		memPath = "/snap/" + filepath.ToSlash(rel)
 		statePath = "/snap/" + ts + "/vm.state"
 	}
-	if err := api.snapshotLoad(statePath, memPath, l.apiVsock, true); err != nil {
+	// track_dirty_pages is not persisted in snapshots: re-arm it so the
+	// restored VM can take further diffs (ADR-006).
+	if err := api.snapshotLoad(statePath, memPath, l.apiVsock, true, b.cfg.IncrementalSnapshots); err != nil {
 		return backendinterface.Handle{}, fail(err)
 	}
 	if err := api.ping(); err != nil {

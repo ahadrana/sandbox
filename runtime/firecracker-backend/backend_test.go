@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2014,5 +2015,207 @@ func tamperMeta(t *testing.T, snapDir, newID string, mutate func(*snapshotMeta))
 	return backendinterface.CheckpointData{
 		IncarnationID: newID,
 		Metadata:      map[string]string{"class": snapshotClass, "snapshot_dir": dst},
+	}
+}
+
+// --- Incremental snapshot chains (ADR-006, FC_TEST-gated) ---
+
+func newIncrementalBackend(t *testing.T, maxDepth int) *Backend {
+	t.Helper()
+	cfg := testConfig(t)
+	cfg.GuestSupervisorBin = buildGuestSupervisor(t)
+	cfg.IncrementalSnapshots = true
+	cfg.MaxSnapshotChainDepth = maxDepth
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	return b
+}
+
+func snapshotMetaOf(t *testing.T, cp backendinterface.CheckpointData) snapshotMeta {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(cp.Metadata["snapshot_dir"], "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m snapshotMeta
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// diskBlocks returns the allocated 512-byte blocks of a file (sparse-aware).
+func diskBlocks(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no Stat_t")
+	}
+	return st.Blocks
+}
+
+// ADR-006 chain round-trip: boot → snapshot (full base) → mutate guest
+// memory → incremental checkpoint (diff) → restore the diff tip → the
+// mutated in-RAM state is back. The diff memory file must be materially
+// smaller on disk than the full base.
+func TestIncrementalSnapshotChain(t *testing.T) {
+	b := newIncrementalBackend(t, 4)
+	h, err := b.Create(createSpec("inc-chain", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Guest-RAM marker (tmpfs, never touches a drive).
+	if res := execOp(t, b, h, "m0", "echo token-0 > /dev/shm/tok"); res.ExitCode != 0 {
+		t.Fatal("write /dev/shm/tok failed")
+	}
+	cp1, err := b.Snapshot(h)
+	if err != nil {
+		t.Fatalf("Snapshot base: %v", err)
+	}
+	if m := snapshotMetaOf(t, cp1); m.Kind != snapshotKindFull || m.Depth != 0 || m.Parent != "" {
+		t.Fatalf("base meta = %+v, want full/depth 0/no parent", m)
+	}
+	if err := b.Resume(h); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	// Mutate memory: rewrite the marker and dirty ~8MiB of RAM.
+	if res := execOp(t, b, h, "m1", "echo token-1 > /dev/shm/tok && head -c 8388608 /dev/urandom > /dev/shm/blob"); res.ExitCode != 0 {
+		t.Fatal("memory mutation failed")
+	}
+	cp2, err := b.Snapshot(h)
+	if err != nil {
+		t.Fatalf("Snapshot diff: %v", err)
+	}
+	m2 := snapshotMetaOf(t, cp2)
+	if m2.Kind != snapshotKindDiff || m2.Depth != 1 || m2.Parent != filepath.Base(cp1.Metadata["snapshot_dir"]) {
+		t.Fatalf("diff meta = %+v, want diff/depth 1/parent=base", m2)
+	}
+	// Economics proof: the diff occupies far fewer disk blocks than the base.
+	baseBlocks := diskBlocks(t, filepath.Join(cp1.Metadata["snapshot_dir"], "mem.file"))
+	diffBlocks := diskBlocks(t, filepath.Join(cp2.Metadata["snapshot_dir"], "mem.file"))
+	if diffBlocks*4 >= baseBlocks {
+		t.Fatalf("diff not smaller: base %d blocks, diff %d blocks", baseBlocks, diffBlocks)
+	}
+	// Restore the diff tip; mutated RAM must be back.
+	b.KillRuntime(h)
+	h2, err := b.Restore(cp2)
+	if err != nil {
+		t.Fatalf("Restore diff tip: %v", err)
+	}
+	defer b.Terminate(h2)
+	if out := execOut(t, b, h2, "tok", "cat /dev/shm/tok"); out != "token-1" {
+		t.Fatalf("/dev/shm/tok = %q after chain restore, want token-1", out)
+	}
+	if res := execOp(t, b, h2, "blob", "test $(stat -c %s /dev/shm/blob) = 8388608"); res.ExitCode != 0 {
+		t.Fatal("mutated blob missing after chain restore")
+	}
+	// The restored VM's next checkpoint chains on top of the restored tip.
+	cp3, err := b.Snapshot(h2)
+	if err != nil {
+		t.Fatalf("Snapshot after restore: %v", err)
+	}
+	if m := snapshotMetaOf(t, cp3); m.Kind != snapshotKindDiff || m.Parent != filepath.Base(cp2.Metadata["snapshot_dir"]) {
+		t.Fatalf("post-restore meta = %+v, want diff extending the restored tip", m)
+	}
+}
+
+// ADR-006 auto-collapse: reaching MaxSnapshotChainDepth collapses the next
+// checkpoint to a new full base.
+func TestSnapshotChainCollapse(t *testing.T) {
+	b := newIncrementalBackend(t, 1)
+	h, err := b.Create(createSpec("inc-collapse", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Terminate(h)
+	if _, err := b.Snapshot(h); err != nil {
+		t.Fatal(err)
+	}
+	b.Resume(h)
+	cp2, err := b.Snapshot(h) // depth 1 == max
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Resume(h)
+	cp3, err := b.Snapshot(h) // would be depth 2: must collapse to full
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := snapshotMetaOf(t, cp2); m.Kind != snapshotKindDiff || m.Depth != 1 {
+		t.Fatalf("second snapshot = %+v, want diff depth 1", m)
+	}
+	m3 := snapshotMetaOf(t, cp3)
+	if m3.Kind != snapshotKindFull || m3.Depth != 0 || m3.Parent != "" {
+		t.Fatalf("collapse snapshot = %+v, want full depth 0 (auto-collapse)", m3)
+	}
+	// The collapsed full restores on its own (chain of one).
+	b.KillRuntime(h)
+	if _, err := b.Restore(cp3); err != nil {
+		t.Fatalf("Restore collapsed full: %v", err)
+	}
+}
+
+// ADR-006 CI-3: corrupting a mid-chain diff's memory file is detected as
+// corruption (typed error), never silently merged.
+func TestSnapshotChainCorruptionDetected(t *testing.T) {
+	b := newIncrementalBackend(t, 4)
+	h, err := b.Create(createSpec("inc-corrupt", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Terminate(h)
+	if _, err := b.Snapshot(h); err != nil {
+		t.Fatal(err)
+	}
+	b.Resume(h)
+	if res := execOp(t, b, h, "w1", "head -c 1048576 /dev/urandom > /dev/shm/a"); res.ExitCode != 0 {
+		t.Fatal(res.ExitCode)
+	}
+	cpMid, err := b.Snapshot(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Resume(h)
+	if res := execOp(t, b, h, "w2", "head -c 1048576 /dev/urandom > /dev/shm/b"); res.ExitCode != 0 {
+		t.Fatal(res.ExitCode)
+	}
+	cpTip, err := b.Snapshot(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Tamper with the mid-chain diff's memory file.
+	midMem := filepath.Join(cpMid.Metadata["snapshot_dir"], "mem.file")
+	f, err := os.OpenFile(midMem, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0xFF, 0xFF, 0xFF, 0xFF}, 4096); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	b.KillRuntime(h)
+	_, err = b.Restore(cpTip)
+	if !IsSnapshotIncompatible(err) {
+		t.Fatalf("corrupt mid-chain diff: err = %v, want SnapshotIncompatibleError", err)
+	}
+	var si *SnapshotIncompatibleError
+	if !errors.As(err, &si) || si.Field != "mem_sha256" {
+		t.Fatalf("typed error = %+v, want field mem_sha256", si)
 	}
 }
