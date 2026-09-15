@@ -6,6 +6,7 @@
 # host-agentd image: static host-agentd + firecracker + patched jailer (+
 # its runtime libs) + sudoshim + guest-supervisor + kernel/rootfs artifacts.
 # control-planed image: static control-planed only.
+# endpoint-proxyd image: static endpoint-proxyd only (ADR-007 ingress).
 set -euo pipefail
 
 REPO="${REPO:-$HOME/sandbox}"
@@ -17,7 +18,7 @@ export PATH="$PATH:/usr/local/go/bin"
 
 cd "$REPO"
 echo "== building static binaries (linux/arm64) =="
-for cmd in host-agentd control-planed; do
+for cmd in host-agentd control-planed endpoint-proxyd; do
   CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o "$WORK/$cmd" "./cmd/$cmd"
 done
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o "$WORK/guest-supervisor" ./runtime/guest-supervisor/cmd/guest-supervisor
@@ -81,5 +82,11 @@ CP="$WORK/rootfs-control-plane"
 mkdir -p "$CP"
 cp "$WORK/control-planed" "$CP/control-planed"
 mkimage control-planed /control-planed "$CP"
+
+echo "== assembling endpoint-proxyd rootfs =="
+EP="$WORK/rootfs-endpoint-proxy"
+mkdir -p "$EP"
+cp "$WORK/endpoint-proxyd" "$EP/endpoint-proxyd"
+mkimage endpoint-proxyd /endpoint-proxyd "$EP"
 
 echo "== done =="

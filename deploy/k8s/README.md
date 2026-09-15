@@ -6,11 +6,46 @@ Single-node k3s deployment proving the real fleet path:
 sandboxctl/curl -> control-planed (Deployment, ClusterIP :8080)
    manager -> scheduler -> Fleet --HTTP/JSON--> host-agentd (DaemonSet)
      -> HostAgent -> firecracker backend -> jailer -> microVM -> vsock supervisor
+
+endpoint traffic (ADR 007):
+client -> endpoint-proxyd (Deployment, ClusterIP :8080)
+   -> control-planed (/v1/bindings, /v1/route, /v1/sandboxes/{id}/resume|address)
+   -> host-agent node :<target-port> (incarnation's data address)
 ```
 
 Kubernetes manages **execution-host capacity only** (DaemonSet lifecycle);
 per-sandbox objects never appear (INV-019). Placement policy stays in the
 sandbox scheduler.
+
+## Endpoint traffic flow (ADR 007)
+
+`endpoint-proxyd` is the single ingress hop for endpoint bindings. A
+request identifies its binding either by the `X-Endpoint-Binding` header
+(explicit override) or by hostname — `<logical-name>.<ENDPOINT_DOMAIN>`
+(dev: `endpoints.sandbox.local`) resolves through
+`GET /v1/bindings/{name}` on the control plane. The proxy then:
+
+1. Routes the binding via `GET /v1/route/{bindingID}` — the control plane
+   evaluates the fail-closed gateway verdict server-side (unknown binding,
+   non-ACTIVE state, TTL expiry, stale epoch fence all deny).
+2. On a "sandbox not live" deny, single-flights
+   `POST /v1/sandboxes/{id}/resume` (one resume shared by all waiters on
+   that sandbox; bounded attempts; per-binding negative cache).
+3. Resolves the upstream via `GET /v1/sandboxes/{id}/address` (the live
+   incarnation's host, from its placement) and reverse-proxies to
+   `host:<target-port>`. Verified-live bindings forward from a short-TTL
+   cache with zero control-plane calls.
+
+It is a separate Deployment, not a sidecar on host-agentd: there is one
+logical ingress (single-flight dedup and the live cache only work
+fleet-wide behind one hop), it scales independently of execution hosts,
+and a sidecar in the hostNetwork pod would share the node's port space
+with the backend's TAP/iptables datapath.
+
+**Dev gap:** the upstream is the host node's address at the binding's
+target port; publishing `host:port -> guest:port` (DNAT or a host-side
+relay) is the firecracker backend's follow-up, so end-to-end guest
+reachability arrives with it.
 
 ## Prereqs (deployment host)
 

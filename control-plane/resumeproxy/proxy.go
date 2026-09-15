@@ -1,7 +1,10 @@
 // Package resumeproxy is the ingress resume-proxy (ADR-007): an HTTP
 // reverse proxy in front of the endpoint data path that makes suspended
-// sandboxes transparently addressable. Requests carry an endpoint binding
-// ID; the proxy routes it through network.Gateway, forwards directly when
+// sandboxes transparently addressable. Requests identify the endpoint
+// binding either explicitly (X-Endpoint-Binding header) or by hostname
+// ("<logical-name>.<EndpointDomain>", resolved to a binding via
+// LookupBinding); the header always wins. The proxy routes the binding
+// through network.Gateway, forwards directly when
 // the sandbox is live (cached — the hot path makes no control-plane
 // calls), and single-flights a Manager resume when it is suspended,
 // forwarding once running. Resume failures are bounded (attempt budget +
@@ -11,6 +14,7 @@ package resumeproxy
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"strings"
@@ -38,8 +42,17 @@ type Config struct {
 	Resume   Resumer
 	Upstream Upstream
 	// BindingHeader carries the endpoint binding ID
-	// (default "X-Endpoint-Binding").
+	// (default "X-Endpoint-Binding"); when set it always wins over
+	// hostname resolution.
 	BindingHeader string
+	// EndpointDomain, when set, enables hostname-based binding
+	// resolution: a request whose Host is "<logical-name>.<EndpointDomain>"
+	// resolves its binding by logical name via LookupBinding.
+	EndpointDomain string
+	// LookupBinding resolves a logical endpoint name to a binding ID
+	// (required when EndpointDomain is set). Positive resolutions are
+	// cached for CacheTTL; unknown names fail closed with 404.
+	LookupBinding func(logicalName string) (string, bool)
 	// CacheTTL is how long a verified-live binding forwards without any
 	// control-plane call (default 2s).
 	CacheTTL time.Duration
@@ -91,6 +104,8 @@ type Metrics struct {
 	ResumeTimeouts  int
 	NegativeHits    int
 	UpstreamErrors  int
+	NameResolutions int // LookupBinding calls (hostname resolutions)
+	UnknownNames    int // hostname lookups that resolved to no binding (404)
 }
 
 // flight is one in-flight resume shared by every waiter on that sandbox.
@@ -110,7 +125,15 @@ type Proxy struct {
 	// (the cache stores the target, not the address: upstream address
 	// resolution still happens per request).
 	cachedTarget map[string]target
-	metrics      Metrics
+	// resolved caches logicalName -> bindingID for CacheTTL (same TTL
+	// discipline as the live cache: positive entries only).
+	resolved map[string]resolvedName
+	metrics  Metrics
+}
+
+type resolvedName struct {
+	bindingID string
+	until     time.Time
 }
 
 type target struct {
@@ -127,6 +150,7 @@ func New(cfg Config) *Proxy {
 		negative:     map[string]time.Time{},
 		flights:      map[string]*flight{},
 		cachedTarget: map[string]target{},
+		resolved:     map[string]resolvedName{},
 	}
 }
 
@@ -145,9 +169,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	p.metrics.Requests++
 	p.mu.Unlock()
-	bindingID := r.Header.Get(p.cfg.BindingHeader)
+	bindingID, status := p.bindingFor(r)
 	if bindingID == "" {
-		http.Error(w, "missing "+p.cfg.BindingHeader, http.StatusBadRequest)
+		if status == http.StatusNotFound {
+			http.Error(w, "unknown endpoint name", status)
+		} else {
+			http.Error(w, "missing "+p.cfg.BindingHeader, http.StatusBadRequest)
+		}
 		return
 	}
 	now := p.cfg.Now()
@@ -190,6 +218,64 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.cachedTarget[bindingID] = target{sandboxID: dec.SandboxID, port: dec.Port}
 	p.mu.Unlock()
 	p.forward(w, r, bindingID, dec)
+}
+
+// bindingFor identifies the request's endpoint binding: the explicit
+// header wins; otherwise a Host of "<logical-name>.<EndpointDomain>"
+// resolves through LookupBinding (positive resolutions cached for
+// CacheTTL). Returns ("", status) on failure: 404 for an unknown name
+// (fail-closed, matching the gateway's "unknown binding" deny), 400 when
+// neither identification is present.
+func (p *Proxy) bindingFor(r *http.Request) (string, int) {
+	if id := r.Header.Get(p.cfg.BindingHeader); id != "" {
+		return id, 0
+	}
+	name, ok := p.hostLogicalName(r.Host)
+	if !ok {
+		return "", http.StatusBadRequest
+	}
+	now := p.cfg.Now()
+	p.mu.Lock()
+	if e, hit := p.resolved[name]; hit && now.Before(e.until) {
+		p.mu.Unlock()
+		return e.bindingID, 0
+	}
+	p.metrics.NameResolutions++
+	p.mu.Unlock()
+	id, found := p.cfg.LookupBinding(name)
+	if !found {
+		p.mu.Lock()
+		p.metrics.UnknownNames++
+		p.mu.Unlock()
+		return "", http.StatusNotFound
+	}
+	p.mu.Lock()
+	p.resolved[name] = resolvedName{bindingID: id, until: now.Add(p.cfg.CacheTTL)}
+	p.mu.Unlock()
+	return id, 0
+}
+
+// hostLogicalName extracts the leftmost label when hostport is
+// "<logical-name>.<EndpointDomain>"; anything else (including deeper
+// subdomains) is not an endpoint hostname.
+func (p *Proxy) hostLogicalName(hostport string) (string, bool) {
+	if p.cfg.EndpointDomain == "" || p.cfg.LookupBinding == nil {
+		return "", false
+	}
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	suffix := "." + strings.ToLower(p.cfg.EndpointDomain)
+	if !strings.HasSuffix(host, suffix) {
+		return "", false
+	}
+	name := strings.TrimSuffix(host, suffix)
+	if name == "" || strings.Contains(name, ".") {
+		return "", false
+	}
+	return name, true
 }
 
 // route wraps Router.Route with metrics.

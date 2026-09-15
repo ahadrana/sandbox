@@ -145,3 +145,60 @@ spec:
     app: control-planed
   ports:
     - { port: 8080, targetPort: 8080 }
+---
+# endpoint-proxyd (ADR 007): the single ingress hop for endpoint traffic —
+# client -> endpoint-proxyd -> host-agent data path. It is a separate
+# Deployment, NOT a sidecar on host-agentd: there is exactly one logical
+# ingress (single-flight resume dedup and the live cache only work
+# fleet-wide behind one hop), it scales independently of execution hosts,
+# and a sidecar in the hostNetwork pod would share the node's port space
+# with the backend's TAP/iptables datapath. Client-facing exposure
+# (Ingress/LoadBalancer, TLS, AuthN) is the gateway's concern (DESIGN
+# 6.1); ClusterIP is the dev stand-in.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: endpoint-proxyd
+  namespace: sandbox-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: endpoint-proxyd
+  template:
+    metadata:
+      labels:
+        app: endpoint-proxyd
+    spec:
+      serviceAccountName: control-plane
+      containers:
+        - name: endpoint-proxyd
+          image: sandbox/endpoint-proxyd:dev
+          imagePullPolicy: Never
+          env:
+            - name: TOKEN
+              value: dev-token # DEV ONLY
+            - name: LISTEN_ADDR
+              value: ":8080"
+            - name: CONTROL_PLANE_URL
+              value: "http://control-planed.sandbox-system.svc.cluster.local:8080"
+            # Hostname scheme: "<logical-name>.<ENDPOINT_DOMAIN>" resolves
+            # to an endpoint binding; the X-Endpoint-Binding header
+            # remains the explicit override.
+            - name: ENDPOINT_DOMAIN
+              value: "endpoints.sandbox.local"
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 1
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: endpoint-proxyd
+  namespace: sandbox-system
+spec:
+  selector:
+    app: endpoint-proxyd
+  ports:
+    - { port: 8080, targetPort: 8080 }

@@ -25,6 +25,7 @@ import (
 	eventservice "github.com/agent-sandbox/platform/control-plane/event-service"
 	sandboxmanager "github.com/agent-sandbox/platform/control-plane/sandbox-manager"
 	"github.com/agent-sandbox/platform/domain"
+	"github.com/agent-sandbox/platform/network"
 	hostagent "github.com/agent-sandbox/platform/runtime/host-agent"
 	"github.com/agent-sandbox/platform/runtime/host-agent/rpc"
 	"github.com/agent-sandbox/platform/workspace"
@@ -44,10 +45,11 @@ type remoteHost struct {
 }
 
 type server struct {
-	mgr   *sandboxmanager.Manager
-	fleet *hostagent.Fleet
-	ws    *workspace.Memory
-	token string
+	mgr     *sandboxmanager.Manager
+	fleet   *hostagent.Fleet
+	ws      *workspace.Memory
+	token   string
+	gateway *network.Gateway
 
 	mu    sync.Mutex
 	hosts map[string]*remoteHost
@@ -70,7 +72,7 @@ func main() {
 	store := sandboxmanager.NewMemoryStore()
 	fleet := hostagent.NewFleet(clock, nil, ws)
 	mgr := sandboxmanager.New(clock, ids, ws, fleet, outbox, store, "control-plane-0")
-	s := &server{mgr: mgr, fleet: fleet, ws: ws, token: token, hosts: map[string]*remoteHost{}}
+	s := &server{mgr: mgr, fleet: fleet, ws: ws, token: token, hosts: map[string]*remoteHost{}, gateway: network.NewGateway(mgr)}
 
 	go s.tickLoop()
 
@@ -83,6 +85,11 @@ func main() {
 	mux.HandleFunc("/v1/sandboxes", s.guard(s.sandboxes))
 	mux.HandleFunc("/v1/sandboxes/", s.guard(s.sandboxOp))
 	mux.HandleFunc("/v1/hosts", s.guard(s.hostViews))
+	// Endpoint data-path support for the resume proxy (ADR-007): binding
+	// create/lookup, gateway route verdicts, and sandbox resume.
+	mux.HandleFunc("/v1/bindings", s.guard(s.createBinding))
+	mux.HandleFunc("/v1/bindings/", s.guard(s.bindingByName))
+	mux.HandleFunc("/v1/route/", s.guard(s.routeBinding))
 
 	log.Printf("control-planed listening on %s", listen)
 	log.Fatal(http.ListenAndServe(listen, mux))
@@ -244,6 +251,37 @@ func (s *server) sandboxOp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]bool{"ok": true})
+	case op == "resume" && r.Method == http.MethodPost:
+		rep, err := s.mgr.Resume(id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, rep)
+	case op == "suspend" && r.Method == http.MethodPost:
+		if err := s.mgr.Suspend(id); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+	case op == "address" && r.Method == http.MethodGet:
+		// The incarnation's current data address: the host agent's
+		// advertised URL. Guest-port publishing (host:port -> guest) is
+		// the firecracker backend's follow-up; until then the proxy
+		// dials the node address at the binding's target port.
+		hostID, ok := s.mgr.HostOf(id)
+		if !ok {
+			http.Error(w, "sandbox has no live placement", http.StatusNotFound)
+			return
+		}
+		s.mu.Lock()
+		h, known := s.hosts[hostID]
+		s.mu.Unlock()
+		if !known {
+			http.Error(w, "host not registered", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]string{"host_id": hostID, "url": h.url})
 	default:
 		http.Error(w, "unknown sandbox op", http.StatusNotFound)
 	}
@@ -283,6 +321,65 @@ func (s *server) execSync(w http.ResponseWriter, r *http.Request, id string) {
 		}
 	}
 	writeJSON(w, ex)
+}
+
+// createBinding is POST /v1/bindings: create an endpoint binding for a
+// sandbox (ADR-007 logical naming; ttl_seconds required by the gateway's
+// no-TTL fail-closed rule).
+func (s *server) createBinding(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		SandboxID   string `json:"sandbox_id"`
+		TargetPort  int    `json:"target_port"`
+		LogicalName string `json:"logical_name"`
+		AuthPolicy  string `json:"auth_policy"`
+		TTLSeconds  int64  `json:"ttl_seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	b, err := s.mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: req.SandboxID, TenantID: "tenant-dev",
+		TargetPort: req.TargetPort, LogicalName: req.LogicalName, AuthPolicy: req.AuthPolicy,
+		TTL: time.Duration(req.TTLSeconds) * time.Second,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, b)
+}
+
+// bindingByName is GET /v1/bindings/{logical-name}: the resume proxy's
+// hostname-resolution hook.
+func (s *server) bindingByName(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimPrefix(r.URL.Path, "/v1/bindings/")
+	b, ok := s.mgr.BindingByName(name)
+	if !ok {
+		http.Error(w, "unknown endpoint name", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, b)
+}
+
+// routeBinding is GET /v1/route/{binding-id}: the gateway's fail-closed
+// route verdict, so the resume proxy routes exactly as the control plane
+// would.
+func (s *server) routeBinding(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/v1/route/")
+	writeJSON(w, s.gateway.Route(id))
 }
 
 func (s *server) hostViews(w http.ResponseWriter, r *http.Request) {

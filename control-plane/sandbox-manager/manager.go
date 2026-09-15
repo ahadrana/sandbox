@@ -1714,6 +1714,53 @@ func (m *Manager) reactivateBindingsLocked(sb *domain.Sandbox) {
 	}
 }
 
+// BindingByName resolves a logical endpoint name to its binding in a
+// routable-or-resumable state (ACTIVE preferred, else SUSPENDED); terminal
+// bindings are invisible. This is the name-resolution hook behind the
+// resume proxy's hostname scheme (ADR-007).
+func (m *Manager) BindingByName(logicalName string) (*domain.EndpointBinding, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var suspended *domain.EndpointBinding
+	for _, b := range m.bindings {
+		if b.LogicalName != logicalName {
+			continue
+		}
+		switch b.State {
+		case domain.EndpointActive:
+			cp := *b
+			return &cp, true
+		case domain.EndpointSuspended:
+			if suspended == nil {
+				suspended = b
+			}
+		}
+	}
+	if suspended != nil {
+		cp := *suspended
+		return &cp, true
+	}
+	return nil, false
+}
+
+// HostOf returns the host ID running the sandbox's live incarnation
+// (false when the sandbox has no live handle or the runtime does not track
+// placement).
+func (m *Manager) HostOf(sandboxID string) (string, bool) {
+	m.mu.Lock()
+	h, ok := m.handles[sandboxID]
+	m.mu.Unlock()
+	if !ok {
+		return "", false
+	}
+	pt, ok := m.rt.(PlacementTracker)
+	if !ok {
+		return "", false
+	}
+	hostID, _, ok := pt.PlacementOf(h.IncarnationID)
+	return hostID, ok
+}
+
 // BindingView is the network.BindingSource implementation for the gateway.
 func (m *Manager) BindingView(bindingID string) (network.BindingView, bool) {
 	m.mu.Lock()

@@ -336,3 +336,141 @@ func TestManagerIntegration(t *testing.T) {
 		t.Fatalf("binding state = %+v, want ACTIVE", got)
 	}
 }
+
+// --- Hostname-based binding resolution (ADR-007 naming hook) ---
+
+func doHostReq(t *testing.T, p *Proxy, host string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("GET", "http://"+host+"/", nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	return rec
+}
+
+// nameLookup returns a counting LookupBinding over a static name->binding
+// table.
+func nameLookup(table map[string]string) (func(string) (string, bool), *int32) {
+	var calls int32
+	return func(name string) (string, bool) {
+		atomic.AddInt32(&calls, 1)
+		id, ok := table[name]
+		return id, ok
+	}, &calls
+}
+
+// A request whose Host is "<logical-name>.<EndpointDomain>" resolves the
+// binding by name and triggers the same single-flight resume as an
+// explicit header.
+func TestHostBasedResumeTrigger(t *testing.T) {
+	up := backendServer(t)
+	rt := &stubRouter{dec: network.RouteDecision{Reason: "sandbox not live", SandboxID: "sb1", Port: 8080}}
+	lookup, lookupCalls := nameLookup(map[string]string{"ep1": "b1"})
+	var resumeCalls int32
+	p := New(Config{
+		Router:         rt,
+		EndpointDomain: "endpoints.test",
+		LookupBinding:  lookup,
+		Resume: func(id string) error {
+			atomic.AddInt32(&resumeCalls, 1)
+			rt.set(network.RouteDecision{Allowed: true, SandboxID: "sb1", Port: 8080})
+			return nil
+		},
+		Upstream:          func(id string, port int) (string, error) { return up.Listener.Addr().String(), nil },
+		MaxResumeAttempts: 1,
+	})
+	if rec := doHostReq(t, p, "ep1.endpoints.test"); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body)
+	}
+	if got := atomic.LoadInt32(&resumeCalls); got != 1 {
+		t.Fatalf("resume calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(lookupCalls); got != 1 {
+		t.Fatalf("name lookups = %d, want 1", got)
+	}
+}
+
+// The explicit X-Endpoint-Binding header always wins over the hostname:
+// the name is never resolved and the router sees the header's binding.
+func TestHeaderBeatsHost(t *testing.T) {
+	up := backendServer(t)
+	rt := &stubRouter{dec: network.RouteDecision{Allowed: true, SandboxID: "sb1", Port: 8080}}
+	lookup, lookupCalls := nameLookup(map[string]string{"ep1": "b-host"})
+	p := New(Config{
+		Router:         rt,
+		EndpointDomain: "endpoints.test",
+		LookupBinding:  lookup,
+		Resume:         func(id string) error { return nil },
+		Upstream:       func(id string, port int) (string, error) { return up.Listener.Addr().String(), nil },
+	})
+	req := httptest.NewRequest("GET", "http://ep1.endpoints.test/", nil)
+	req.Header.Set("X-Endpoint-Binding", "b-header")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := atomic.LoadInt32(lookupCalls); got != 0 {
+		t.Fatalf("name lookups = %d, want 0 (header wins)", got)
+	}
+}
+
+// An unknown endpoint name fails closed with 404 and never reaches the
+// router (matching the gateway's "unknown binding" deny).
+func TestUnknownHostFailClosed(t *testing.T) {
+	rt := &stubRouter{dec: network.RouteDecision{Allowed: true, SandboxID: "sb1", Port: 8080}}
+	lookup, _ := nameLookup(map[string]string{"ep1": "b1"})
+	p := New(Config{
+		Router:         rt,
+		EndpointDomain: "endpoints.test",
+		LookupBinding:  lookup,
+		Resume:         func(id string) error { return nil },
+		Upstream:       func(id string, port int) (string, error) { return "", nil },
+	})
+	if rec := doHostReq(t, p, "nope.endpoints.test"); rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if rt.count() != 0 {
+		t.Fatalf("router called %d times for unknown name, want 0", rt.count())
+	}
+	// A host outside the endpoint domain with no header is a plain 400.
+	if rec := doHostReq(t, p, "example.com"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("non-endpoint host status = %d, want 400", rec.Code)
+	}
+	if p.Metrics().UnknownNames != 1 {
+		t.Fatalf("UnknownNames = %d, want 1", p.Metrics().UnknownNames)
+	}
+}
+
+// Positive name resolutions are cached with the live-cache TTL
+// discipline: N requests within the TTL make exactly one LookupBinding
+// call.
+func TestCachedResolutionPurity(t *testing.T) {
+	up := backendServer(t)
+	rt := &stubRouter{dec: network.RouteDecision{Allowed: true, SandboxID: "sb1", Port: 8080}}
+	lookup, lookupCalls := nameLookup(map[string]string{"ep1": "b1"})
+	clock := &manualNow{t: time.Now()}
+	p := New(Config{
+		Router:         rt,
+		EndpointDomain: "endpoints.test",
+		LookupBinding:  lookup,
+		Resume:         func(id string) error { return nil },
+		Upstream:       func(id string, port int) (string, error) { return up.Listener.Addr().String(), nil },
+		CacheTTL:       time.Second,
+		Now:            clock.Now,
+	})
+	for i := 0; i < 5; i++ {
+		if rec := doHostReq(t, p, "ep1.endpoints.test"); rec.Code != http.StatusOK {
+			t.Fatalf("request %d = %d", i, rec.Code)
+		}
+	}
+	if got := atomic.LoadInt32(lookupCalls); got != 1 {
+		t.Fatalf("name lookups within TTL = %d, want 1", got)
+	}
+	clock.advance(2 * time.Second)
+	if rec := doHostReq(t, p, "ep1.endpoints.test"); rec.Code != http.StatusOK {
+		t.Fatalf("post-expiry request = %d", rec.Code)
+	}
+	if got := atomic.LoadInt32(lookupCalls); got != 2 {
+		t.Fatalf("name lookups after TTL expiry = %d, want 2", got)
+	}
+}
