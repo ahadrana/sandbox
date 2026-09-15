@@ -172,6 +172,12 @@ func dispatch(h hostagent.Host, req request) (resp response) {
 			return fail(err)
 		}
 		return response{OK: true, Checkpoint: &cp}
+	case "restore":
+		handle, err := h.Restore(*req.Checkpoint)
+		if err != nil {
+			return fail(err)
+		}
+		return response{OK: true, Handle: handle}
 	case "publish_port":
 		if err := h.PublishPort(req.Handle, req.GuestPort, req.HostPort); err != nil {
 			return fail(err)
@@ -353,6 +359,14 @@ func (c *Client) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoin
 		return backendinterface.CheckpointData{}, err
 	}
 	return *resp.Checkpoint, nil
+}
+
+func (c *Client) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
+	resp, err := c.call(request{Op: "restore", Checkpoint: &cp})
+	if err != nil {
+		return backendinterface.Handle{}, err
+	}
+	return resp.Handle, nil
 }
 
 func (c *Client) PublishPort(h backendinterface.Handle, guestPort, hostPort int) error {

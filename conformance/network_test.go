@@ -23,6 +23,7 @@ import (
 	"github.com/agent-sandbox/platform/network"
 	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
 	fakebackend "github.com/agent-sandbox/platform/runtime/fake-backend"
+	hostagent "github.com/agent-sandbox/platform/runtime/host-agent"
 	"github.com/agent-sandbox/platform/workspace"
 )
 
@@ -695,5 +696,89 @@ func TestEndpointPublishBackgroundActive(t *testing.T) {
 	}
 	if !rt.isPublished(8080) {
 		t.Fatal("binding on BACKGROUND_ACTIVE sandbox not published")
+	}
+}
+
+// reclaimCapsRuntime wraps a recording-publisher backend declaring
+// snapshot-class RAM reclaim, so the manager drops the handle at suspend
+// and Resume must route a restore through the runtime (ADR-008).
+type reclaimCapsRuntime struct {
+	*recordPublisher
+}
+
+func (r reclaimCapsRuntime) Capabilities() backendinterface.Capabilities {
+	c := r.recordPublisher.Capabilities()
+	c.CheckpointReclaimsMemory = true
+	return c
+}
+
+// Routed restore end to end (ADR-008): the manager's runtime is a FLEET of
+// host agents. A checkpoint suspend reclaims the incarnation (handle
+// dropped, placement erased, port unpublished); Resume routes Fleet.Restore
+// to the checkpoint's ORIGIN host, preserving the execution epoch — so the
+// suspended binding reactivates and its port is republished, exactly the
+// continuity the resume proxy's triggering request depends on.
+func TestRoutedRestoreReactivatesBindings(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC))
+	ids := domain.NewIDGen()
+	ws := workspace.NewMemory(clock, ids)
+	outbox := eventservice.NewOutbox()
+	fleet := hostagent.NewFleet(clock, nil, ws)
+	pub := &recordPublisher{Backend: fakebackend.New()}
+	agent := hostagent.New("host-1", reclaimCapsRuntime{pub}, nil, ws, 1<<20, 4, 16)
+	fleet.RegisterHost(agent)
+	mgr := sandboxmanager.New(clock, ids, ws, fleet, outbox, sandboxmanager.NewMemoryStore(), "cp-1")
+
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-routed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+	info, err := mgr.GetSandbox(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incID := *info.RuntimeIncarnationID
+	b, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 8080, LogicalName: "web", TTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pub.isPublished(8080) {
+		t.Fatal("binding not published while live")
+	}
+
+	if err := mgr.Suspend(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if pub.isPublished(8080) {
+		t.Fatal("port still published after suspend")
+	}
+	if _, _, ok := fleet.PlacementOf(incID); ok {
+		t.Fatal("placement retained after reclaiming suspend")
+	}
+
+	report, err := mgr.Resume(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.NewEpoch != report.PriorEpoch {
+		t.Fatalf("routed restore changed epoch %d -> %d", report.PriorEpoch, report.NewEpoch)
+	}
+	// The restored incarnation is re-placed on the origin host.
+	hostID, _, ok := fleet.PlacementOf(incID)
+	if !ok || hostID != "host-1" {
+		t.Fatalf("restored incarnation not re-placed on origin host: %q, %v", hostID, ok)
+	}
+	// Epoch preserved => the binding's fence still matches: it reactivates
+	// and its port is republished.
+	got := mgr.ListEndpointBindings(sb.SandboxID)
+	if len(got) != 1 || got[0].BindingID != b.BindingID || got[0].State != domain.EndpointActive {
+		t.Fatalf("binding not reactivated after routed restore: %+v", got)
+	}
+	if !pub.isPublished(8080) {
+		t.Fatal("port not republished after routed restore")
 	}
 }

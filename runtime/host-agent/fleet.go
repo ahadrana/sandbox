@@ -1,6 +1,7 @@
 package hostagent
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ type Host interface {
 	Pause(handle backendinterface.Handle) error
 	Resume(handle backendinterface.Handle) error
 	Snapshot(handle backendinterface.Handle) (backendinterface.CheckpointData, error)
+	Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error)
 	Stats(handle backendinterface.Handle) (backendinterface.Stats, error)
 	Exec(handle backendinterface.Handle, executionID string, op domain.Operation) error
 	WaitExecution(handle backendinterface.Handle, executionID string) (supervisor.Result, error)
@@ -319,8 +321,89 @@ func (f *Fleet) UnpublishPort(h backendinterface.Handle, hostPort int) error {
 	return host.UnpublishPort(h, hostPort)
 }
 
+// Restore routes a checkpoint restore to the ORIGIN host (ADR-008):
+// checkpoint bits are host-local artifacts and the RPC carries them by
+// reference, so only the host that wrote the checkpoint can boot from it.
+// An incarnation that is still live (STOP/CONT class, never terminated)
+// resumes in place with no re-placement; a reclaimed incarnation is
+// re-placed on the origin host under a fresh fence — capacity and the
+// checkpoint's host-facts guard (kernel release, CPU part) are enforced,
+// so a mismatched or exhausted origin host fails the restore honestly and
+// the caller falls back to workspace-only recovery.
 func (f *Fleet) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
-	return backendinterface.Handle{}, supervisor.ErrUnsupported
+	f.mu.Lock()
+	if hostID, ok := f.byIncarnation[cp.IncarnationID]; ok {
+		// Live incarnation: it never left its host — resume in place.
+		host := f.hosts[hostID]
+		down := f.down[hostID]
+		f.mu.Unlock()
+		if down {
+			return backendinterface.Handle{}, backendinterface.ErrRuntimeGone
+		}
+		return host.Restore(cp)
+	}
+	origin := cp.Metadata["origin_host"]
+	if origin == "" {
+		f.mu.Unlock()
+		return backendinterface.Handle{}, fmt.Errorf("checkpoint %s records no origin host: %w", cp.IncarnationID, backendinterface.ErrNotFound)
+	}
+	host, ok := f.hosts[origin]
+	if !ok {
+		f.mu.Unlock()
+		return backendinterface.Handle{}, fmt.Errorf("checkpoint origin host %q not in fleet: %w", origin, backendinterface.ErrNotFound)
+	}
+	if f.down[origin] {
+		f.mu.Unlock()
+		return backendinterface.Handle{}, fmt.Errorf("checkpoint origin host %q unavailable: %w", origin, backendinterface.ErrRuntimeGone)
+	}
+	view := host.View()
+	f.mu.Unlock()
+	// The checkpoint's recorded host facts must match the origin host
+	// exactly — a mismatched host could never boot it (ADR-001 P0.4), and
+	// this fleet has no cross-host transfer to route around it.
+	if kr := cp.Metadata["kernel_release"]; kr != "" && kr != view.KernelRelease {
+		return backendinterface.Handle{}, fmt.Errorf("checkpoint kernel_release %q does not match origin host %q: %w", kr, view.KernelRelease, supervisor.ErrUnsupported)
+	}
+	if part := cp.Metadata["cpu_part"]; part != "" && part != view.CPUPart {
+		return backendinterface.Handle{}, fmt.Errorf("checkpoint cpu_part %q does not match origin host %q: %w", part, view.CPUPart, supervisor.ErrUnsupported)
+	}
+	var mem int64
+	fmt.Sscanf(cp.Metadata["memory_bytes"], "%d", &mem)
+	if mem == 0 {
+		mem = f.DefaultMemory
+	}
+	// Placement on the single admissible host: capacity is re-validated and
+	// a fresh placement fence issued.
+	placement, err := f.sched.Place(scheduler.Request{
+		SandboxID:      cp.Metadata["sandbox_id"],
+		MemoryRequired: mem,
+	}, []scheduler.HostView{view})
+	if err != nil {
+		f.mu.Lock()
+		f.capacityFailures++
+		f.mu.Unlock()
+		return backendinterface.Handle{}, err
+	}
+	// Refresh the fence in a COPY of the metadata — the caller's checkpoint
+	// record is shared state.
+	md := make(map[string]string, len(cp.Metadata)+1)
+	for k, v := range cp.Metadata {
+		md[k] = v
+	}
+	md["fence"] = fmt.Sprintf("%d", placement.Fence)
+	handle, err := host.Restore(backendinterface.CheckpointData{
+		IncarnationID: cp.IncarnationID,
+		Files:         cp.Files,
+		Metadata:      md,
+	})
+	if err != nil {
+		return backendinterface.Handle{}, err
+	}
+	f.mu.Lock()
+	f.byIncarnation[handle.IncarnationID] = placement.HostID
+	f.fenceOf[handle.IncarnationID] = placement.Fence
+	f.mu.Unlock()
+	return handle, nil
 }
 
 // Terminate scrubs the incarnation on its host; a lost host is cleaned up
@@ -467,8 +550,9 @@ func (f *Fleet) Alive(h backendinterface.Handle) bool {
 // Capabilities returns the honest intersection of the fleet's declared
 // surfaces: the weakest isolation class and only the features every host
 // supports. An empty fleet has zero-value capabilities (declaring VM-class
-// with no hosts would be a lie). Restore is declared unsupported because
-// Fleet.Restore has no placement routing and returns ErrUnsupported.
+// with no hosts would be a lie). SupportsRestore means routed restore works
+// — with the ADR-008 scoping that a checkpoint boots only on its origin
+// host (checkpoint bits are host-local; there is no cross-host transfer).
 func (f *Fleet) Capabilities() backendinterface.Capabilities {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -500,7 +584,6 @@ func (f *Fleet) Capabilities() backendinterface.Capabilities {
 			caps.IsolationClass = c.IsolationClass
 		}
 	}
-	caps.SupportsRestore = false
 	return caps
 }
 

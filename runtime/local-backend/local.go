@@ -91,6 +91,9 @@ func New(root string, opts ...Option) (*Backend, error) {
 			IsolationClass:     backendinterface.IsolationProcess,
 			SupportsPause:      true,
 			SupportsCheckpoint: true,
+			// STOP/CONT restore is genuine execution continuity (SIGCONT of
+			// the checkpointed PIDs, INV-009-validated).
+			SupportsRestore: true,
 		},
 	}
 	for _, opt := range opts {

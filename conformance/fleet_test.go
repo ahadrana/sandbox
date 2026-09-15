@@ -14,6 +14,8 @@ import (
 	"github.com/agent-sandbox/platform/domain"
 	environmentbuilder "github.com/agent-sandbox/platform/environment-builder"
 	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
+	fakebackend "github.com/agent-sandbox/platform/runtime/fake-backend"
+	supervisor "github.com/agent-sandbox/platform/runtime/guest-supervisor"
 	hostagent "github.com/agent-sandbox/platform/runtime/host-agent"
 	"github.com/agent-sandbox/platform/runtime/hostfacts"
 	localbackend "github.com/agent-sandbox/platform/runtime/local-backend"
@@ -434,8 +436,9 @@ func TestConcurrentDuplicateCreateAtomic(t *testing.T) {
 }
 
 // M10 regression: fleet capabilities are the honest intersection — an empty
-// fleet declares zero-value capabilities, and Restore (which Fleet does not
-// route) is never over-declared.
+// fleet declares zero-value capabilities, and a feature is declared only
+// when every host supports it. Restore is declared when the hosts support
+// it: Fleet.Restore routes to the checkpoint's origin host (ADR-008).
 func TestFleetCapabilitiesHonest(t *testing.T) {
 	clock := domain.NewManualClock(time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC))
 	ws := workspace.NewMemory(clock, domain.NewIDGen())
@@ -450,8 +453,11 @@ func TestFleetCapabilitiesHonest(t *testing.T) {
 	if caps.IsolationClass != backendinterface.IsolationProcess {
 		t.Fatalf("fleet isolation class = %s, want PROCESS (weakest host)", caps.IsolationClass)
 	}
-	if caps.SupportsRestore {
-		t.Fatal("SupportsRestore over-declared: Fleet.Restore returns ErrUnsupported")
+	// Every host here is a local backend with STOP/CONT restore; the
+	// intersection may — and must — declare it. The fleet-level scoping
+	// (origin-host-only, ADR-008) is a routing semantic, not a capability.
+	if !caps.SupportsRestore {
+		t.Fatal("SupportsRestore under-declared: every host supports restore and Fleet.Restore routes it")
 	}
 }
 
@@ -702,4 +708,175 @@ func TestPublishProtectsRPCPort(t *testing.T) {
 	if err == nil || !errors.Is(err, backendinterface.ErrPortConflict) {
 		t.Fatalf("err = %v, want ErrPortConflict", err)
 	}
+}
+
+// Routed restore placement (ADR-008): a checkpoint boots only on its ORIGIN
+// host — the bits are host-local and the RPC carries them by reference.
+// Fleet.Restore re-places a reclaimed incarnation on the origin host under
+// a fresh fence, enforces the host-facts guard, and fails honestly (unknown,
+// down, or mismatched origin) so the manager can fall back to
+// workspace-only recovery.
+func TestFleetRestoreOriginHost(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC))
+	ws := workspace.NewMemory(clock, domain.NewIDGen())
+	fleet := hostagent.NewFleet(clock, nil, ws)
+	agents := map[string]*hostagent.HostAgent{}
+	for _, id := range []string{"host-1", "host-2"} {
+		agent := hostagent.New(id, fakebackend.New(), nil, ws, 1<<20, 4, 16)
+		agents[id] = agent
+		fleet.RegisterHost(agent)
+	}
+	wsID, wsGen := commitEmptyWS(t, ws)
+	spec := backendinterface.Spec{SandboxID: "sb-1", IncarnationID: "inc-1", Epoch: 1, MemoryBytes: 64, WorkspaceID: wsID, WorkspaceGeneration: wsGen}
+	h, err := fleet.Create(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, _, ok := fleet.PlacementOf(h.IncarnationID)
+	if !ok {
+		t.Fatal("no placement after create")
+	}
+	if err := fleet.Start(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := fleet.Pause(h); err != nil {
+		t.Fatal(err)
+	}
+	cp, err := fleet.Snapshot(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The host enriched the checkpoint with its accounting facts.
+	if cp.Metadata["sandbox_id"] != "sb-1" || cp.Metadata["memory_bytes"] != "64" || cp.Metadata["fence"] == "" {
+		t.Fatalf("checkpoint not self-describing: %v", cp.Metadata)
+	}
+
+	// Reclaim the incarnation (snapshot-class suspend): placement erased.
+	if err := fleet.Terminate(h); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := fleet.PlacementOf(h.IncarnationID); ok {
+		t.Fatal("placement retained after terminate")
+	}
+	if got := agents[origin].View().UsedSlots; got != 0 {
+		t.Fatalf("origin host slot not reclaimed: %d", got)
+	}
+
+	// Restore with no origin recorded: honest failure, no guessing.
+	if _, err := fleet.Restore(cp); !errors.Is(err, backendinterface.ErrNotFound) {
+		t.Fatalf("restore without origin host: err = %v", err)
+	}
+	cp.Metadata["origin_host"] = origin
+
+	// Unknown origin host: honest failure.
+	bad := cp
+	bad.Metadata = copyMD(cp.Metadata)
+	bad.Metadata["origin_host"] = "host-nope"
+	if _, err := fleet.Restore(bad); !errors.Is(err, backendinterface.ErrNotFound) {
+		t.Fatalf("restore to unknown host: err = %v", err)
+	}
+
+	// Guard mismatch: the recorded facts must match the origin host.
+	bad2 := cp
+	bad2.Metadata = copyMD(cp.Metadata)
+	bad2.Metadata["kernel_release"] = "bogus-0.0.0"
+	if _, err := fleet.Restore(bad2); !errors.Is(err, supervisor.ErrUnsupported) {
+		t.Fatalf("restore with mismatched guard: err = %v", err)
+	}
+
+	// The happy path lands on the origin host — never the better-scored
+	// peer — under a fresh fence, with capacity re-charged exactly once.
+	h2, err := fleet.Restore(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h2 != h {
+		t.Fatalf("restored handle = %v, want %v", h2, h)
+	}
+	gotHost, fence, ok := fleet.PlacementOf(h2.IncarnationID)
+	if !ok || gotHost != origin {
+		t.Fatalf("restored placement = %q, %v; want origin %q", gotHost, ok, origin)
+	}
+	if fence != 2 {
+		t.Fatalf("restore fence = %d, want 2 (fresh placement)", fence)
+	}
+	if got := agents[origin].View().UsedSlots; got != 1 {
+		t.Fatalf("origin host slots after restore = %d, want 1", got)
+	}
+
+	// A down origin host fails the restore honestly.
+	if err := fleet.Terminate(h2); err != nil {
+		t.Fatal(err)
+	}
+	fleet.SimulateHostLoss(origin)
+	if _, err := fleet.Restore(cp); !errors.Is(err, backendinterface.ErrRuntimeGone) {
+		t.Fatalf("restore with origin host down: err = %v", err)
+	}
+}
+
+// A checkpoint whose incarnation is still LIVE (STOP/CONT class — never
+// terminated) restores in place: no re-placement, no new fence, no extra
+// capacity charge.
+func TestFleetRestoreLiveIncarnationInPlace(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC))
+	ws := workspace.NewMemory(clock, domain.NewIDGen())
+	fleet := hostagent.NewFleet(clock, nil, ws)
+	agent := hostagent.New("host-1", fakebackend.New(), nil, ws, 1<<20, 4, 16)
+	fleet.RegisterHost(agent)
+	wsID, wsGen := commitEmptyWS(t, ws)
+	spec := backendinterface.Spec{SandboxID: "sb-1", IncarnationID: "inc-1", Epoch: 1, MemoryBytes: 64, WorkspaceID: wsID, WorkspaceGeneration: wsGen}
+	h, err := fleet.Create(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fleet.Start(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := fleet.Pause(h); err != nil {
+		t.Fatal(err)
+	}
+	cp, err := fleet.Snapshot(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No origin_host in the metadata: the live placement routes the restore.
+	h2, err := fleet.Restore(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h2 != h {
+		t.Fatalf("restored handle = %v, want %v", h2, h)
+	}
+	_, fence, ok := fleet.PlacementOf(h2.IncarnationID)
+	if !ok || fence != 1 {
+		t.Fatalf("live restore re-placed: fence = %d, ok = %v", fence, ok)
+	}
+	if got := agent.View().UsedSlots; got != 1 {
+		t.Fatalf("slots after in-place restore = %d, want 1", got)
+	}
+}
+
+func copyMD(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func commitEmptyWS(t *testing.T, ws *workspace.Memory) (string, int64) {
+	t.Helper()
+	w, err := ws.Create("tenant-1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := ws.GetHead(w.WorkspaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := ws.Commit(w.WorkspaceID, head.Generation, map[string]string{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w.WorkspaceID, gen.Generation
 }

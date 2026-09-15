@@ -24,6 +24,8 @@ import (
 	"github.com/agent-sandbox/platform/domain"
 	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
 	firecrackerbackend "github.com/agent-sandbox/platform/runtime/firecracker-backend"
+	hostagent "github.com/agent-sandbox/platform/runtime/host-agent"
+	"github.com/agent-sandbox/platform/workspace"
 )
 
 // firecrackerUnavailable returns "" when the firecracker backend can run
@@ -385,5 +387,111 @@ func TestFirecrackerCheckpointSuspendReclaimsQuota(t *testing.T) {
 	}
 	if files["quota.txt"] != "sb1" {
 		t.Fatalf("workspace not intact after quota-reclaim resume: %v", files)
+	}
+}
+
+// Routed restore against a REAL microVM (ADR-008): the manager's runtime is
+// a fleet of host agents wrapping the firecracker backend. A checkpoint
+// suspend snapshots the VM and reclaims its RAM (placement erased);
+// Resume routes Fleet.Restore to the origin host, which re-registers the
+// incarnation from the self-describing checkpoint — the execution epoch is
+// preserved and guest RAM state (a background process, an uncommitted
+// tmpfs file) genuinely survives.
+func TestFirecrackerFleetRoutedRestore(t *testing.T) {
+	b := firecrackerRuntime(t)
+	clock := domain.NewManualClock(time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC))
+	ids := domain.NewIDGen()
+	ws := workspace.NewMemory(clock, ids)
+	outbox := eventservice.NewOutbox()
+	fleet := hostagent.NewFleet(clock, nil, ws)
+	agent := hostagent.New("fc-host-1", b, nil, ws, 1<<40, 4, 16)
+	fleet.RegisterHost(agent)
+	mgr := sandboxmanager.New(clock, ids, ws, fleet, outbox, sandboxmanager.NewMemoryStore(), "cp-1")
+	d := agentdriver.New(mgr, "tenant-1", "principal-1", 75)
+
+	sb, _ := d.CreateSandbox("task-fc-routed-restore")
+	mustMaterialize(t, d, sb.SandboxID)
+	// RAM markers: a background process and an uncommitted /tmp file —
+	// neither survives a workspace-only resume.
+	if _, err := d.ExecSync(sb.SandboxID, domain.Operation{
+		Command: "sleep 300 & echo ram-marker > /tmp/ram.txt & echo started",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := mgr.GetSandbox(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incID := *info.RuntimeIncarnationID
+	h := backendinterface.Handle{IncarnationID: incID}
+	origin, _, ok := fleet.PlacementOf(incID)
+	if !ok || origin != "fc-host-1" {
+		t.Fatalf("placement = %q, %v", origin, ok)
+	}
+	pollUntil(t, 15*time.Second, "background sleeper in guest inventory", func() bool {
+		inv, err := b.ProcessInventory(h)
+		if err != nil {
+			return false
+		}
+		for _, p := range inv {
+			if strings.Contains(p.Command, "sleep 300") {
+				return true
+			}
+		}
+		return false
+	})
+
+	if err := mgr.Suspend(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if b.Alive(h) {
+		t.Fatal("VMM still running after reclaiming checkpoint suspend")
+	}
+	if _, _, ok := fleet.PlacementOf(incID); ok {
+		t.Fatal("placement retained after reclaiming suspend")
+	}
+
+	report, err := mgr.Resume(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.NewEpoch != report.PriorEpoch {
+		t.Fatalf("routed restore changed epoch %d -> %d", report.PriorEpoch, report.NewEpoch)
+	}
+	hostID, fence, ok := fleet.PlacementOf(incID)
+	if !ok || hostID != origin {
+		t.Fatalf("restored incarnation not re-placed on origin host: %q, %v", hostID, ok)
+	}
+	if fence != 2 {
+		t.Fatalf("restore fence = %d, want 2 (fresh placement)", fence)
+	}
+	// The host agent re-registered the reclaimed incarnation: capacity is
+	// charged exactly once and routed calls work.
+	if got := agent.View().UsedSlots; got != 1 {
+		t.Fatalf("host slots after routed restore = %d, want 1", got)
+	}
+	// Guest RAM survived: the sleeper is back with the inventory and the
+	// uncommitted tmpfs file is readable.
+	pollUntil(t, 15*time.Second, "sleeper back after routed restore", func() bool {
+		inv, err := b.ProcessInventory(h)
+		if err != nil {
+			return false
+		}
+		for _, p := range inv {
+			if strings.Contains(p.Command, "sleep 300") {
+				return true
+			}
+		}
+		return false
+	})
+	ex, err := d.ExecSync(sb.SandboxID, domain.Operation{Command: "cat /tmp/ram.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ex.State != domain.ExecutionCompleted {
+		t.Fatalf("post-restore exec state = %s", ex.State)
+	}
+	if err := mgr.KillRuntime(sb.SandboxID); err != nil {
+		t.Fatal(err)
 	}
 }

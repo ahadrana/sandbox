@@ -42,6 +42,28 @@ fleet-wide behind one hop), it scales independently of execution hosts,
 and a sidecar in the hostNetwork pod would share the node's port space
 with the backend's TAP/iptables datapath.
 
+## Routed restore (ADR 008): the resume keeps continuity
+
+With the manager's runtime being a fleet of host agents, `Resume` routes
+`Fleet.Restore` to the checkpoint's ORIGIN host — checkpoint bits are
+host-local (the firecracker snapshot dir travels by reference, there is no
+cross-host transfer). The host agent re-registers the reclaimed
+incarnation from the self-describing checkpoint metadata under a fresh
+placement fence. The execution epoch is preserved, so the suspended
+binding's epoch fence still matches: it reactivates, its host port is
+republished, and the proxy's triggering request returns the guest's
+response (200), not a 503. A checkpoint whose origin host is gone fails
+honestly and the manager falls back to workspace-only recovery (epoch
+bump; bindings stay suspended). Cross-host checkpoint transfer is a
+documented follow-up.
+
+Two deployment facts make this work in the container image: util-linux
+`mount`/`umount` are baked in (the jailed snapshot path bind-mounts the
+incarnation's snapshot root into the jail), and that bind mount happens at
+jail PREPARATION time — the jailer unshares a private mount namespace and
+a container root is not a shared peer of it, so a mount performed at
+snapshot time would never reach the running VMM.
+
 ## Host->guest port publishing (the data-plane last hop)
 
 When the manager creates an endpoint binding on a running sandbox it calls

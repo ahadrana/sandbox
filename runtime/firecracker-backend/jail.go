@@ -127,6 +127,21 @@ func (b *Backend) prepareJail(inc *incarnation) (string, error) {
 			return "", err
 		}
 	}
+	// Share the incarnation's snapshot root into the jail BEFORE the VMM
+	// starts. The jailer unshares its own mount namespace, and when the
+	// backend itself runs in a container the container root is not a shared
+	// peer of it — so a bind mount performed later (at snapshot time) never
+	// propagates to the running VMM and snapshot_create fails ENOENT on
+	// /snap/<ts>. Mounts present in the chroot tree at spawn time are
+	// inherited; cleanupJail/Snapshot's own bindMount stay as idempotent
+	// safety nets.
+	snapRoot := b.snapshotDir(inc.id)
+	if err := os.MkdirAll(snapRoot, 0o700); err != nil {
+		return "", err
+	}
+	if err := bindMount(snapRoot, filepath.Join(root, "snap")); err != nil {
+		return "", err
+	}
 	return root, nil
 }
 

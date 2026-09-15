@@ -1510,6 +1510,17 @@ func (m *Manager) checkpointSuspendLocked(sb *domain.Sandbox, h backendinterface
 		m.rt.Resume(h)
 		return err
 	}
+	// ADR-008: routed restore is origin-host-only, so the checkpoint must
+	// name the host holding its bits. Captured now — a reclaim-class
+	// suspend terminates the incarnation below, erasing the placement.
+	if pt, ok := m.rt.(PlacementTracker); ok {
+		if hostID, _, placed := pt.PlacementOf(h.IncarnationID); placed {
+			if data.Metadata == nil {
+				data.Metadata = map[string]string{}
+			}
+			data.Metadata["origin_host"] = hostID
+		}
+	}
 	cpID := m.ids.Next("cp")
 	rec := domain.Checkpoint{
 		CheckpointID:        cpID,
@@ -1583,6 +1594,7 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 		return nil, err
 	}
 	var checkpointFacts map[string]string
+	var restoreErr string
 	if sb.CheckpointRef != nil {
 		if record, ok := m.checkpoints[*sb.CheckpointRef]; ok {
 			// P1.7: if continuity restore fails and we fall back to a
@@ -1597,6 +1609,8 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 				if newHandle, err := m.rt.Restore(record.data); err == nil {
 					m.handles[sandboxID] = newHandle
 					return m.resumeWithContinuityLocked(sb, record)
+				} else {
+					restoreErr = err.Error()
 				}
 				// Continuity broken: clean the stale incarnation and fall
 				// back to workspace-only recovery.
@@ -1633,6 +1647,9 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 		"continuity":           "workspace_only",
 		"execution_epoch":      sb.ExecutionEpoch,
 		"workspace_generation": sb.WorkspaceGeneration,
+		// Why continuity was unavailable (empty when no restore was
+		// attempted): operators must be able to see a silent fallback.
+		"restore_error": restoreErr,
 	})
 	if err := m.flushTx(); err != nil {
 		return nil, err

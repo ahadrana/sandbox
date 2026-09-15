@@ -65,7 +65,9 @@ cp /lib/aarch64-linux-gnu/libgcc_s.so.1 /lib/aarch64-linux-gnu/libc.so.6 "$HA/li
 # datapath (Batch 1) additionally needs iproute2/iptables for the TAP + egress
 # chains, conntrack-tools for the generation-bump conntrack flush, and procps
 # sysctl for ip_forward / ip_unprivileged_port_start=0 (DNS proxy binds :53).
-for bin in cp mkfs.ext4 debugfs e2fsck conntrack iptables ip sysctl; do
+# The jailed snapshot/restore path (ADR-006) needs util-linux mount/umount
+# for the snapshot-dir bind mount into the jail.
+for bin in cp mkfs.ext4 debugfs e2fsck conntrack iptables ip sysctl mount umount; do
   src="$(command -v "$bin")"
   cp "$src" "$HA/usr/local/bin/"
   ldd "$src" | awk '/=> \// {print $3} /^\// {print $1}' | sort -u |

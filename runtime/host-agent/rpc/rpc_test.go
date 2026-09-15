@@ -8,6 +8,7 @@ import (
 
 	"github.com/agent-sandbox/platform/domain"
 	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
+	fakebackend "github.com/agent-sandbox/platform/runtime/fake-backend"
 	supervisor "github.com/agent-sandbox/platform/runtime/guest-supervisor"
 	hostagent "github.com/agent-sandbox/platform/runtime/host-agent"
 	localbackend "github.com/agent-sandbox/platform/runtime/local-backend"
@@ -128,4 +129,124 @@ func commitWS(t *testing.T, ws *workspace.Memory, files map[string]string) (stri
 		t.Fatal(err)
 	}
 	return w.WorkspaceID, gen.Generation
+}
+
+// The restore op round-trips (ADR-008): a live STOP/CONT incarnation
+// resumes in place, and a reclaimed incarnation is re-registered on the
+// host from the self-describing checkpoint metadata.
+func TestRestoreRoundTrip(t *testing.T) {
+	backend, err := localbackend.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := domain.NewManualClock(testNow)
+	ids := domain.NewIDGen()
+	ws := workspace.NewMemory(clock, ids)
+	agent := hostagent.New("host-rpc", backend, nil, ws, 1<<30, 4, 16)
+	srv := httptest.NewServer(Handler(agent, "tok"))
+	defer srv.Close()
+	c := NewClient(srv.URL, "tok")
+
+	wsID, gen := commitWS(t, ws, map[string]string{"a.txt": "alpha"})
+	handle, err := c.Create(hostagent.CreateRequest{
+		SandboxID: "sb-1", IncarnationID: "inc-rpc-1", Fence: 1, Epoch: 1,
+		WorkspaceID: wsID, WorkspaceGeneration: gen, MemoryBytes: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(handle); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Pause(handle); err != nil {
+		t.Fatal(err)
+	}
+	cp, err := c.Snapshot(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cp.Metadata["sandbox_id"] != "sb-1" || cp.Metadata["memory_bytes"] != "64" {
+		t.Fatalf("checkpoint not self-describing: %v", cp.Metadata)
+	}
+	restored, err := c.Restore(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored != handle {
+		t.Fatalf("restored handle = %v, want %v", restored, handle)
+	}
+	if got := c.View().UsedSlots; got != 1 {
+		t.Fatalf("slots after in-place restore = %d, want 1", got)
+	}
+	if err := c.Terminate(handle); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Reclaim path over the wire: after Terminate the host has forgotten the
+// incarnation; Restore must re-register it (capacity, sandbox mapping) so
+// subsequent routed calls succeed and a host re-registration does not
+// scrub it as an orphan.
+func TestRestoreReregistersReclaimedIncarnation(t *testing.T) {
+	ws := workspace.NewMemory(domain.NewManualClock(testNow), domain.NewIDGen())
+	agent := hostagent.New("host-rpc", fakebackend.New(), nil, ws, 1<<30, 4, 16)
+	srv := httptest.NewServer(Handler(agent, "tok"))
+	defer srv.Close()
+	c := NewClient(srv.URL, "tok")
+
+	wsID2, gen2 := commitWS(t, ws, map[string]string{})
+	handle, err := c.Create(hostagent.CreateRequest{
+		SandboxID: "sb-1", IncarnationID: "inc-rpc-1", Fence: 1, Epoch: 1, MemoryBytes: 64,
+		WorkspaceID: wsID2, WorkspaceGeneration: gen2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(handle); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Pause(handle); err != nil {
+		t.Fatal(err)
+	}
+	cp, err := c.Snapshot(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Terminate(handle); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.View().UsedSlots; got != 0 {
+		t.Fatalf("slot not reclaimed: %d", got)
+	}
+
+	// A stale fence is rejected with the sentinel across the wire.
+	md0 := map[string]string{}
+	for k, v := range cp.Metadata {
+		md0[k] = v
+	}
+	md0["fence"] = "0"
+	stale := cp
+	stale.Metadata = md0
+	if _, err := c.Restore(stale); !errors.Is(err, hostagent.ErrStaleFence) {
+		t.Fatalf("stale-fence restore: err = %v", err)
+	}
+
+	// Fresh fence (as the fleet would issue at restore placement).
+	md := map[string]string{}
+	for k, v := range cp.Metadata {
+		md[k] = v
+	}
+	md["fence"] = "2"
+	fresh := cp
+	fresh.Metadata = md
+	if _, err := c.Restore(fresh); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.View().UsedSlots; got != 1 {
+		t.Fatalf("slots after routed restore = %d, want 1", got)
+	}
+	// The incarnation is known again: routed ops succeed.
+	if !c.Alive(handle) {
+		t.Fatal("restored incarnation not alive on host")
+	}
 }

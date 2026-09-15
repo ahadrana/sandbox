@@ -26,6 +26,7 @@ import (
 	sandboxmanager "github.com/agent-sandbox/platform/control-plane/sandbox-manager"
 	"github.com/agent-sandbox/platform/domain"
 	"github.com/agent-sandbox/platform/network"
+	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
 	hostagent "github.com/agent-sandbox/platform/runtime/host-agent"
 	"github.com/agent-sandbox/platform/runtime/host-agent/rpc"
 	"github.com/agent-sandbox/platform/workspace"
@@ -71,7 +72,7 @@ func main() {
 	outbox := eventservice.NewOutbox()
 	store := sandboxmanager.NewMemoryStore()
 	fleet := hostagent.NewFleet(clock, nil, ws)
-	mgr := sandboxmanager.New(clock, ids, ws, fleet, outbox, store, "control-plane-0")
+	mgr := sandboxmanager.New(clock, ids, ws, loggingRestore{fleet}, outbox, store, "control-plane-0")
 	s := &server{mgr: mgr, fleet: fleet, ws: ws, token: token, hosts: map[string]*remoteHost{}, gateway: network.NewGateway(mgr)}
 
 	go s.tickLoop()
@@ -407,4 +408,35 @@ func randKey() string {
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
+}
+
+// loggingRestore surfaces routed-restore failures in the daemon log: the
+// manager falls back to workspace-only resume on any Restore error
+// (INV-009), which is correct but must never be silent for operators.
+type loggingRestore struct {
+	*hostagent.Fleet
+}
+
+func (l loggingRestore) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
+	h, err := l.Fleet.Restore(cp)
+	if err != nil {
+		log.Printf("restore of incarnation %s failed (workspace-only fallback follows): %v", cp.IncarnationID, err)
+	}
+	return h, err
+}
+
+func (l loggingRestore) Pause(h backendinterface.Handle) error {
+	if err := l.Fleet.Pause(h); err != nil {
+		log.Printf("pause of incarnation %s failed: %v", h.IncarnationID, err)
+		return err
+	}
+	return nil
+}
+
+func (l loggingRestore) Snapshot(h backendinterface.Handle) (backendinterface.CheckpointData, error) {
+	cp, err := l.Fleet.Snapshot(h)
+	if err != nil {
+		log.Printf("snapshot of incarnation %s failed (workspace-only suspend follows): %v", h.IncarnationID, err)
+	}
+	return cp, err
 }

@@ -445,11 +445,79 @@ func (h *HostAgent) Snapshot(handle backendinterface.Handle) (backendinterface.C
 	if err := h.route(handle); err != nil {
 		return backendinterface.CheckpointData{}, err
 	}
-	return h.backend.Snapshot(handle)
+	cp, err := h.backend.Snapshot(handle)
+	if err != nil {
+		return backendinterface.CheckpointData{}, err
+	}
+	// Self-describing checkpoint (ADR-008): a routed restore must be able to
+	// re-register the incarnation on the origin host from the checkpoint
+	// alone, so the host's accounting facts travel in the metadata.
+	h.mu.Lock()
+	if rec, ok := h.incarnations[handle.IncarnationID]; ok {
+		if cp.Metadata == nil {
+			cp.Metadata = map[string]string{}
+		}
+		cp.Metadata["sandbox_id"] = rec.sandboxID
+		cp.Metadata["environment_id"] = rec.envID
+		cp.Metadata["memory_bytes"] = fmt.Sprintf("%d", rec.memory)
+		cp.Metadata["fence"] = fmt.Sprintf("%d", rec.fence)
+	}
+	h.mu.Unlock()
+	return cp, nil
 }
 
+// Restore boots an incarnation from a checkpoint on THIS host (ADR-008:
+// checkpoints are host-local artifacts, so restore is origin-host-only) and
+// re-registers the host-side accounting Snapshot recorded. An incarnation
+// still registered (STOP/CONT class, never terminated) keeps its record; a
+// reclaimed one is charged capacity again. The placement fence in the
+// checkpoint metadata — refreshed by the fleet at restore placement time —
+// is validated and adopted exactly like Create's.
 func (h *HostAgent) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
-	return h.backend.Restore(cp)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	rec, known := h.incarnations[cp.IncarnationID]
+	sandboxID := cp.Metadata["sandbox_id"]
+	if known {
+		sandboxID = rec.sandboxID
+	}
+	var fence int64
+	hasFence := cp.Metadata["fence"] != ""
+	if hasFence {
+		fmt.Sscanf(cp.Metadata["fence"], "%d", &fence)
+		if sandboxID != "" && fence < h.fences[sandboxID] {
+			return backendinterface.Handle{}, ErrStaleFence
+		}
+	}
+	var memory int64
+	fmt.Sscanf(cp.Metadata["memory_bytes"], "%d", &memory)
+	if !known && (h.slotsUsed+1 > h.slots || h.memUsed+memory > h.memCapacity) {
+		return backendinterface.Handle{}, ErrCapacity
+	}
+	handle, err := h.backend.Restore(cp)
+	if err != nil {
+		return backendinterface.Handle{}, err
+	}
+	if known {
+		rec.paused = false
+		if hasFence {
+			rec.fence = fence
+		}
+	} else {
+		h.incarnations[cp.IncarnationID] = &incRecord{
+			sandboxID: sandboxID, fence: fence,
+			memory: memory, envID: cp.Metadata["environment_id"],
+		}
+		if sandboxID != "" {
+			h.bySandbox[sandboxID] = cp.IncarnationID
+		}
+		h.slotsUsed++
+		h.memUsed += memory
+	}
+	if sandboxID != "" && fence > h.fences[sandboxID] {
+		h.fences[sandboxID] = fence
+	}
+	return handle, nil
 }
 
 // PublishPort exposes a guest TCP port on the host address (ADR-007 data

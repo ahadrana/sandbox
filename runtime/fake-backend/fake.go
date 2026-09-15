@@ -186,6 +186,32 @@ func (b *Backend) Terminate(h backendinterface.Handle) error {
 	return nil
 }
 
+// LiveHandles lists the fake's live incarnations (host-agent adoption).
+func (b *Backend) LiveHandles() []backendinterface.Handle {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []backendinterface.Handle
+	for id, r := range b.runtimes {
+		if !r.terminated && !r.dead {
+			out = append(out, backendinterface.Handle{IncarnationID: id})
+		}
+	}
+	return out
+}
+
+// LiveSpecs lists the fake's live incarnation specs (host-agent adoption).
+func (b *Backend) LiveSpecs() []backendinterface.Spec {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []backendinterface.Spec
+	for _, r := range b.runtimes {
+		if !r.terminated && !r.dead {
+			out = append(out, r.spec)
+		}
+	}
+	return out
+}
+
 func (b *Backend) Stats(h backendinterface.Handle) (backendinterface.Stats, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
