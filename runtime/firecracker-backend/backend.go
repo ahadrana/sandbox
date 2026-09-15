@@ -2,6 +2,7 @@ package firecrackerbackend
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 	"github.com/agent-sandbox/platform/domain"
 	"github.com/agent-sandbox/platform/runtime/backend-interface"
 	"github.com/agent-sandbox/platform/runtime/guest-supervisor"
+	"github.com/agent-sandbox/platform/runtime/hostfacts"
 )
 
 // incarnationIDPattern whitelists IDs before they touch filesystem paths,
@@ -152,6 +154,13 @@ type incarnation struct {
 	jailed       bool
 	jailRoot     string
 	net          *netState
+	// toolsImage is the host path of the content-addressed read-only tools
+	// drive attached to this incarnation (P0.3); empty in stage-2 mode and
+	// for legacy (pre-P0.3) snapshots whose supervisor lives in the rootfs.
+	toolsImage string
+	// toolsSHA is the sha256 of the supervisor binary the tools image was
+	// built from (recorded in snapshot metadata, P0.4).
+	toolsSHA string
 	// opMu serializes guest-mutating operations (Exec writes/commands)
 	// against the pause/snapshot window: Snapshot holds it across
 	// pause+snapshotCreate so an Exec either fully lands in the guest before
@@ -169,9 +178,16 @@ type Backend struct {
 	mu      sync.Mutex
 	incs    map[string]*incarnation
 	nextCID uint32
+	// toolsMu serializes tools-image builds (ensureToolsImage); separate
+	// from mu because Create calls it while holding mu (P0.3).
+	toolsMu sync.Mutex
 	// jailerFailed records why the jailer is not in use (empty = jailer
 	// active or not configured); surfaced via JailerStatus.
 	jailerFailed string
+	// kernelSHA/fcVersion cache the snapshot-package facts (P0.4); computed
+	// lazily under mu on first Snapshot.
+	kernelSHA string
+	fcVersion string
 }
 
 // JailerStatus reports the jailer fallback reason ("" when the jailer is
@@ -286,18 +302,29 @@ func (b *Backend) Create(spec backendinterface.Spec) (backendinterface.Handle, e
 	if err := injectWorkspaceUnit(rootfs); err != nil {
 		return fail(err)
 	}
+	var toolsImage, toolsSHA string
 	if b.cfg.GuestSupervisorBin != "" {
-		if err := injectGuestAgent(rootfs, b.cfg.GuestSupervisorBin, spec.IncarnationID, b.cfg.SupervisorPort); err != nil {
+		// P0.3: the supervisor binary ships on ONE content-addressed
+		// read-only tools drive shared by every incarnation, not injected
+		// into each rootfs copy (~3MB/VM saved).
+		var err error
+		toolsImage, toolsSHA, err = b.ensureToolsImage()
+		if err != nil {
+			return fail(err)
+		}
+		if err := injectGuestAgentUnit(rootfs, spec.IncarnationID, b.cfg.SupervisorPort); err != nil {
 			return fail(err)
 		}
 	}
 	inc := &incarnation{
-		id:       spec.IncarnationID,
-		spec:     spec,
-		dir:      dir,
-		wsMirror: map[string]string{},
-		ops:      map[string]domain.Operation{},
-		results:  map[string]supervisor.Result{},
+		id:         spec.IncarnationID,
+		spec:       spec,
+		dir:        dir,
+		wsMirror:   map[string]string{},
+		ops:        map[string]domain.Operation{},
+		results:    map[string]supervisor.Result{},
+		toolsImage: toolsImage,
+		toolsSHA:   toolsSHA,
 	}
 	for k, v := range spec.WorkspaceManifest {
 		inc.wsMirror[k] = v
@@ -417,6 +444,13 @@ func (b *Backend) configureNew(inc *incarnation) error {
 	}
 	if err := api.addDrive("workspace", l.apiWS, false, false); err != nil {
 		return err
+	}
+	if inc.toolsImage != "" {
+		// Third drive: the shared read-only tools ext4 (P0.3), mounted
+		// in-guest by label fc-tools at /opt/fc-tools.
+		if err := api.addDrive("tools", l.apiTools, false, true); err != nil {
+			return err
+		}
 	}
 	if ns := b.netOf(inc); ns != nil {
 		if err := api.addNIC("eth0", ns.tap, ns.mac); err != nil {
@@ -612,6 +646,130 @@ type snapshotMeta struct {
 	// restore bumps it (generation+1, conntrack flush) so pre-restore
 	// flows cannot continue under the old policy (P0.1).
 	NetGeneration *int `json:"net_generation,omitempty"`
+	// Self-describing snapshot package (P0.4): the facts below make the
+	// snapshot portable-checkable. Restore validates every populated field
+	// against the current host/backend and fails with a typed
+	// SnapshotIncompatibleError on mismatch. Empty fields (legacy
+	// snapshots) skip validation.
+	// ToolsImage is the content-addressed tools drive the saved VMM state
+	// references (P0.3); restore reuses THIS image even when the current
+	// supervisor binary differs (a supervisor upgrade must never block
+	// restore).
+	ToolsImage         string `json:"tools_image,omitempty"`
+	SupervisorSHA256   string `json:"supervisor_sha256,omitempty"`
+	KernelSHA256       string `json:"kernel_sha256,omitempty"`
+	FirecrackerVersion string `json:"firecracker_version,omitempty"`
+	Arch               string `json:"arch,omitempty"`
+	KernelRelease      string `json:"kernel_release,omitempty"`
+	CPUPart            string `json:"cpu_part,omitempty"`
+}
+
+// SnapshotIncompatibleError is Restore's typed failure when a
+// self-describing snapshot's recorded facts (P0.4) do not match the
+// current host or backend, or when a referenced snapshot artifact (tools
+// image) is missing.
+type SnapshotIncompatibleError struct {
+	Field string // e.g. "kernel_sha256", "arch", "tools_image"
+	Want  string // value recorded in the snapshot
+	Got   string // value on the current host/backend
+}
+
+func (e *SnapshotIncompatibleError) Error() string {
+	return fmt.Sprintf("firecrackerbackend: snapshot incompatible: %s recorded as %q but current is %q", e.Field, e.Want, e.Got)
+}
+
+// IsSnapshotIncompatible reports whether err is (or wraps) a
+// SnapshotIncompatibleError.
+func IsSnapshotIncompatible(err error) bool {
+	var si *SnapshotIncompatibleError
+	return errors.As(err, &si)
+}
+
+// kernelSHA256 returns the cached sha256 of the configured kernel image,
+// computing it on first use (P0.4 snapshot package).
+func (b *Backend) kernelSHA256() (string, error) {
+	b.mu.Lock()
+	cached := b.kernelSHA
+	b.mu.Unlock()
+	if cached != "" {
+		return cached, nil
+	}
+	sha, err := sha256File(b.cfg.KernelPath)
+	if err != nil {
+		return "", fmt.Errorf("kernel image: %w", err)
+	}
+	b.mu.Lock()
+	b.kernelSHA = sha
+	b.mu.Unlock()
+	return sha, nil
+}
+
+// firecrackerVersion returns the cached first line of
+// `firecracker --version` (P0.4 snapshot package).
+func (b *Backend) firecrackerVersion() string {
+	b.mu.Lock()
+	cached := b.fcVersion
+	b.mu.Unlock()
+	if cached != "" {
+		return cached
+	}
+	v := "unknown"
+	if out, err := exec.Command(b.cfg.FirecrackerBin, "--version").Output(); err == nil {
+		if line, _, _ := strings.Cut(string(out), "\n"); strings.TrimSpace(line) != "" {
+			v = strings.TrimSpace(line)
+		}
+	}
+	b.mu.Lock()
+	b.fcVersion = v
+	b.mu.Unlock()
+	return v
+}
+
+// validateSnapshotPackage checks the self-describing facts recorded in
+// meta against the current host/backend (P0.4). Unpopulated fields (legacy
+// snapshots) are skipped. SupervisorSHA256 is intentionally NOT fatal: the
+// supervisor recorded in the snapshot is the one the restored VM must run,
+// so a mismatch just means the recorded tools image is used. Returns a
+// *SnapshotIncompatibleError on fatal mismatch.
+func (b *Backend) validateSnapshotPackage(meta *snapshotMeta) error {
+	facts := hostfacts.Current()
+	check := func(field, recorded, current string) error {
+		if recorded == "" {
+			return nil
+		}
+		if recorded != current {
+			return &SnapshotIncompatibleError{Field: field, Want: recorded, Got: current}
+		}
+		return nil
+	}
+	if err := check("arch", meta.Arch, facts.Arch); err != nil {
+		return err
+	}
+	if err := check("kernel_release", meta.KernelRelease, facts.KernelRelease); err != nil {
+		return err
+	}
+	if err := check("cpu_part", meta.CPUPart, facts.CPUPart); err != nil {
+		return err
+	}
+	if meta.KernelSHA256 != "" {
+		sha, err := b.kernelSHA256()
+		if err != nil {
+			return err
+		}
+		if err := check("kernel_sha256", meta.KernelSHA256, sha); err != nil {
+			return err
+		}
+	}
+	if err := check("firecracker_version", meta.FirecrackerVersion, b.firecrackerVersion()); err != nil {
+		return err
+	}
+	// The tools image is referenced by the saved VMM state: it must exist.
+	if meta.ToolsImage != "" {
+		if _, err := os.Stat(meta.ToolsImage); err != nil {
+			return &SnapshotIncompatibleError{Field: "tools_image", Want: meta.ToolsImage, Got: "missing: " + err.Error()}
+		}
+	}
+	return nil
 }
 
 func (b *Backend) snapshotDir(incarnationID string) string {
@@ -729,7 +887,21 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 		inc.net.mu.Unlock()
 		meta.NetGeneration = &gen
 	}
+	meta.ToolsImage = inc.toolsImage
+	meta.SupervisorSHA256 = inc.toolsSHA
 	b.mu.Unlock()
+	// Self-describing package (P0.4): record host/backend facts so a later
+	// restore can reject incompatible environments with a typed error.
+	facts := hostfacts.Current()
+	meta.Arch = facts.Arch
+	meta.KernelRelease = facts.KernelRelease
+	meta.CPUPart = facts.CPUPart
+	kernelSHA, err := b.kernelSHA256()
+	if err != nil {
+		return fail(err)
+	}
+	meta.KernelSHA256 = kernelSHA
+	meta.FirecrackerVersion = b.firecrackerVersion()
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
 		return fail(err)
@@ -750,6 +922,11 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 		Metadata: map[string]string{
 			"class":        snapshotClass,
 			"snapshot_dir": snapDir,
+			// Placement-guard visibility (P1.7): hosts matching these
+			// facts get the checkpoint-locality bonus.
+			"arch":           facts.Arch,
+			"kernel_release": facts.KernelRelease,
+			"cpu_part":       facts.CPUPart,
 		},
 	}, nil
 }
@@ -786,6 +963,17 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 	if err := json.Unmarshal(metaBytes, &meta); err != nil {
 		return backendinterface.Handle{}, fmt.Errorf("checkpoint metadata corrupt: %w", err)
 	}
+	// P0.4: the snapshot is self-describing — reject hosts/backends whose
+	// facts differ from what the snapshot was taken under (typed error).
+	if err := b.validateSnapshotPackage(&meta); err != nil {
+		return backendinterface.Handle{}, err
+	}
+	// The restored VM must run the supervisor it was snapshotted with:
+	// reuse the recorded tools image even when the current binary differs
+	// (a supervisor upgrade never blocks restore). Legacy snapshots
+	// (pre-P0.3) record no tools image: their supervisor lives inside the
+	// snapshot's rootfs and no tools drive is attached.
+	toolsImage, toolsSHA := meta.ToolsImage, meta.SupervisorSHA256
 	b.mu.Lock()
 	inc, ok := b.incs[cp.IncarnationID]
 	if !ok {
@@ -806,6 +994,8 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 	inc.dead = false
 	inc.paused = false
 	inc.started = true
+	inc.toolsImage = toolsImage
+	inc.toolsSHA = toolsSHA
 	for k, v := range cp.Files {
 		inc.wsMirror[k] = v
 	}

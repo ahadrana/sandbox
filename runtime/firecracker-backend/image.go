@@ -1,7 +1,10 @@
 package firecrackerbackend
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -142,7 +145,11 @@ func injectWorkspaceUnit(rootfsPath string) error {
 
 // guestAgentUnitTemplate is the systemd unit starting the in-guest
 // supervisor after the workspace mount; %s carries the incarnation ID and
-// %d the vsock port.
+// %d the vsock port. The supervisor binary is NOT in the rootfs: it lives
+// on the shared read-only tools drive (P0.3, filesystem label fc-tools)
+// which this unit mounts at /opt/fc-tools. The mount is idempotent
+// (mountpoint -q first) because Restart=always re-runs ExecStartPre; the
+// /dev/vdX fallbacks cover kernels that mount by label too late.
 const guestAgentUnitTemplate = `[Unit]
 Description=agent-sandbox guest supervisor
 Requires=agent-workspace.service
@@ -150,7 +157,8 @@ After=agent-workspace.service
 
 [Service]
 Environment=AGENT_SANDBOX_INCARNATION_ID=%s
-ExecStart=/usr/local/bin/guest-supervisor -port %d
+ExecStartPre=/bin/sh -c 'mkdir -p /opt/fc-tools && (mountpoint -q /opt/fc-tools || mount -t ext4 -o ro LABEL=fc-tools /opt/fc-tools || mount -t ext4 -o ro /dev/vdc /opt/fc-tools || mount -t ext4 -o ro /dev/vdb /opt/fc-tools || mount -t ext4 -o ro /dev/vdd /opt/fc-tools)'
+ExecStart=/opt/fc-tools/guest-supervisor -port %d
 Restart=always
 RestartSec=0.2
 
@@ -158,11 +166,104 @@ RestartSec=0.2
 WantedBy=multi-user.target
 `
 
-// injectGuestAgent writes the guest-supervisor daemon binary (with exec
-// permission via debugfs sif) and its systemd unit into a rootfs image copy.
-// Must run after injectWorkspaceUnit (the unit Requires/Afters it) and after
-// the journal recovery it performs.
-func injectGuestAgent(rootfsPath, binPath, incarnationID string, port uint32) error {
+// toolsLabel is the filesystem label of the content-addressed tools drive.
+const toolsLabel = "fc-tools"
+
+// sha256File returns the hex sha256 of the file at path.
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// buildToolsImage creates an ext4 image at imgPath containing the
+// guest-supervisor binary at /guest-supervisor (mode 0755), filesystem
+// label fc-tools, using mkfs.ext4 + debugfs (no root required).
+func buildToolsImage(imgPath, supervisorBin string) error {
+	sizeMiB := int64(8)
+	if fi, err := os.Stat(supervisorBin); err == nil {
+		sizeMiB = fi.Size()/(1<<20)*2 + 8
+	}
+	img, err := os.Create(imgPath)
+	if err != nil {
+		return err
+	}
+	if err := img.Truncate(sizeMiB << 20); err != nil {
+		img.Close()
+		return err
+	}
+	img.Close()
+	if out, err := exec.Command("mkfs.ext4", "-q", "-F", "-L", toolsLabel, imgPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("mkfs.ext4 tools: %v: %s", err, out)
+	}
+	tmp, err := os.MkdirTemp("", "fc-tools-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	script := filepath.Join(tmp, "cmds")
+	body := "write " + supervisorBin + " /guest-supervisor\n" +
+		"sif /guest-supervisor mode 0100755\n"
+	if err := os.WriteFile(script, []byte(body), 0o600); err != nil {
+		return err
+	}
+	if out, err := exec.Command("debugfs", "-w", "-f", script, imgPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("debugfs tools inject: %v: %s", err, out)
+	}
+	return nil
+}
+
+// ensureToolsImage returns the path of this backend's shared, read-only
+// tools ext4 image (P0.3) and the sha256 of the supervisor binary it was
+// built from. The image is content-addressed
+// (<Root>/tools/tools-<sha256>.ext4): one file serves every incarnation,
+// replacing the old per-incarnation ~3MB debugfs injection into each
+// rootfs copy. Built once per content via tmp+rename, so a crashed build
+// never leaves a partial image behind (the .tmp file is cleaned up on the
+// next build attempt). Tools images are never deleted: a snapshot's saved
+// VMM state references the image path, so restore depends on it surviving
+// (GC of unreferenced images is a documented follow-up).
+func (b *Backend) ensureToolsImage() (string, string, error) {
+	sha, err := sha256File(b.cfg.GuestSupervisorBin)
+	if err != nil {
+		return "", "", fmt.Errorf("guest supervisor binary: %w", err)
+	}
+	b.toolsMu.Lock()
+	defer b.toolsMu.Unlock()
+	dir := filepath.Join(b.cfg.Root, "tools")
+	img := filepath.Join(dir, "tools-"+sha+".ext4")
+	if _, err := os.Stat(img); err == nil {
+		return img, sha, nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", err
+	}
+	tmp := img + ".tmp"
+	os.Remove(tmp) // clean up a crashed earlier build
+	if err := buildToolsImage(tmp, b.cfg.GuestSupervisorBin); err != nil {
+		os.Remove(tmp)
+		return "", "", err
+	}
+	if err := os.Rename(tmp, img); err != nil {
+		os.Remove(tmp)
+		return "", "", err
+	}
+	return img, sha, nil
+}
+
+// injectGuestAgentUnit writes the guest-supervisor systemd unit into a
+// rootfs image copy. The unit mounts the shared tools drive and runs the
+// supervisor from it; the binary itself is no longer injected per
+// incarnation (P0.3). Must run after injectWorkspaceUnit (the unit
+// Requires/Afters it) and after the journal recovery it performs.
+func injectGuestAgentUnit(rootfsPath, incarnationID string, port uint32) error {
 	tmp, err := os.MkdirTemp("", "fc-agent-")
 	if err != nil {
 		return err
@@ -173,9 +274,7 @@ func injectGuestAgent(rootfsPath, binPath, incarnationID string, port uint32) er
 		return err
 	}
 	script := filepath.Join(tmp, "cmds")
-	body := "write " + binPath + " /usr/local/bin/guest-supervisor\n" +
-		"sif /usr/local/bin/guest-supervisor mode 0100755\n" +
-		"write " + unit + " /etc/systemd/system/guest-supervisor.service\n" +
+	body := "write " + unit + " /etc/systemd/system/guest-supervisor.service\n" +
 		"symlink /etc/systemd/system/multi-user.target.wants/guest-supervisor.service /etc/systemd/system/guest-supervisor.service\n"
 	if err := os.WriteFile(script, []byte(body), 0o600); err != nil {
 		return err

@@ -20,6 +20,20 @@ var ErrIntegrityMismatch = errors.New("workspace integrity digest mismatch")
 
 // Durable is a filesystem WorkspaceStore: content-addressed blobs plus
 // digest-verified manifests, atomic head updates via rename.
+//
+// WAL discipline audit (P1.10, CubeS3lvol's four journal rules, adapted —
+// this store is a two-file protocol, not an append journal):
+//  1. One batch in flight: callers serialize commits per workspace; head
+//     updates are rename-atomic.
+//  2. Ack after fsync: writeFileAtomic fsyncs the file before rename and
+//     fsyncs the directory after, so a returned Commit is durable.
+//  3. Corruption detected as corruption: every blob and manifest digest
+//     is a sha256 verified on read (ErrIntegrityMismatch) — no explicit
+//     CRC is needed; content addressing IS the checksum.
+//  4. Torn writes never replay: manifests land before the head that
+//     references them, and both writes are tmp+fsync+rename+dir-fsync, so
+//     a crash leaves either the old head or an unreferenced generation,
+//     never a head pointing at a missing or partial manifest.
 type Durable struct {
 	mu    sync.Mutex
 	root  string

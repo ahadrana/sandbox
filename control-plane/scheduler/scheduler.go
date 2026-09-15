@@ -25,6 +25,21 @@ type HostView struct {
 	// CachedCheckpoints marks sandboxes with a compatible checkpoint held
 	// on this host (resume locality bonus).
 	CachedCheckpoints map[string]bool
+	// KernelRelease and CPUPart are the host facts (uname -r, CPU model
+	// discriminator) that gate checkpoint-locality (P1.7): a full-VM
+	// checkpoint is only restorable on a host whose facts match the
+	// checkpoint's guard. Populated by HostAgent.View.
+	KernelRelease string
+	CPUPart       string
+}
+
+// Guard describes the host facts a checkpoint depends on (P1.7). A host's
+// CachedCheckpoints entry only earns its locality bonus when the host's
+// facts match the guard exactly; a mismatching host is scored as if it
+// held no checkpoint.
+type Guard struct {
+	KernelRelease string
+	CPUPart       string
 }
 
 // Request describes one incarnation placement.
@@ -34,6 +49,9 @@ type Request struct {
 	WorkspaceID    string
 	MemoryRequired int64
 	Priority       int
+	// CheckpointGuard, when set, is the host-facts guard of the checkpoint
+	// being restored (P1.7); nil means no restore is in play.
+	CheckpointGuard *Guard
 }
 
 // Placement is the scheduling decision; Fence is monotonic per sandbox and
@@ -94,10 +112,27 @@ func score(req Request, h HostView) float64 {
 	if h.CachedWorkspaces[req.WorkspaceID] {
 		score += 2
 	}
-	if h.CachedCheckpoints[req.SandboxID] {
+	if h.CachedCheckpoints[req.SandboxID] && checkpointCompatible(req.CheckpointGuard, h) {
 		score += 3
 	}
 	return score
+}
+
+// checkpointCompatible reports whether host facts satisfy the checkpoint's
+// restore guard (P1.7): a nil guard means no restore is in play (bonus
+// applies unconditionally); a set guard requires an exact match on every
+// guarded fact.
+func checkpointCompatible(g *Guard, h HostView) bool {
+	if g == nil {
+		return true
+	}
+	if g.KernelRelease != "" && h.KernelRelease != g.KernelRelease {
+		return false
+	}
+	if g.CPUPart != "" && h.CPUPart != g.CPUPart {
+		return false
+	}
+	return true
 }
 
 // Place chooses a healthy host with free capacity for one incarnation.

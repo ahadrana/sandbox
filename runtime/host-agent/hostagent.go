@@ -15,6 +15,7 @@ import (
 	"github.com/agent-sandbox/platform/domain"
 	"github.com/agent-sandbox/platform/runtime/backend-interface"
 	"github.com/agent-sandbox/platform/runtime/guest-supervisor"
+	"github.com/agent-sandbox/platform/runtime/hostfacts"
 )
 
 var (
@@ -535,6 +536,7 @@ func (h *HostAgent) Capabilities() backendinterface.Capabilities {
 func (h *HostAgent) View() scheduler.HostView {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	facts := hostfacts.Current()
 	v := scheduler.HostView{
 		HostID:             h.hostID,
 		Healthy:            true,
@@ -545,6 +547,9 @@ func (h *HostAgent) View() scheduler.HostView {
 		CachedEnvironments: map[string]bool{},
 		CachedWorkspaces:   map[string]bool{},
 		CachedCheckpoints:  map[string]bool{},
+		// P1.7: host facts gate the checkpoint-locality bonus on restore.
+		KernelRelease: facts.KernelRelease,
+		CPUPart:       facts.CPUPart,
 	}
 	if h.memCapacity > 0 {
 		v.Pressure = float64(h.memUsed) / float64(h.memCapacity)

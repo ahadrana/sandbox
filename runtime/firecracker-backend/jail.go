@@ -30,6 +30,7 @@ type vmmLayout struct {
 	apiKernel string
 	apiRootfs string
 	apiWS     string
+	apiTools  string
 	jailed    bool
 	jailRoot  string
 }
@@ -57,6 +58,9 @@ func (b *Backend) layoutFor(inc *incarnation) vmmLayout {
 			apiKernel: b.cfg.KernelPath,
 			apiRootfs: filepath.Join(inc.dir, "rootfs.ext4"),
 			apiWS:     filepath.Join(inc.dir, "workspace.img"),
+			// The tools image is content-addressed and read-only, so the
+			// VMM opens the single shared file directly (no per-VM copy).
+			apiTools: inc.toolsImage,
 		}
 	}
 	root := inc.jailRoot
@@ -69,6 +73,7 @@ func (b *Backend) layoutFor(inc *incarnation) vmmLayout {
 		apiKernel: "/vmlinux",
 		apiRootfs: "/rootfs.ext4",
 		apiWS:     "/workspace.img",
+		apiTools:  "/tools.ext4",
 		jailed:    true,
 		jailRoot:  root,
 	}
@@ -114,6 +119,13 @@ func (b *Backend) prepareJail(inc *incarnation) (string, error) {
 	}
 	if err := linkOrCopy(filepath.Join(root, "workspace.img"), filepath.Join(inc.dir, "workspace.img")); err != nil {
 		return "", err
+	}
+	if inc.toolsImage != "" {
+		// P0.3: share the read-only tools image into the jail; the saved
+		// VMM state references the jail-relative path /tools.ext4.
+		if err := linkOrCopy(filepath.Join(root, "tools.ext4"), inc.toolsImage); err != nil {
+			return "", err
+		}
 	}
 	return root, nil
 }

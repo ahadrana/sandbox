@@ -2,6 +2,7 @@ package firecrackerbackend
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -1824,5 +1825,194 @@ func TestSnapshotFailureResumesAndCleans(t *testing.T) {
 	}
 	if err := b.Resume(h); err != nil {
 		t.Fatalf("Resume: %v", err)
+	}
+}
+
+// execOut runs a guest command and returns its trimmed stdout.
+func execOut(t *testing.T, b *Backend, h backendinterface.Handle, id, cmd string) string {
+	t.Helper()
+	res := execOp(t, b, h, id, cmd)
+	if res.ExitCode != 0 {
+		t.Fatalf("exec %q exit = %d", cmd, res.ExitCode)
+	}
+	chunk, err := supOf(t, b, h.IncarnationID).ReadOutput(id, false, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadOutput %q: %v", cmd, err)
+	}
+	return strings.TrimSpace(string(chunk.Data))
+}
+
+// P0.3: the guest-supervisor binary ships on ONE content-addressed
+// read-only tools ext4 (label fc-tools) shared by every incarnation, and
+// the in-guest unit mounts it and runs the supervisor from the mount.
+func TestGuestToolsOnPmem(t *testing.T) {
+	b := newBackend(t)
+	h1, err := b.Create(createSpec("inc-tools-1", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h1); err != nil {
+		t.Fatalf("Start inc-tools-1: %v", err)
+	}
+	defer b.Terminate(h1)
+	h2, err := b.Create(createSpec("inc-tools-2", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h2); err != nil {
+		t.Fatalf("Start inc-tools-2: %v", err)
+	}
+	defer b.Terminate(h2)
+
+	// One shared tools image for both incarnations.
+	entries, err := os.ReadDir(filepath.Join(b.cfg.Root, "tools"))
+	if err != nil {
+		t.Fatalf("tools dir: %v", err)
+	}
+	var images []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "tools-") && strings.HasSuffix(e.Name(), ".ext4") {
+			images = append(images, e.Name())
+		}
+	}
+	if len(images) != 1 {
+		t.Fatalf("tools images = %v, want exactly 1 shared by 2 incarnations", images)
+	}
+	b.mu.Lock()
+	ti1, ti2 := b.incs["inc-tools-1"].toolsImage, b.incs["inc-tools-2"].toolsImage
+	b.mu.Unlock()
+	if ti1 == "" || ti1 != ti2 {
+		t.Fatalf("incarnations reference different tools images: %q vs %q", ti1, ti2)
+	}
+
+	for _, id := range []string{"inc-tools-1", "inc-tools-2"} {
+		h := backendinterface.Handle{IncarnationID: id}
+		// In-guest proof: the tools fs is mounted at /opt/fc-tools.
+		mnt := execOut(t, b, h, "mnt-"+id, "grep fc-tools /proc/mounts")
+		if !strings.Contains(mnt, "/opt/fc-tools") || !strings.Contains(mnt, "ro,") {
+			t.Fatalf("%s: tools mount = %q, want ro mount at /opt/fc-tools", id, mnt)
+		}
+		// The running supervisor's executable lives on the tools mount.
+		exe := execOut(t, b, h, "exe-"+id, "readlink /proc/$(pidof guest-supervisor)/exe")
+		if exe != "/opt/fc-tools/guest-supervisor" {
+			t.Fatalf("%s: supervisor exe = %q, want /opt/fc-tools/guest-supervisor", id, exe)
+		}
+		// The old per-rootfs injection must be gone.
+		res := execOp(t, b, h, "old-"+id, "test ! -e /usr/local/bin/guest-supervisor")
+		if res.ExitCode != 0 {
+			t.Fatalf("%s: /usr/local/bin/guest-supervisor still exists (per-VM injection not removed)", id)
+		}
+		// Exec data path still works.
+		if out := execOut(t, b, h, "echo-"+id, "echo tools-ok"); out != "tools-ok" {
+			t.Fatalf("%s: echo = %q", id, out)
+		}
+	}
+}
+
+// P0.4: a snapshot is a self-describing package. Restore on the same host
+// succeeds; tampering a recorded fact (kernel sha256, or the tools-image
+// reference) in a copy of the snapshot dir fails with a typed
+// SnapshotIncompatibleError naming the field.
+func TestSnapshotPackageValidation(t *testing.T) {
+	b := newBackend(t)
+	h, err := b.Create(createSpec("inc-pkg", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	cp, err := b.Snapshot(h)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	snapDir := cp.Metadata["snapshot_dir"]
+
+	// The package records every fact.
+	metaBytes, err := os.ReadFile(filepath.Join(snapDir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta snapshotMeta
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.ToolsImage == "" || meta.SupervisorSHA256 == "" || meta.KernelSHA256 == "" ||
+		meta.FirecrackerVersion == "" || meta.Arch == "" || meta.KernelRelease == "" || meta.CPUPart == "" {
+		t.Fatalf("snapshot package incomplete: %+v", meta)
+	}
+
+	// Same-host restore works.
+	b.KillRuntime(h)
+	h2, err := b.Restore(cp)
+	if err != nil {
+		t.Fatalf("same-host Restore: %v", err)
+	}
+	if out := execOut(t, b, h2, "post-restore", "echo restored-ok"); out != "restored-ok" {
+		t.Fatalf("exec after restore = %q", out)
+	}
+	b.Terminate(h2)
+
+	// Tampered copy: recorded kernel sha no longer matches the host kernel.
+	tampered := tamperMeta(t, snapDir, "inc-pkg-tampered-kernel", func(m *snapshotMeta) {
+		m.KernelSHA256 = strings.Repeat("0", 64)
+	})
+	_, err = b.Restore(tampered)
+	if !IsSnapshotIncompatible(err) {
+		t.Fatalf("tampered kernel sha: error = %v, want SnapshotIncompatibleError", err)
+	}
+	var si *SnapshotIncompatibleError
+	if !errors.As(err, &si) || si.Field != "kernel_sha256" {
+		t.Fatalf("typed error field = %+v, want kernel_sha256", si)
+	}
+
+	// Tampered copy: recorded tools image is gone.
+	tampered2 := tamperMeta(t, snapDir, "inc-pkg-tampered-tools", func(m *snapshotMeta) {
+		m.ToolsImage = filepath.Join(b.cfg.Root, "tools", "tools-deadbeef.ext4")
+	})
+	_, err = b.Restore(tampered2)
+	if !IsSnapshotIncompatible(err) {
+		t.Fatalf("missing tools image: error = %v, want SnapshotIncompatibleError", err)
+	}
+	if !errors.As(err, &si) || si.Field != "tools_image" {
+		t.Fatalf("typed error field = %+v, want tools_image", si)
+	}
+}
+
+// tamperMeta hardlink-copies the snapshot dir (cheap), rewrites its
+// meta.json via mutate, and returns a CheckpointData pointing at the copy
+// under a new incarnation ID.
+func tamperMeta(t *testing.T, snapDir, newID string, mutate func(*snapshotMeta)) backendinterface.CheckpointData {
+	t.Helper()
+	dst := snapDir + "-" + newID
+	os.RemoveAll(dst)
+	out, err := exec.Command("cp", "-al", snapDir, dst).CombinedOutput()
+	if err != nil {
+		t.Fatalf("cp -al snapshot: %v: %s", err, out)
+	}
+	mp := filepath.Join(dst, "meta.json")
+	data, err := os.ReadFile(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m snapshotMeta
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	m.Spec.IncarnationID = newID
+	mutate(&m)
+	data, err = json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Replace the hardlinked file, never write through it (would corrupt
+	// the pristine snapshot).
+	os.Remove(mp)
+	if err := os.WriteFile(mp, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return backendinterface.CheckpointData{
+		IncarnationID: newID,
+		Metadata:      map[string]string{"class": snapshotClass, "snapshot_dir": dst},
 	}
 }

@@ -145,6 +145,36 @@ conformance assertions were not weakened — the difference is declared
   setsid daemons), background termination, and live workspace reads —
   same semantics as the local backend.
 
+### Batch 2 amendments (CubeSandbox borrows P0.3, P0.4, P1.7, P1.10)
+
+- **Agent on a shared tools drive (P0.3).** The guest-supervisor binary is
+  no longer injected into each per-incarnation rootfs copy. One
+  content-addressed read-only ext4 (`tools/tools-<sha256>.ext4`, label
+  `fc-tools`) is attached to every microVM as a third virtio-blk drive;
+  the injected unit mounts it at `/opt/fc-tools` (by label, idempotent)
+  and runs the supervisor from the mount. Tools images are never deleted
+  because saved VMM state references their paths (GC is a follow-up).
+- **Self-describing snapshots (P0.4).** Snapshot `meta.json` records the
+  supervisor/kernel sha256, firecracker version, and host facts
+  (`arch`, `kernel_release`, `cpu_part` via `runtime/hostfacts`).
+  `Restore` validates every populated field against the current
+  host/backend and fails with the typed `SnapshotIncompatibleError`
+  (`IsSnapshotIncompatible`) on mismatch; the recorded tools image is
+  reused even when the current supervisor binary differs, so a supervisor
+  upgrade never blocks restore.
+- **Restore placement guards (P1.7).** `scheduler.HostView` carries host
+  `KernelRelease`/`CPUPart`; `Request.CheckpointGuard` carries the
+  checkpoint's guard. The checkpoint-locality bonus (+3) applies only
+  when the guard matches exactly — restoring on a mismatched host would
+  fail P0.4 validation anyway, so locality must not pretend otherwise.
+- **WAL discipline (P1.10).** The sandbox-manager journal writes one
+  CRC32-prefixed line per commit (`"<8-hex-crc> <json>"`), fsynced before
+  the ack; a CRC mismatch mid-journal is a loud load error, a torn tail
+  is discarded whole, and legacy no-CRC lines still replay. Compaction is
+  now also self-triggering when the journal grows past
+  `CompactAfterBytes` (8 MiB) or `CompactAfterLines` (50k) since the last
+  snapshot.
+
 ## Consequences
 
 - Positive: VM-class isolation is implemented and conformance-gated;
