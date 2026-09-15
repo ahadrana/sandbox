@@ -33,8 +33,8 @@ request identifies its binding either by the `X-Endpoint-Binding` header
    that sandbox; bounded attempts; per-binding negative cache).
 3. Resolves the upstream via `GET /v1/sandboxes/{id}/address` (the live
    incarnation's host, from its placement) and reverse-proxies to
-   `host:<target-port>`. Verified-live bindings forward from a short-TTL
-   cache with zero control-plane calls.
+   `host:<target-port>` — the published endpoint (below). Verified-live
+   bindings forward from a short-TTL cache with zero control-plane calls.
 
 It is a separate Deployment, not a sidecar on host-agentd: there is one
 logical ingress (single-flight dedup and the live cache only work
@@ -42,10 +42,29 @@ fleet-wide behind one hop), it scales independently of execution hosts,
 and a sidecar in the hostNetwork pod would share the node's port space
 with the backend's TAP/iptables datapath.
 
-**Dev gap:** the upstream is the host node's address at the binding's
-target port; publishing `host:port -> guest:port` (DNAT or a host-side
-relay) is the firecracker backend's follow-up, so end-to-end guest
-reachability arrives with it.
+## Host->guest port publishing (the data-plane last hop)
+
+When the manager creates an endpoint binding on a running sandbox it calls
+the runtime's `PortPublisher` seam (`PublishPort(handle, guestPort,
+hostPort)`); the firecracker backend DNATs the host port to the
+incarnation's TAP IP in a per-incarnation nat chain (`FC-PUB-<slot>`)
+hooked from PREROUTING (external and pod clients) and OUTPUT (host-local
+clients, loopback excluded — loopback would hairpin into a black hole).
+The host port IS the binding's target port: no remapping, so the address
+clients hold never lies; a second sandbox publishing the same host port
+fails the binding creation with a typed port-conflict error. Suspend,
+unbind, and TTL expiry unpublish; Terminate/KillRuntime/restore tear the
+whole chain down with the incarnation's networking, and resume republishes
+on the (possibly new) host. Replies need no MASQUERADE (they traverse the
+host and conntrack reverses the DNAT); note DNAT'd replies are evaluated
+by the guest egress chain, so publishing composes with default-allow
+policies — under default-deny the client destinations must be allowed.
+Publishing steals the port NODE-WIDE (every local address, both hooks):
+a binding whose target port collides with a host service hijacks that
+service's traffic into the guest. The host agent therefore refuses to
+publish its own RPC listen port (heartbeats/RPC would be DNAT'd into the
+guest and the host declared lost), and operators must keep binding target
+ports clear of node services (kubelet, kube-proxy, SSH, platform 8080).
 
 ## Prereqs (deployment host)
 
@@ -107,13 +126,13 @@ curl -s -H "$T" -d '{}' localhost:18080/v1/sandboxes/$SB/terminate
 
 ## Notes / simplifications in this topology
 
-- `FC_NETWORKING` is off: no per-incarnation TAP/egress inside the pod yet
-  (the datapath itself is proven on-host by `TestEgressPolicy`). The image
-  already ships the datapath tooling the egress feature needs when enabled
-  (Batch 1 follow-up): `ip`/`iptables` (+ xtables-nft plugins) for the TAP
-  and egress chains, `conntrack` for the policy-generation conntrack flush,
-  and `sysctl` for `ip_forward`; a privileged `netinit` initContainer
-  applies `net.ipv4.ip_forward=1` and
+- `FC_NETWORKING` is on: every incarnation gets a TAP behind host egress
+  chains (the datapath proven on-host by `TestEgressPolicy`), and endpoint
+  bindings publish host:port -> guest:port DNAT rules (ADR-007). The image
+  ships the datapath tooling this needs: `ip`/`iptables` (+ xtables-nft
+  plugins) for the TAP and egress/publish chains, `conntrack` for the
+  policy-generation conntrack flush, and `sysctl` for `ip_forward`; a
+  privileged `netinit` initContainer applies `net.ipv4.ip_forward=1` and
   `net.ipv4.ip_unprivileged_port_start=0` (the per-incarnation DNS-learning
   proxies bind :53 on their TAP host addresses) on the host netns at pod
   start. The backend also applies both sysctls itself at runtime.

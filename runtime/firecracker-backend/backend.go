@@ -273,6 +273,9 @@ func (b *Backend) Capabilities() backendinterface.Capabilities {
 		// to a per-incarnation TAP behind a host egress chain.
 		NetworkIsolated:    b.cfg.Networking,
 		HostCredentialFree: true,
+		// The endpoint data plane (DNAT host:port -> guestIP:port) exists
+		// only when the backend manages guest networking at all.
+		SupportsPortPublish: b.cfg.Networking,
 	}
 }
 

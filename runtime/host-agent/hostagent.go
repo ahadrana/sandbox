@@ -203,6 +203,24 @@ type HostAgent struct {
 	incarnations map[string]*incRecord // incarnationID -> record
 	fences       map[string]int64      // sandboxID -> highest accepted fence
 	bySandbox    map[string]string     // sandboxID -> live incarnationID
+
+	// protectedPorts may never be published to guests: publishing the
+	// agent's own RPC port would DNAT-hijack heartbeats and RPC traffic
+	// into a guest (observed: host declared lost, teardown suppressed).
+	protectedPorts map[int]bool
+}
+
+// ProtectPorts forbids publishing the given host ports (the daemon calls
+// it with its own RPC listen port).
+func (h *HostAgent) ProtectPorts(ports ...int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.protectedPorts == nil {
+		h.protectedPorts = map[int]bool{}
+	}
+	for _, p := range ports {
+		h.protectedPorts[p] = true
+	}
 }
 
 func New(hostID string, backend RuntimeBackend, envs EnvironmentSource, ws WorkspaceStore, memCapacity int64, slots int, cacheSize int) *HostAgent {
@@ -432,6 +450,33 @@ func (h *HostAgent) Snapshot(handle backendinterface.Handle) (backendinterface.C
 
 func (h *HostAgent) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
 	return h.backend.Restore(cp)
+}
+
+// PublishPort exposes a guest TCP port on the host address (ADR-007 data
+// plane) when the backend implements backendinterface.PortPublisher;
+// otherwise honestly unsupported.
+func (h *HostAgent) PublishPort(handle backendinterface.Handle, guestPort, hostPort int) error {
+	h.mu.Lock()
+	protected := h.protectedPorts[hostPort]
+	h.mu.Unlock()
+	if protected {
+		return fmt.Errorf("host port %d is reserved for the host agent itself: %w", hostPort, backendinterface.ErrPortConflict)
+	}
+	pp, ok := h.backend.(backendinterface.PortPublisher)
+	if !ok {
+		return supervisor.ErrUnsupported
+	}
+	return pp.PublishPort(handle, guestPort, hostPort)
+}
+
+// UnpublishPort removes a published host port (no-op when the backend
+// cannot publish — there is nothing to remove).
+func (h *HostAgent) UnpublishPort(handle backendinterface.Handle, hostPort int) error {
+	pp, ok := h.backend.(backendinterface.PortPublisher)
+	if !ok {
+		return nil
+	}
+	return pp.UnpublishPort(handle, hostPort)
 }
 
 func (h *HostAgent) Stats(handle backendinterface.Handle) (backendinterface.Stats, error) {

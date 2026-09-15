@@ -41,6 +41,55 @@ type PlacementTracker interface {
 	PlacementOf(incarnationID string) (hostID string, fence int64, ok bool)
 }
 
+// PortPublisher is implemented by runtimes that expose a guest TCP port on
+// the host address (ADR-007 endpoint data plane). The manager publishes a
+// binding's target port while its sandbox is live and unpublishes on
+// suspend, unbind, and expiry; runtimes without the capability are skipped
+// silently (their endpoint reachability is someone else's layer).
+type PortPublisher interface {
+	PublishPort(h backendinterface.Handle, guestPort, hostPort int) error
+	UnpublishPort(h backendinterface.Handle, hostPort int) error
+}
+
+// publishBinding actuates one binding on the data plane when the sandbox
+// is Running with a live handle and the runtime can publish. The host
+// port IS the binding's target port (no remapping: the address clients
+// hold never lies), so a host-port conflict fails the binding's creation
+// outright.
+func (m *Manager) publishBinding(b *domain.EndpointBinding) error {
+	pp, ok := m.rt.(PortPublisher)
+	if !ok {
+		return nil
+	}
+	sb, ok := m.sandboxes[b.SandboxID]
+	if !ok {
+		return nil
+	}
+	switch sb.ObservedState {
+	case domain.SandboxRunning, domain.SandboxQuiescent, domain.SandboxBackgroundActive:
+	default:
+		return nil // not live: actuated by materialize/resume
+	}
+	h, live := m.handles[b.SandboxID]
+	if !live {
+		return nil
+	}
+	return pp.PublishPort(h, b.TargetPort, b.TargetPort)
+}
+
+// unpublishBinding removes one binding from the data plane, best-effort:
+// the runtime teardown (Terminate/KillRuntime/restore elsewhere) is the
+// backstop, so unpublish errors never fail a lifecycle transition.
+func (m *Manager) unpublishBinding(b *domain.EndpointBinding) {
+	pp, ok := m.rt.(PortPublisher)
+	if !ok {
+		return
+	}
+	if h, live := m.handles[b.SandboxID]; live {
+		_ = pp.UnpublishPort(h, b.TargetPort)
+	}
+}
+
 // LostIncarnationTracker is implemented by fleet runtimes that detect host
 // loss; the manager reconciles the listed incarnations.
 type LostIncarnationTracker interface {
@@ -635,7 +684,27 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 		"workspace_generation": head.Generation,
 		"incarnation_id":       incID,
 	})
+	// Bindings created before the sandbox first ran are actuated now that
+	// there is a live guest to DNAT to.
+	m.publishActiveBindingsLocked(sb)
 	return nil
+}
+
+// publishActiveBindingsLocked actuates every ACTIVE binding of a running
+// sandbox on the data plane (materialize, resume); failures never fail the
+// lifecycle transition — they surface as endpoint 502s and an audit event.
+func (m *Manager) publishActiveBindingsLocked(sb *domain.Sandbox) {
+	for _, b := range m.bindings {
+		if b.SandboxID != sb.SandboxID || b.State != domain.EndpointActive {
+			continue
+		}
+		if err := m.publishBinding(b); err != nil {
+			m.emit(sb, sb.SandboxID, domain.EventEndpointPublishFailed, map[string]any{
+				"binding_id": b.BindingID,
+				"error":      err.Error(),
+			})
+		}
+	}
 }
 
 // checkQuotaLocked enforces tenant admission quotas at materialization:
@@ -1364,6 +1433,9 @@ func (m *Manager) suspendWithReasonLocked(sb *domain.Sandbox, reason string, all
 		if b.SandboxID == sandboxID && b.State == domain.EndpointActive {
 			b.State = domain.EndpointSuspended
 			m.tx.Bindings = append(m.tx.Bindings, b)
+			// The incarnation (and its host:port DNAT) is about to go away;
+			// the port frees for other sandboxes until resume republishes.
+			m.unpublishBinding(b)
 		}
 	}
 	h, live := m.handles[sandboxID]
@@ -1647,6 +1719,11 @@ func (m *Manager) CreateEndpointBinding(req api.CreateEndpointBindingRequest) (*
 	if req.TTL > 0 {
 		b.ExpiresAt = m.clock.Now().Add(req.TTL)
 	}
+	// Actuate the data plane before the binding exists: a publish failure
+	// (e.g. host-port conflict) fails the creation, no half-bound state.
+	if err := m.publishBinding(b); err != nil {
+		return nil, err
+	}
 	m.bindings[b.BindingID] = b
 	m.tx.Bindings = append(m.tx.Bindings, b)
 	m.emit(sb, sb.SandboxID, domain.EventEndpointBound, map[string]any{
@@ -1690,6 +1767,7 @@ func (m *Manager) UnbindEndpoint(bindingID string) error {
 func (m *Manager) unbindLocked(b *domain.EndpointBinding, reason string) error {
 	b.State = domain.EndpointUnbound
 	m.tx.Bindings = append(m.tx.Bindings, b)
+	m.unpublishBinding(b)
 	sb := m.sandboxes[b.SandboxID]
 	if sb == nil {
 		sb = &domain.Sandbox{SandboxID: b.SandboxID, TenantID: b.TenantID}
@@ -1712,6 +1790,9 @@ func (m *Manager) reactivateBindingsLocked(sb *domain.Sandbox) {
 			m.tx.Bindings = append(m.tx.Bindings, b)
 		}
 	}
+	// Republish on the (possibly new) host; the old host's rules went down
+	// with the old incarnation's networking.
+	m.publishActiveBindingsLocked(sb)
 }
 
 // BindingByName resolves a logical endpoint name to its binding in a
@@ -1920,6 +2001,7 @@ func (m *Manager) Tick(d time.Duration) error {
 		if (b.State == domain.EndpointActive || b.State == domain.EndpointSuspended) && !b.ExpiresAt.IsZero() && now.After(b.ExpiresAt) {
 			b.State = domain.EndpointExpired
 			m.tx.Bindings = append(m.tx.Bindings, b)
+			m.unpublishBinding(b)
 			if sb := m.sandboxes[b.SandboxID]; sb != nil {
 				m.emit(sb, sb.SandboxID, domain.EventEndpointUnbound, map[string]any{
 					"binding_id": b.BindingID,

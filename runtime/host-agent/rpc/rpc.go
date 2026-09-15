@@ -34,6 +34,8 @@ type request struct {
 	Checkpoint  *backendinterface.CheckpointData `json:"checkpoint,omitempty"`
 	ExecutionID string                           `json:"execution_id,omitempty"`
 	Operation   *domain.Operation                `json:"operation,omitempty"`
+	GuestPort   int                              `json:"guest_port,omitempty"`
+	HostPort    int                              `json:"host_port,omitempty"`
 }
 
 // response carries the union of all op results.
@@ -170,6 +172,14 @@ func dispatch(h hostagent.Host, req request) (resp response) {
 			return fail(err)
 		}
 		return response{OK: true, Checkpoint: &cp}
+	case "publish_port":
+		if err := h.PublishPort(req.Handle, req.GuestPort, req.HostPort); err != nil {
+			return fail(err)
+		}
+	case "unpublish_port":
+		if err := h.UnpublishPort(req.Handle, req.HostPort); err != nil {
+			return fail(err)
+		}
 	case "stats":
 		st, err := h.Stats(req.Handle)
 		if err != nil {
@@ -343,6 +353,16 @@ func (c *Client) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoin
 		return backendinterface.CheckpointData{}, err
 	}
 	return *resp.Checkpoint, nil
+}
+
+func (c *Client) PublishPort(h backendinterface.Handle, guestPort, hostPort int) error {
+	_, err := c.call(request{Op: "publish_port", Handle: h, GuestPort: guestPort, HostPort: hostPort})
+	return err
+}
+
+func (c *Client) UnpublishPort(h backendinterface.Handle, hostPort int) error {
+	_, err := c.call(request{Op: "unpublish_port", Handle: h, HostPort: hostPort})
+	return err
 }
 
 func (c *Client) Stats(h backendinterface.Handle) (backendinterface.Stats, error) {

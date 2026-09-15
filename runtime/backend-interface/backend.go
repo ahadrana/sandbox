@@ -10,6 +10,10 @@ var (
 	ErrIllegalState    = errors.New("runtime in wrong state for operation")
 	ErrResponseDropped = errors.New("fault injection: response dropped")
 	ErrSupervisorDead  = errors.New("fault injection: supervisor dead")
+	// ErrPortConflict reports a host port already published for another
+	// incarnation (typed so callers can distinguish it from plumbing
+	// errors).
+	ErrPortConflict = errors.New("host port already published")
 )
 
 // AckLostError reports a response lost after the operation was applied;
@@ -92,6 +96,30 @@ type Capabilities struct {
 	CheckpointReclaimsMemory bool
 	NetworkIsolated          bool
 	HostCredentialFree       bool
+	// SupportsPortPublish declares the endpoint data plane (ADR-007): the
+	// backend can DNAT a host TCP port to an incarnation's guest port
+	// (PortPublisher). False when the backend has no host networking.
+	SupportsPortPublish bool
+}
+
+// PortPublisher is the endpoint data-plane seam (ADR-007): backends with
+// host networking expose a guest TCP port on the host's address so endpoint
+// bindings are reachable as host:port. The manager publishes a binding's
+// target port while its sandbox is live and unpublishes on suspend,
+// unbind, and expiry; the backend additionally tears every published rule
+// down with the incarnation's networking (Terminate/KillRuntime/Restore).
+// It is an OPTIONAL capability interface — backends assert it, never the
+// Backend contract.
+type PortPublisher interface {
+	// PublishPort DNATs hostPort (on every host address) to the
+	// incarnation's guestIP:guestPort. Deterministic conflict semantics:
+	// the host port is fixed (no dynamic allocation) and a port owned by
+	// another live incarnation fails with ErrPortConflict. Idempotent for
+	// an identical re-publish (resume republish).
+	PublishPort(h Handle, guestPort, hostPort int) error
+	// UnpublishPort removes the hostPort DNAT rule; unknown ports are a
+	// no-op (teardown is the backstop).
+	UnpublishPort(h Handle, hostPort int) error
 }
 
 // Backend is the runtime backend contract (DESIGN §6.7).

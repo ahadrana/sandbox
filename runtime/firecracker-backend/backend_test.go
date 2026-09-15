@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -754,6 +755,103 @@ func TestEgressPolicy(t *testing.T) {
 			t.Fatalf("tap %s survived Terminate", ns.tap)
 		}
 	}
+}
+
+// ADR-007 data plane: publishing a binding's port DNATs host:port ->
+// guestIP:port. A host-local client over the (non-loopback) uplink address
+// reaches the guest server; unpublish and KillRuntime remove all rules.
+func TestPortPublish(t *testing.T) {
+	b := newNetBackend(t)
+	if !b.Capabilities().SupportsPortPublish {
+		t.Fatal("SupportsPortPublish = false with Networking enabled")
+	}
+	ext := uplinkIP(t)
+	id := "inc-pub"
+	h, err := b.Create(egressSpec(id, network.EgressPolicy{DefaultAllow: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start %s: %v", id, err)
+	}
+	// Guest-side HTTP server on the binding's target port.
+	if res := execOp(t, b, h, "srv1", "echo hello-endpoint > /tmp/index.txt"); res.ExitCode != 0 {
+		t.Fatalf("marker write exit = %d", res.ExitCode)
+	}
+	if res := execOp(t, b, h, "srv2", "nohup python3 -m http.server 8080 --directory /tmp >/tmp/srv.log 2>&1 & echo spawned"); res.ExitCode != 0 {
+		t.Fatalf("server spawn exit = %d", res.ExitCode)
+	}
+	if err := b.PublishPort(h, 8080, 18099); err != nil {
+		t.Fatalf("PublishPort: %v", err)
+	}
+	// A host-local client to the host's own uplink address traverses the
+	// OUTPUT hook (loopback is deliberately excluded — it would hairpin
+	// into a black hole).
+	url := "http://" + ext + ":18099/"
+	client := &http.Client{Timeout: 3 * time.Second}
+	var body []byte
+	ok := false
+	for i := 0; i < 20; i++ {
+		resp, err := client.Get(url)
+		if err == nil {
+			data, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				body, ok = data, true
+				break
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !ok {
+		t.Fatal("host:port did not reach the guest server after publish")
+	}
+	if !strings.Contains(string(body), "index.txt") {
+		t.Fatalf("unexpected body through DNAT: %.200s", body)
+	}
+	// Loopback clients fail fast (excluded from the OUTPUT hook): nothing
+	// listens on 127.0.0.1:18099, so this refuses quickly rather than
+	// hairpinning into a hang.
+	lo := &http.Client{Timeout: 2 * time.Second}
+	if resp, err := lo.Get("http://127.0.0.1:18099/"); err == nil {
+		resp.Body.Close()
+		t.Fatal("127.0.0.1 client reached the guest (loopback must be excluded)")
+	}
+
+	// Unpublish: the port dies and the registry frees (republish works).
+	if err := b.UnpublishPort(h, 18099); err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := client.Get(url); err == nil {
+		resp.Body.Close()
+		t.Fatal("port still reachable after unpublish")
+	}
+	if err := b.PublishPort(h, 8080, 18099); err != nil {
+		t.Fatalf("republish after unpublish: %v", err)
+	}
+	if resp, err := client.Get(url); err != nil {
+		t.Fatalf("republished port unreachable: %v", err)
+	} else {
+		resp.Body.Close()
+	}
+
+	// KillRuntime: no publish chains or rules may survive.
+	ns := netOf(t, b, id)
+	b.KillRuntime(h)
+	out, err := exec.Command("sudo", "-n", "iptables-save").CombinedOutput()
+	if err != nil {
+		t.Fatalf("iptables-save: %v", err)
+	}
+	if strings.Contains(string(out), "FC-PUB-") {
+		t.Fatalf("publish rules survived KillRuntime:\n%s", out)
+	}
+	pubPorts.Lock()
+	for p, s := range pubPorts.byPort {
+		if s == ns.slot {
+			t.Fatalf("port %d still registered to slot %d after KillRuntime", p, s)
+		}
+	}
+	pubPorts.Unlock()
 }
 
 // FM1: two networked VMs cannot reach each other (guest IP or host tap

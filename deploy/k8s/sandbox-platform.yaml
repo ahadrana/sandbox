@@ -39,9 +39,9 @@ spec:
     spec:
       serviceAccountName: host-agent
       # hostNetwork: the firecracker backend manages TAP/iptables on the
-      # host's networking stack (enabled later; FC_NETWORKING stays off in
-      # this dev topology). hostPID is deliberately NOT shared: the backend
-      # tracks VMM processes it spawned itself.
+      # host's networking stack (egress chains, DNS-learning proxies, and
+      # the ADR-007 endpoint DNAT publish). hostPID is deliberately NOT
+      # shared: the backend tracks VMM processes it spawned itself.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       # Multi-node: pin to dedicated execution nodes, e.g.
@@ -89,6 +89,11 @@ spec:
               value: "25769803776" # 24 GiB
             - name: SLOTS
               value: "16"
+            # Per-incarnation TAP + egress chains + endpoint port
+            # publishing (ADR-007); the netinit initContainer above
+            # applies the sysctls this needs.
+            - name: FC_NETWORKING
+              value: "true"
           volumeMounts:
             - { name: kvm, mountPath: /dev/kvm }
             - { name: fc-state, mountPath: /var/lib/sandbox-fc }

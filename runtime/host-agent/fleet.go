@@ -43,6 +43,8 @@ type Host interface {
 	MarkCommitted(handle backendinterface.Handle)
 	KillRuntime(handle backendinterface.Handle)
 	Alive(handle backendinterface.Handle) bool
+	PublishPort(handle backendinterface.Handle, guestPort, hostPort int) error
+	UnpublishPort(handle backendinterface.Handle, hostPort int) error
 }
 
 // Fleet is the simulated execution fleet: it routes every manager operation
@@ -296,6 +298,27 @@ func (f *Fleet) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoint
 	return host.Snapshot(h)
 }
 
+// PublishPort routes an endpoint publish to the incarnation's host
+// (ADR-007 data plane).
+func (f *Fleet) PublishPort(h backendinterface.Handle, guestPort, hostPort int) error {
+	host, _, err := f.hostOf(h)
+	if err != nil {
+		return err
+	}
+	return host.PublishPort(h, guestPort, hostPort)
+}
+
+// UnpublishPort routes an endpoint unpublish to the incarnation's host; a
+// lost host is cleaned locally (its reboot scrubs the rules) and is not an
+// error.
+func (f *Fleet) UnpublishPort(h backendinterface.Handle, hostPort int) error {
+	host, down, err := f.hostOf(h)
+	if err != nil || down {
+		return nil
+	}
+	return host.UnpublishPort(h, hostPort)
+}
+
 func (f *Fleet) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
 	return backendinterface.Handle{}, supervisor.ErrUnsupported
 }
@@ -472,6 +495,7 @@ func (f *Fleet) Capabilities() backendinterface.Capabilities {
 		caps.SupportsCheckpoint = caps.SupportsCheckpoint && c.SupportsCheckpoint
 		caps.NetworkIsolated = caps.NetworkIsolated && c.NetworkIsolated
 		caps.HostCredentialFree = caps.HostCredentialFree && c.HostCredentialFree
+		caps.SupportsPortPublish = caps.SupportsPortPublish && c.SupportsPortPublish
 		if classRank[c.IsolationClass] < classRank[caps.IsolationClass] {
 			caps.IsolationClass = c.IsolationClass
 		}

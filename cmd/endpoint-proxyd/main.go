@@ -7,10 +7,10 @@
 // calls are plain HTTP with the shared dev token, exactly how host-agentd
 // talks to control-planed.
 //
-// Dev gaps: shared-token auth only, no TLS; the upstream address is the
-// host agent's node — publishing host:port -> guest:port is the
-// firecracker backend's follow-up, so end-to-end guest reachability
-// depends on it.
+// Dev gaps: shared-token auth only, no TLS. The upstream address is the
+// incarnation's host node at the binding's target port, where the
+// firecracker backend's endpoint publish (FC-PUB-* DNAT) forwards into
+// the guest.
 package main
 
 import (

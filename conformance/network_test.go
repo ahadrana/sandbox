@@ -10,15 +10,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	agentdriver "github.com/agent-sandbox/platform/agent-driver"
 	"github.com/agent-sandbox/platform/api"
 	eventservice "github.com/agent-sandbox/platform/control-plane/event-service"
+	sandboxmanager "github.com/agent-sandbox/platform/control-plane/sandbox-manager"
 	credentialbroker "github.com/agent-sandbox/platform/credential-broker"
 	"github.com/agent-sandbox/platform/domain"
 	"github.com/agent-sandbox/platform/network"
+	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
+	fakebackend "github.com/agent-sandbox/platform/runtime/fake-backend"
+	"github.com/agent-sandbox/platform/workspace"
 )
 
 // Egress allow/deny decisions are enforced at the supervisor layer for
@@ -469,5 +474,226 @@ func TestAuditLogErrorsAndCap(t *testing.T) {
 	}
 	if err := l2.Record("k", "s", "d", now); err == nil {
 		t.Fatal("write error after close not surfaced")
+	}
+}
+
+// --- Endpoint data-plane publishing (ADR-007, backendinterface.PortPublisher) ---
+
+// recordPublisher wraps the fake backend with a recording PortPublisher:
+// the manager-side publish lifecycle is verifiable without host iptables.
+type recordPublisher struct {
+	*fakebackend.Backend
+	mu        sync.Mutex
+	published map[int]int // hostPort -> guestPort
+	failNext  error
+}
+
+func (r *recordPublisher) PublishPort(h backendinterface.Handle, guestPort, hostPort int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failNext != nil {
+		err := r.failNext
+		r.failNext = nil
+		return err
+	}
+	if r.published == nil {
+		r.published = map[int]int{}
+	}
+	r.published[hostPort] = guestPort
+	return nil
+}
+
+func (r *recordPublisher) UnpublishPort(h backendinterface.Handle, hostPort int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.published, hostPort)
+	return nil
+}
+
+func (r *recordPublisher) isPublished(hostPort int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.published[hostPort]
+	return ok
+}
+
+func newPublishSystem(t *testing.T) (*sandboxmanager.Manager, *recordPublisher, *domain.ManualClock) {
+	t.Helper()
+	clock := domain.NewManualClock(time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC))
+	ids := domain.NewIDGen()
+	ws := workspace.NewMemory(clock, ids)
+	outbox := eventservice.NewOutbox()
+	store := sandboxmanager.NewMemoryStore()
+	rt := &recordPublisher{Backend: fakebackend.New()}
+	mgr := sandboxmanager.New(clock, ids, ws, rt, outbox, store, "host-1")
+	return mgr, rt, clock
+}
+
+func mustMaterializeMgr(t *testing.T, mgr *sandboxmanager.Manager, sandboxID string) {
+	t.Helper()
+	if _, err := mgr.Materialize(sandboxID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The data plane follows the binding lifecycle: published on create while
+// live, freed on suspend (the port is available to other sandboxes),
+// republished on resume, removed on unbind and on TTL expiry.
+func TestEndpointPublishLifecycle(t *testing.T) {
+	mgr, rt, clock := newPublishSystem(t)
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-pub"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+
+	b, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 8080, LogicalName: "web", TTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rt.isPublished(8080) {
+		t.Fatal("binding created on live sandbox but port not published")
+	}
+
+	// Suspend frees the host port; the gateway denies while suspended.
+	if err := mgr.Suspend(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if rt.isPublished(8080) {
+		t.Fatal("port still published after suspend")
+	}
+
+	// A binding created while suspended is NOT published (no live handle);
+	// resume republishes every reactivated binding.
+	if _, err := mgr.Resume(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if !rt.isPublished(8080) {
+		t.Fatal("port not republished after resume")
+	}
+
+	// Unbind removes the publish.
+	if err := mgr.UnbindEndpoint(b.BindingID); err != nil {
+		t.Fatal(err)
+	}
+	if rt.isPublished(8080) {
+		t.Fatal("port still published after unbind")
+	}
+
+	// TTL expiry unpublishes too.
+	b2, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 9090, LogicalName: "api", TTL: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rt.isPublished(9090) {
+		t.Fatal("second binding not published")
+	}
+	_ = b2
+	clock.Advance(2 * time.Second)
+	if err := mgr.Tick(time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if rt.isPublished(9090) {
+		t.Fatal("port still published after TTL expiry")
+	}
+}
+
+// A publish failure (e.g. host-port conflict) fails the binding creation
+// outright — no half-bound state.
+func TestEndpointPublishFailureFailsCreate(t *testing.T) {
+	mgr, rt, _ := newPublishSystem(t)
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-pubfail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+	rt.failNext = backendinterface.ErrPortConflict
+	_, err = mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 8080, LogicalName: "web", TTL: time.Hour,
+	})
+	if err == nil {
+		t.Fatal("binding created despite publish conflict")
+	}
+	if got := mgr.ListEndpointBindings(sb.SandboxID); len(got) != 0 {
+		t.Fatalf("half-bound state after failed publish: %+v", got)
+	}
+}
+
+// A binding created on a SUSPENDED sandbox skips the publish (no live
+// handle) and is actuated by the resume's republish.
+func TestEndpointPublishSkippedWhileSuspended(t *testing.T) {
+	mgr, rt, _ := newPublishSystem(t)
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-pubsusp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+	if err := mgr.Suspend(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 8080, LogicalName: "web", TTL: time.Hour,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rt.isPublished(8080) {
+		t.Fatal("port published for suspended sandbox")
+	}
+	if _, err := mgr.Resume(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	// The binding was created against the pre-suspend epoch, so resume
+	// reactivates and republishes it.
+	if !rt.isPublished(8080) {
+		t.Fatal("port not republished after resume")
+	}
+}
+
+// A background-class sandbox idles into BACKGROUND_ACTIVE (not RUNNING or
+// QUIESCENT) — the publish gate must treat it as live.
+func TestEndpointPublishBackgroundActive(t *testing.T) {
+	mgr, rt, _ := newPublishSystem(t)
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-pubbg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+	// A lingering background child makes the sandbox BACKGROUND_ACTIVE
+	// (not quiescent) once the launching execution completes.
+	ex, err := mgr.StartExecution(api.StartExecutionRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1", PrincipalID: "p1",
+		IdempotencyKey: "bg-1",
+		Operation:      domain.Operation{Command: "sleep 30 & echo spawned"},
+		ExpectedEpoch:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.CompleteExecution(ex.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
+	info, err := mgr.GetSandbox(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ObservedState != domain.SandboxBackgroundActive && info.ObservedState != domain.SandboxQuiescent {
+		t.Fatalf("state = %s, want a live idle state", info.ObservedState)
+	}
+	if _, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 8080, LogicalName: "web", TTL: time.Hour,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !rt.isPublished(8080) {
+		t.Fatal("binding on BACKGROUND_ACTIVE sandbox not published")
 	}
 }

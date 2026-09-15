@@ -174,9 +174,13 @@ const (
 	EventResourceLimitExceeded    EventType = "ResourceLimitExceeded"
 	EventEndpointBound            EventType = "EndpointBound"
 	EventEndpointUnbound          EventType = "EndpointUnbound"
-	EventQuotaExceeded            EventType = "QuotaExceeded"
-	EventTenantDeleted            EventType = "TenantDeleted"
-	EventSandboxPreempted         EventType = "SandboxPreempted"
+	// EventEndpointPublishFailed records a data-plane publish failure on
+	// an otherwise-ACTIVE binding (the binding stays bound; reachability
+	// is degraded until a republish succeeds).
+	EventEndpointPublishFailed EventType = "EndpointPublishFailed"
+	EventQuotaExceeded         EventType = "QuotaExceeded"
+	EventTenantDeleted         EventType = "TenantDeleted"
+	EventSandboxPreempted      EventType = "SandboxPreempted"
 )
 
 type Tenant struct {

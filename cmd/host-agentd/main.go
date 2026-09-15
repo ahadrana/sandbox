@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -108,6 +109,13 @@ func main() {
 		ws = &remoteWS{url: controlPlane, token: token}
 	}
 	agent := hostagent.New(hostID, backend, nil, ws, memCapacity, int(slots), 64)
+	// Never let an endpoint binding publish the agent's own RPC port: the
+	// DNAT would hijack heartbeats/RPC into a guest.
+	if _, port, err := net.SplitHostPort(listen); err == nil {
+		if p, err := strconv.Atoi(port); err == nil {
+			agent.ProtectPorts(p)
+		}
+	}
 
 	// Heartbeat: register once, then keep the control plane's liveness view
 	// fresh. bootID identifies this agent process; the control plane

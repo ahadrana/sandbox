@@ -72,8 +72,14 @@ for bin in cp mkfs.ext4 debugfs e2fsck conntrack iptables ip sysctl; do
     while read -r lib; do cp -n "$lib" "$HA/lib/aarch64-linux-gnu/"; done
 done
 # iptables here is xtables-nft-multi: its match/target plugins are dlopen'd
-# from the xtables dir (invisible to ldd), so ship the whole directory.
-cp -r /usr/lib/aarch64-linux-gnu/xtables "$HA/lib/aarch64-linux-gnu/"
+# from the xtables dir (invisible to ldd), so ship the whole directory AT
+# THE COMPILED-IN SEARCH PATH (/usr/lib/... — /lib is NOT a symlink to
+# /usr/lib inside the scratch image).
+mkdir -p "$HA/usr/lib/aarch64-linux-gnu"
+cp -r /usr/lib/aarch64-linux-gnu/xtables "$HA/usr/lib/aarch64-linux-gnu/"
+# xtables-nft-multi dispatches on argv[0]: the backend's ip6tables calls
+# resolve to the same binary (checkNetPrereqs requires it in PATH).
+ln -s /usr/local/bin/iptables "$HA/usr/local/bin/ip6tables"
 cp "$ARTIFACTS/vmlinux.bin" "$ARTIFACTS/rootfs.ext4" "$HA/opt/sandbox/"
 mkimage host-agentd /host-agentd "$HA"
 

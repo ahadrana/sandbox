@@ -1,6 +1,7 @@
 package conformance
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -687,5 +688,18 @@ func TestRestorePlacementGuard(t *testing.T) {
 	// Mismatching guard: NO bonus — the fuller host wins instead.
 	if got := create("inc-g4", mismatching); got == cpHost {
 		t.Fatalf("mismatching guard still earned the checkpoint-locality bonus (host %q)", got)
+	}
+}
+
+// The host agent refuses to publish its own RPC port to a guest: the DNAT
+// would hijack heartbeats/RPC into the guest (observed on k3s: host
+// declared lost, teardown suppressed, VMM + rules leaked).
+func TestPublishProtectsRPCPort(t *testing.T) {
+	fs := newFleetSystem(t, 1, 2)
+	agent := fs.hosts["host-1"]
+	agent.ProtectPorts(8080)
+	err := agent.PublishPort(backendinterface.Handle{IncarnationID: "inc-x"}, 9000, 8080)
+	if err == nil || !errors.Is(err, backendinterface.ErrPortConflict) {
+		t.Fatalf("err = %v, want ErrPortConflict", err)
 	}
 }

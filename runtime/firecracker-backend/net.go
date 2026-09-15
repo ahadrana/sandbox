@@ -120,6 +120,7 @@ type netState struct {
 	minTTL       time.Duration
 	maxLearned   int
 	now          func() time.Time
+	published    map[int]int // hostPort -> guestPort (ADR-007 data plane)
 
 	proxy    *dnsProxy
 	syncCh   chan struct{}
@@ -869,6 +870,7 @@ func cleanupNetDevices(ns *netState) {
 	}
 	sudo("ip6tables", "-F", ns.chain6).Run()
 	sudo("ip6tables", "-X", ns.chain6).Run()
+	cleanupPubRules(ns)
 	sudo("ip", "link", "del", ns.tap).Run()
 }
 
@@ -937,6 +939,18 @@ func sweepStaleNetworking() {
 		for _, line := range strings.Split(string(out), "\n") {
 			if strings.HasPrefix(line, "-N ") {
 				if n, found := parseChainSlot(line[3:], spec.pfx); found {
+					slots[n] = true
+				}
+			}
+		}
+	}
+	// Published-port chains live in the nat table (ADR-007 data plane).
+	if out, err := sudo("iptables", "-t", "nat", "-S").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "firecrackerbackend: crash sweep: iptables -t nat -S: %v: %s\n", err, out)
+	} else {
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(line, "-N ") {
+				if n, found := parseChainSlot(line[3:], pubChainPfx); found {
 					slots[n] = true
 				}
 			}

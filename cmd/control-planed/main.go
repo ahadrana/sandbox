@@ -266,9 +266,9 @@ func (s *server) sandboxOp(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]bool{"ok": true})
 	case op == "address" && r.Method == http.MethodGet:
 		// The incarnation's current data address: the host agent's
-		// advertised URL. Guest-port publishing (host:port -> guest) is
-		// the firecracker backend's follow-up; until then the proxy
-		// dials the node address at the binding's target port.
+		// advertised URL. The proxy dials that host at the binding's
+		// target port, where the backend's endpoint publish DNATs into
+		// the guest.
 		hostID, ok := s.mgr.HostOf(id)
 		if !ok {
 			http.Error(w, "sandbox has no live placement", http.StatusNotFound)
