@@ -73,8 +73,15 @@ curl -s -H "$T" -d '{}' localhost:18080/v1/sandboxes/$SB/terminate
 ## Notes / simplifications in this topology
 
 - `FC_NETWORKING` is off: no per-incarnation TAP/egress inside the pod yet
-  (the datapath itself is proven on-host by `TestEgressPolicy`; enabling it
-  means shipping iproute2/iptables in the image).
+  (the datapath itself is proven on-host by `TestEgressPolicy`). The image
+  already ships the datapath tooling the egress feature needs when enabled
+  (Batch 1 follow-up): `ip`/`iptables` (+ xtables-nft plugins) for the TAP
+  and egress chains, `conntrack` for the policy-generation conntrack flush,
+  and `sysctl` for `ip_forward`; a privileged `netinit` initContainer
+  applies `net.ipv4.ip_forward=1` and
+  `net.ipv4.ip_unprivileged_port_start=0` (the per-incarnation DNS-learning
+  proxies bind :53 on their TAP host addresses) on the host netns at pod
+  start. The backend also applies both sysctls itself at runtime.
 - k3s (v1.36 and v1.32 alike) crash-looped on this host's 7.0.0-1012-aws
   AND 6.17.0-1017-aws kernels: `kubelet: could not detect number of cpus`.
   The host's ACPI MADT marks only CPUs 0-3 enabled and kernels ≥ 6.16 only

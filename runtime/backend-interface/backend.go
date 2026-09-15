@@ -39,6 +39,12 @@ type Spec struct {
 	Env map[string]string
 	// Priority (0-100) is forwarded to the scheduler.
 	Priority int
+	// CheckpointFacts, when non-nil, carries the host-facts metadata
+	// (arch/kernel_release/cpu_part) of the checkpoint this create
+	// materializes a restore from (copied from CheckpointData.Metadata,
+	// P1.7). Placement uses it to gate the checkpoint-locality bonus to
+	// hosts whose facts match exactly; backends ignore it.
+	CheckpointFacts map[string]string
 }
 
 type Handle struct {

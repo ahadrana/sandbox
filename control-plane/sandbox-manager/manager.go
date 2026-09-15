@@ -491,7 +491,11 @@ func (m *Manager) GetSandbox(sandboxID string) (*domain.Sandbox, error) {
 	return &cp, nil
 }
 
-func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreReport) error {
+// materializeLocked creates the incarnation. checkpointFacts, when
+// non-nil, is the host-facts metadata of the checkpoint being restored
+// (P1.7): it flows into the spec so fleet placement only grants the
+// checkpoint-locality bonus to hosts whose facts match exactly.
+func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreReport, checkpointFacts map[string]string) error {
 	if err := m.checkQuotaLocked(sb); err != nil {
 		return err
 	}
@@ -535,6 +539,7 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 		WorkspaceManifest:   manifest,
 		Env:                 map[string]string{"AGENT_SANDBOX_EGRESS": egressEnv},
 		Priority:            sb.Priority,
+		CheckpointFacts:     checkpointFacts,
 	}
 	h, err := m.rt.Create(spec)
 	// Fleet full: preempt (suspend) strictly-lower-priority BACKGROUND
@@ -803,7 +808,7 @@ func (m *Manager) Materialize(sandboxID string) (*api.RestoreReport, error) {
 	default:
 		return nil, domain.ErrIllegalState
 	}
-	if err := m.materializeLocked(sb, report); err != nil {
+	if err := m.materializeLocked(sb, report, nil); err != nil {
 		// Any failure after the STARTING transition must leave the sandbox
 		// in a valid, persisted state so a later Materialize retry is legal
 		// instead of wedging on STARTING (FAILED is retriable).
@@ -1505,8 +1510,13 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 	if err := m.transition(sb, domain.SandboxResuming); err != nil {
 		return nil, err
 	}
+	var checkpointFacts map[string]string
 	if sb.CheckpointRef != nil {
 		if record, ok := m.checkpoints[*sb.CheckpointRef]; ok {
+			// P1.7: if continuity restore fails and we fall back to a
+			// fresh materialization, placement must still prefer the host
+			// holding the checkpoint — gated on exact host-facts match.
+			checkpointFacts = checkpointFactsOf(record.data)
 			h, live := m.handles[sandboxID]
 			// Reclaim-class backends drop the handle at suspend; continuity
 			// is still available via Restore from the checkpoint, and the
@@ -1541,7 +1551,7 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 		UncommittedStateLost: true,
 		LostClasses:          domain.AllVolatileLostClasses,
 	}
-	if err := m.materializeLocked(sb, report); err != nil {
+	if err := m.materializeLocked(sb, report, checkpointFacts); err != nil {
 		return nil, err
 	}
 	// ADR-007: a workspace-only resume bumps the epoch, so this only
@@ -1556,6 +1566,22 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 		return nil, err
 	}
 	return report, nil
+}
+
+// checkpointFactsOf extracts the placement-guard facts (P1.7) a backend
+// recorded in CheckpointData.Metadata at snapshot time; nil when absent
+// (non-VM backends record no facts, and no guard applies).
+func checkpointFactsOf(cp backendinterface.CheckpointData) map[string]string {
+	var facts map[string]string
+	for _, k := range []string{"arch", "kernel_release", "cpu_part"} {
+		if v := cp.Metadata[k]; v != "" {
+			if facts == nil {
+				facts = map[string]string{}
+			}
+			facts[k] = v
+		}
+	}
+	return facts
 }
 
 // resumeWithContinuityLocked completes a checkpoint resume: same

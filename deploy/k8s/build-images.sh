@@ -60,13 +60,19 @@ cp /lib/ld-linux-aarch64.so.1 "$HA/lib/"
 cp /lib/aarch64-linux-gnu/libgcc_s.so.1 /lib/aarch64-linux-gnu/libc.so.6 "$HA/lib/aarch64-linux-gnu/"
 # The backend shells out to coreutils/e2fsprogs for image ops (cp --reflink,
 # mkfs.ext4/debugfs workspace image, e2fsck rootfs prep); ship them plus every
-# shared library ldd reports, since the image is otherwise scratch.
-for bin in cp mkfs.ext4 debugfs e2fsck; do
+# shared library ldd reports, since the image is otherwise scratch. The egress
+# datapath (Batch 1) additionally needs iproute2/iptables for the TAP + egress
+# chains, conntrack-tools for the generation-bump conntrack flush, and procps
+# sysctl for ip_forward / ip_unprivileged_port_start=0 (DNS proxy binds :53).
+for bin in cp mkfs.ext4 debugfs e2fsck conntrack iptables ip sysctl; do
   src="$(command -v "$bin")"
   cp "$src" "$HA/usr/local/bin/"
   ldd "$src" | awk '/=> \// {print $3} /^\// {print $1}' | sort -u |
     while read -r lib; do cp -n "$lib" "$HA/lib/aarch64-linux-gnu/"; done
 done
+# iptables here is xtables-nft-multi: its match/target plugins are dlopen'd
+# from the xtables dir (invisible to ldd), so ship the whole directory.
+cp -r /usr/lib/aarch64-linux-gnu/xtables "$HA/lib/aarch64-linux-gnu/"
 cp "$ARTIFACTS/vmlinux.bin" "$ARTIFACTS/rootfs.ext4" "$HA/opt/sandbox/"
 mkimage host-agentd /host-agentd "$HA"
 

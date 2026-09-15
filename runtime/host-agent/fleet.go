@@ -214,13 +214,24 @@ func (f *Fleet) Create(spec backendinterface.Spec) (backendinterface.Handle, err
 	if mem == 0 {
 		mem = f.DefaultMemory
 	}
-	placement, err := f.sched.Place(scheduler.Request{
+	req := scheduler.Request{
 		SandboxID:      spec.SandboxID,
 		EnvironmentID:  spec.EnvironmentID,
 		WorkspaceID:    spec.WorkspaceID,
 		MemoryRequired: mem,
 		Priority:       spec.Priority,
-	}, views)
+	}
+	// P1.7: a create materializing a checkpoint restore carries the
+	// checkpoint's host facts — the locality bonus only counts on hosts
+	// whose facts match exactly (a mismatched host could not restore it
+	// anyway, ADR-001 P0.4 validation).
+	if len(spec.CheckpointFacts) > 0 {
+		req.CheckpointGuard = &scheduler.Guard{
+			KernelRelease: spec.CheckpointFacts["kernel_release"],
+			CPUPart:       spec.CheckpointFacts["cpu_part"],
+		}
+	}
+	placement, err := f.sched.Place(req, views)
 	if err != nil {
 		f.capacityFailures++
 		f.mu.Unlock()

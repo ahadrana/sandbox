@@ -14,6 +14,7 @@ import (
 	environmentbuilder "github.com/agent-sandbox/platform/environment-builder"
 	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
 	hostagent "github.com/agent-sandbox/platform/runtime/host-agent"
+	"github.com/agent-sandbox/platform/runtime/hostfacts"
 	localbackend "github.com/agent-sandbox/platform/runtime/local-backend"
 	"github.com/agent-sandbox/platform/workspace"
 )
@@ -630,5 +631,61 @@ func TestFirecrackerHostAgent(t *testing.T) {
 	}
 	if v := agent.View(); v.UsedSlots != 0 || v.UsedMemory != 0 {
 		t.Fatalf("capacity after terminate = %d slots/%d mem, want 0/0", v.UsedSlots, v.UsedMemory)
+	}
+}
+
+// P1.7 plumbing: a create materializing a checkpoint restore carries the
+// checkpoint's host facts (Spec.CheckpointFacts ← CheckpointData.Metadata
+// via the manager); the fleet grants the checkpoint-locality bonus only on
+// an exact fact match.
+func TestRestorePlacementGuard(t *testing.T) {
+	fs := newFleetSystem(t, 2, 4)
+	wsID := createWSForTest(t, fs)
+	spec := func(incID string, facts map[string]string) backendinterface.Spec {
+		return backendinterface.Spec{
+			SandboxID: "sb-guard", IncarnationID: incID, Epoch: 1,
+			WorkspaceID: wsID, WorkspaceGeneration: 1, MemoryBytes: 64,
+			CheckpointFacts: facts,
+		}
+	}
+	// Boot an incarnation and pause it: its host then holds the only
+	// "cached checkpoint" for sb-guard.
+	h1, err := fs.fleet.Create(spec("inc-g1", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.fleet.Start(h1); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.fleet.Pause(h1); err != nil {
+		t.Fatal(err)
+	}
+	cpHost, _, ok := fs.fleet.PlacementOf("inc-g1")
+	if !ok {
+		t.Fatal("no placement for inc-g1")
+	}
+	facts := hostfacts.Current()
+	matching := map[string]string{"arch": facts.Arch, "kernel_release": facts.KernelRelease, "cpu_part": facts.CPUPart}
+	mismatching := map[string]string{"arch": facts.Arch, "kernel_release": "0.0.0-nonexistent", "cpu_part": facts.CPUPart}
+	create := func(incID string, facts map[string]string) string {
+		t.Helper()
+		if _, err := fs.fleet.Create(spec(incID, facts)); err != nil {
+			t.Fatal(err)
+		}
+		host, _, _ := fs.fleet.PlacementOf(incID)
+		return host
+	}
+	// Matching guard: the checkpoint-holding host wins on the bonus.
+	if got := create("inc-g2", matching); got != cpHost {
+		t.Fatalf("matching guard placed on %q, want checkpoint host %q", got, cpHost)
+	}
+	// Nil guard (no restore in play): the bonus still applies (legacy
+	// semantics) — the checkpoint host wins again.
+	if got := create("inc-g3", nil); got != cpHost {
+		t.Fatalf("nil guard placed on %q, want checkpoint host %q (bonus unconditional)", got, cpHost)
+	}
+	// Mismatching guard: NO bonus — the fuller host wins instead.
+	if got := create("inc-g4", mismatching); got == cpHost {
+		t.Fatalf("mismatching guard still earned the checkpoint-locality bonus (host %q)", got)
 	}
 }

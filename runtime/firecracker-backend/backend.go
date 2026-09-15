@@ -894,6 +894,73 @@ func (b *Backend) gcSnapshots(incarnationID string) {
 	}
 }
 
+// gcToolsImages deletes content-addressed tools images (P0.3) that are no
+// longer referenced: an image is retained iff a LIVE incarnation uses it
+// or ANY retained snapshot link's meta records its sha256
+// (SupervisorSHA256 — chain links are covered because every link carries
+// its own package facts, ADR-006 CI-4). Saved VMM state references the
+// image path, so deleting a referenced image would break restore (typed
+// tools_image error at validation); only fully unreferenced images are
+// collected. Orphaned .tmp build artifacts are always removed.
+func (b *Backend) gcToolsImages() {
+	if b.cfg.GuestSupervisorBin == "" {
+		return
+	}
+	toolsDir := filepath.Join(b.cfg.Root, "tools")
+	entries, err := os.ReadDir(toolsDir)
+	if err != nil {
+		return
+	}
+	referenced := map[string]bool{}
+	b.mu.Lock()
+	for _, inc := range b.incs {
+		if !inc.dead && inc.toolsSHA != "" {
+			referenced[inc.toolsSHA] = true
+		}
+	}
+	b.mu.Unlock()
+	snapsRoot := filepath.Join(b.cfg.Root, "snapshots")
+	incDirs, err := os.ReadDir(snapsRoot)
+	if err == nil {
+		for _, incDir := range incDirs {
+			if !incDir.IsDir() {
+				continue
+			}
+			snaps, err := os.ReadDir(filepath.Join(snapsRoot, incDir.Name()))
+			if err != nil {
+				continue
+			}
+			for _, s := range snaps {
+				if !s.IsDir() {
+					continue
+				}
+				data, err := os.ReadFile(filepath.Join(snapsRoot, incDir.Name(), s.Name(), "meta.json"))
+				if err != nil {
+					continue
+				}
+				var meta snapshotMeta
+				if json.Unmarshal(data, &meta) == nil && meta.SupervisorSHA256 != "" {
+					referenced[meta.SupervisorSHA256] = true
+				}
+			}
+		}
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, ".tmp") {
+			os.Remove(filepath.Join(toolsDir, name)) // crashed build leftover
+			continue
+		}
+		if !strings.HasPrefix(name, "tools-") || !strings.HasSuffix(name, ".ext4") {
+			continue
+		}
+		sha := strings.TrimSuffix(strings.TrimPrefix(name, "tools-"), ".ext4")
+		if !referenced[sha] {
+			os.Remove(filepath.Join(toolsDir, name))
+		}
+	}
+}
+
 // Snapshot captures a full VM checkpoint: the VM is paused if running, then
 // memory + vCPU state plus reflink copies of both drives are stored under
 // <root>/snapshots/<incarnation>/<ts>, surviving Terminate of the source VM.
@@ -1029,6 +1096,7 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 	inc.chainDepth = meta.Depth
 	b.mu.Unlock()
 	b.gcSnapshots(inc.id)
+	b.gcToolsImages()
 	b.mu.Lock()
 	files := map[string]string{}
 	for k, v := range inc.wsMirror {
