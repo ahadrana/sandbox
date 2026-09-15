@@ -1544,6 +1544,9 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 	if err := m.materializeLocked(sb, report); err != nil {
 		return nil, err
 	}
+	// ADR-007: a workspace-only resume bumps the epoch, so this only
+	// reactivates bindings whose fence still matches (normally none).
+	m.reactivateBindingsLocked(sb)
 	m.emit(sb, sb.SandboxID, domain.EventSandboxResumed, map[string]any{
 		"continuity":           "workspace_only",
 		"execution_epoch":      sb.ExecutionEpoch,
@@ -1567,6 +1570,10 @@ func (m *Manager) resumeWithContinuityLocked(sb *domain.Sandbox, record checkpoi
 	if err := m.transition(sb, domain.SandboxRunning); err != nil {
 		return nil, err
 	}
+	// ADR-007: traffic-triggered resume must make endpoints reachable
+	// again — suspended bindings return to ACTIVE (continuity resume keeps
+	// the epoch, so their fence still matches).
+	m.reactivateBindingsLocked(sb)
 	m.emit(sb, sb.SandboxID, domain.EventSandboxResumed, map[string]any{
 		"continuity":           "execution_state",
 		"checkpoint_id":        record.rec.CheckpointID,
@@ -1666,6 +1673,19 @@ func (m *Manager) unbindLocked(b *domain.EndpointBinding, reason string) error {
 		"reason":     reason,
 	})
 	return nil
+}
+
+// reactivateBindingsLocked returns the sandbox's SUSPENDED bindings to
+// ACTIVE when their execution-epoch fence still matches (ADR-007). Suspend
+// marks bindings SUSPENDED; without reactivation a resumed sandbox would
+// stay unreachable and a traffic-triggered resume would loop.
+func (m *Manager) reactivateBindingsLocked(sb *domain.Sandbox) {
+	for _, b := range m.bindings {
+		if b.SandboxID == sb.SandboxID && b.State == domain.EndpointSuspended && b.ExecutionEpoch == sb.ExecutionEpoch {
+			b.State = domain.EndpointActive
+			m.tx.Bindings = append(m.tx.Bindings, b)
+		}
+	}
 }
 
 // BindingView is the network.BindingSource implementation for the gateway.
