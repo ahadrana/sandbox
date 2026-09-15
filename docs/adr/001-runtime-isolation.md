@@ -109,18 +109,33 @@ conformance assertions were not weakened — the difference is declared
   both FORWARD and INPUT); the chain jump itself also carries the source
   match. **IPv6:** disabled in-guest via sysctl AND all tap-ingress IPv6
   dropped host-side in a per-incarnation ip6tables DROP chain (host IPv6
-  forwarding stays off). DNS: the base rootfs ships an empty resolv.conf;
-  the guest unit points it at a public resolver, so DNS is ordinary egress
-  subject to the same policy. **Hostname policy entries** (non-IP/CIDR
-  allow/deny entries) are resolved through DNS at chain setup and
-  re-resolved every `Config.ReResolveInterval` (default 60s) with an
-  atomic chain swap (build tmp chain, retarget the FORWARD/INPUT jumps,
-  rename) — a failure keeps the old rules. Caveat: re-resolution is
-  periodic, not per-connection, so a hostname whose DNS answer changes
-  between re-resolve ticks is enforced at its LAST resolved addresses;
-  DNS answers are also attacker-influenceable in principle. Security-
-  sensitive denies (e.g. blocking a known-bad destination) should use
-  IP/CIDR entries, not hostnames. With networking off, no NIC exists at
+  forwarding stays off). **DNS learning proxy:** the guest resolv.conf
+  points at a per-incarnation DNS proxy on the TAP host address; every
+  query name is gated through `network.EvaluateEgress` (metadata/cluster
+  names always NXDOMAIN, denied names NXDOMAIN + audit line), allowed
+  queries forward upstream (host resolver or `Config.DNSUpstream`;
+  truncated UDP retried over TCP, upstream failure → SERVFAIL), and A
+  answers install (IP,TTL) /32 allow entries for that incarnation only —
+  reaped on TTL expiry (`Config.DNSMinTTL` floor, `Config.DNSMaxLearned`
+  cap, oldest evicted). **Hostname policy entries are DNS-gate entries
+  only**: they are never resolved at chain-build time (the FM4 periodic
+  re-resolver is superseded and removed). A guest hardcoding its own
+  resolver bypasses name learning — under default-deny that DNS traffic is
+  dropped like any other non-policy egress (fail-closed by omission).
+  **Policy generations:** the egress chain name carries a generation
+  (`FC-EGR-<slot>-g<N>`); `Backend.SetEgressPolicy` (transactional — a
+  failed install restores the old policy/generation) and snapshot restore
+  (generation recorded in snapshot metadata, +1 on restore) bump it and
+  flush the guest's conntrack state (`conntrack -D -s <ip>`, best-effort:
+  the stateless rules already re-evaluate every packet). Current
+  generation, learned-entry count, and denied-DNS counter are exposed via
+  `Backend.EgressStatus`. **Atomic fail-closed updates:** every chain
+  installation (initial setup, learned-entry batches via the coalescing
+  sync loop, generation swaps) builds a scratch `FC-TMP-*` chain, verifies
+  each rule with `iptables -C`, retargets the FORWARD/INPUT jumps, then
+  deletes the old chain — a mid-install failure leaves the old complete
+  chain (or aborts initial setup, failing Start), never a half-built
+  policy. With networking off, no NIC exists at
   all (fail-closed) and `NetworkIsolated` is declared false.
 - **Snapshot GC.** Snapshots are per-incarnation timestamped dirs;
   `MaxSnapshotsPerIncarnation` (default 3) GCs oldest;

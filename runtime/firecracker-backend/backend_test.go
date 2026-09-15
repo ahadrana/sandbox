@@ -1526,22 +1526,16 @@ func TestCrashRecoverySweep(t *testing.T) {
 	}
 }
 
-// FM4: hostname policy entries are re-resolved periodically and the chain
-// swapped atomically — after several ticks the resolved rules are intact
-// and no tmp chain leaks.
-func TestHostnamePolicyReResolve(t *testing.T) {
-	cfg := testConfig(t)
-	cfg.GuestSupervisorBin = buildGuestSupervisor(t)
-	cfg.Networking = true
-	cfg.ReResolveInterval = time.Second
-	b, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { b.Close() })
-	h, err := b.Create(egressSpec("inc-reresolve", network.EgressPolicy{
-		DefaultAllow: true,
-		Deny:         []string{"localhost"},
+// P0.2: hostname policy entries are DNS-gated by the per-incarnation proxy.
+// With default-deny + an allow-by-NAME entry, the guest resolves and reaches
+// the named destination (a learned /32 appears in the chain); a name NOT in
+// the policy gets NXDOMAIN and is unreachable; metadata/cluster names are
+// always NXDOMAIN.
+func TestDNSLearningEgress(t *testing.T) {
+	b := newNetBackend(t)
+	h, err := b.Create(egressSpec("inc-dnslearn", network.EgressPolicy{
+		DefaultAllow: false,
+		Allow:        []string{"example.com"},
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -1549,38 +1543,242 @@ func TestHostnamePolicyReResolve(t *testing.T) {
 	if err := b.Start(h); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	b.mu.Lock()
-	ns := b.incs["inc-reresolve"].net
-	b.mu.Unlock()
-	if ns == nil {
-		t.Fatal("no network state")
+	defer b.Terminate(h)
+
+	// Allowed name resolves through the TAP proxy and connects.
+	if rc := curl(t, b, h, "d1", "http://example.com/", 15); rc != 0 {
+		t.Fatalf("curl example.com under name-allow policy: exit %d", rc)
 	}
-	chainHas := func() (denyLocal, tmpLeaked bool) {
-		out, err := sudo("iptables", "-S", ns.chain).CombinedOutput()
-		if err != nil {
-			return false, false
-		}
-		denyLocal = strings.Contains(string(out), "127.0.0.1")
-		_, tmpErr := sudo("iptables", "-S", ns.chain+".tmp").CombinedOutput()
-		tmpLeaked = tmpErr == nil
-		return denyLocal, tmpLeaked
+	// The chain carries a learned /32 allow and the generation-1 name.
+	st, err := b.EgressStatus(h)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if deny, _ := chainHas(); !deny {
-		t.Fatal("localhost deny not resolved at setup")
+	if st.Generation != 1 || !strings.HasSuffix(st.Chain, "-g1") {
+		t.Fatalf("generation/chain = %d/%s, want 1/*-g1", st.Generation, st.Chain)
 	}
-	// Let several re-resolve ticks run; the swap must keep rules intact.
-	time.Sleep(3500 * time.Millisecond)
-	deny, tmp := chainHas()
-	if !deny {
-		t.Fatal("localhost deny lost after re-resolve swap")
+	if st.LearnedEntries == 0 {
+		t.Fatal("no DNS-learned entries after example.com query")
 	}
-	if tmp {
-		t.Fatal("tmp chain leaked after re-resolve swap")
+	out, err := sudo("iptables", "-S", st.Chain).CombinedOutput()
+	if err != nil {
+		t.Fatalf("iptables -S %s: %v", st.Chain, err)
 	}
-	// The jump still targets the real chain.
+	if !strings.Contains(string(out), "/32 -j ACCEPT") {
+		t.Fatalf("no learned /32 ACCEPT in chain:\n%s", out)
+	}
+
+	// Denied-by-omission name: NXDOMAIN -> curl cannot resolve.
+	res := execOp(t, b, h, "d2", "curl -s --max-time 8 -o /dev/null http://example.org/")
+	if res.ExitCode == 0 {
+		t.Fatal("example.org reachable though not in policy")
+	}
+	// Metadata/cluster name is always denied, even though it is not a
+	// policy entry at all.
+	res = execOp(t, b, h, "d3", "curl -s --max-time 8 -o /dev/null http://kubernetes.default.svc/")
+	if res.ExitCode == 0 {
+		t.Fatal("kubernetes.default.svc resolved/reachable")
+	}
+	st, err = b.EgressStatus(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.DNSDenied < 2 {
+		t.Fatalf("DNSDenied = %d, want >= 2", st.DNSDenied)
+	}
+}
+
+// P0.1: changing the policy on a live incarnation bumps the generation
+// (visible in the chain name), kills established flows to newly denied
+// destinations, and invokes the conntrack flush.
+func TestPolicyGenerationChange(t *testing.T) {
+	b := newNetBackend(t)
+	ext := uplinkIP(t)
+	hostServer(t, ext)
+	// A second server whose /hang never answers promptly, so a flow is
+	// ESTABLISHED (and stuck) when the policy changes under it.
+	hangLn, err := net.Listen("tcp", ext+":18081")
+	if err != nil {
+		t.Fatalf("listen hang server: %v", err)
+	}
+	hangSrv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(30 * time.Second)
+		fmt.Fprint(w, "late")
+	})}
+	go hangSrv.Serve(hangLn)
+	t.Cleanup(func() { hangSrv.Close() })
+	h, err := b.Create(egressSpec("inc-gen", network.EgressPolicy{DefaultAllow: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Terminate(h)
+	if rc := curl(t, b, h, "g1", "http://"+ext+":18080/ok", 5); rc != 0 {
+		t.Fatalf("pre-change curl: %d", rc)
+	}
+
+	flushes := 0
+	old := flushGuestConntrack
+	flushGuestConntrack = func(ip string) { flushes++; old(ip) }
+	defer func() { flushGuestConntrack = old }()
+
+	// An established flow: a hanging request started before the change.
+	if err := b.Exec(h, "g2", domain.Operation{Command: "curl -s --max-time 10 -o /dev/null http://" + ext + ":18081/hang"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond) // let the connection establish
+
+	if err := b.SetEgressPolicy(h, network.EgressPolicy{DefaultAllow: true, Deny: []string{ext}}); err != nil {
+		t.Fatalf("SetEgressPolicy: %v", err)
+	}
+	st, err := b.EgressStatus(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Generation != 2 || !strings.HasSuffix(st.Chain, "-g2") {
+		t.Fatalf("generation/chain after change = %d/%s, want 2/*-g2", st.Generation, st.Chain)
+	}
 	out, err := sudo("iptables", "-S", "FORWARD").CombinedOutput()
-	if err != nil || !strings.Contains(string(out), "-j "+ns.chain) {
-		t.Fatalf("FORWARD jump missing after swaps: %v %s", err, out)
+	if err != nil || !strings.Contains(string(out), "-j "+st.Chain) {
+		t.Fatalf("FORWARD jump not at gen-2 chain: %v %s", err, out)
+	}
+	if flushes == 0 {
+		t.Fatal("conntrack flush not invoked on policy change")
+	}
+	// The established flow dies (packets hit the new stateless DROP).
+	res, err := b.WaitExecution(h, "g2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatal("established flow survived policy change")
+	}
+	// New connections fail too.
+	if rc := curl(t, b, h, "g3", "http://"+ext+":18080/ok", 3); rc == 0 {
+		t.Fatal("denied destination reachable after policy change")
+	}
+}
+
+// P0.1: snapshot restore continues the generation (+1) so pre-restore
+// flows are invalidated; the flush runs again.
+func TestSnapshotRestoreBumpsGeneration(t *testing.T) {
+	b := newNetBackend(t)
+	h, err := b.Create(egressSpec("inc-genrestore", network.EgressPolicy{DefaultAllow: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	flushes := 0
+	old := flushGuestConntrack
+	flushGuestConntrack = func(ip string) { flushes++; old(ip) }
+	defer func() { flushGuestConntrack = old }()
+
+	cp, err := b.Snapshot(h)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	h2, err := b.Restore(cp)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	defer b.Terminate(h2)
+	st, err := b.EgressStatus(h2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Generation != 2 || !strings.HasSuffix(st.Chain, "-g2") {
+		t.Fatalf("generation/chain after restore = %d/%s, want 2/*-g2", st.Generation, st.Chain)
+	}
+	if flushes == 0 {
+		t.Fatal("conntrack flush not invoked on restore")
+	}
+	// The restored VM is fully networked.
+	if rc := curl(t, b, h2, "r1", "http://example.com/", 15); rc != 0 {
+		t.Fatalf("curl after restore: %d", rc)
+	}
+}
+
+// P0.5: a fault injected mid-chain-install leaves the old chain fully
+// intact and no FC-TMP scratch chains behind; after the fault clears the
+// swap completes. No VM boot needed.
+func TestChainInstallFaultAtomicity(t *testing.T) {
+	b := newNetBackend(t)
+	ext := "192.0.2.1"
+	inc := &incarnation{
+		id:   "inc-atomic",
+		spec: egressSpec("inc-atomic", network.EgressPolicy{DefaultAllow: false, Allow: []string{ext}}),
+		ops:  map[string]domain.Operation{},
+	}
+	b.mu.Lock()
+	b.incs[inc.id] = inc
+	b.mu.Unlock()
+	if err := b.allocateNetworkingLocked(inc, preferredSlot(inc.id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.setupNetworking(inc); err != nil {
+		t.Fatal(err)
+	}
+	defer b.teardownNetworking(inc)
+	ns := inc.net
+
+	chainDump := func(chain string) string {
+		out, err := sudo("iptables", "-S", chain).CombinedOutput()
+		if err != nil {
+			t.Fatalf("iptables -S %s: %v", chain, err)
+		}
+		return string(out)
+	}
+	tmpLeftovers := func() bool {
+		out, err := sudo("iptables", "-S").CombinedOutput()
+		if err != nil {
+			t.Fatalf("iptables -S: %v", err)
+		}
+		return strings.Contains(string(out), tmpChainPfx)
+	}
+
+	ns.mu.Lock()
+	genChain := ns.chain
+	ns.mu.Unlock()
+	before := chainDump(genChain)
+
+	for _, stage := range []string{"verify", "swap"} {
+		chainInstallFault = func(s string) error {
+			if s == stage {
+				return fmt.Errorf("injected %s failure", s)
+			}
+			return nil
+		}
+		err := b.SetEgressPolicy(backendinterface.Handle{IncarnationID: inc.id},
+			network.EgressPolicy{DefaultAllow: false, Allow: []string{ext, "192.0.2.2"}})
+		chainInstallFault = nil
+		if err == nil {
+			t.Fatalf("stage %s: SetEgressPolicy succeeded despite fault", stage)
+		}
+		if got := chainDump(genChain); got != before {
+			t.Fatalf("stage %s: old chain mutated by failed install:\n%s", stage, got)
+		}
+		if tmpLeftovers() {
+			t.Fatalf("stage %s: FC-TMP scratch chain leaked", stage)
+		}
+	}
+	// Recovery: the fault cleared, the swap completes and bumps the gen.
+	if err := b.SetEgressPolicy(backendinterface.Handle{IncarnationID: inc.id},
+		network.EgressPolicy{DefaultAllow: false, Allow: []string{ext, "192.0.2.2"}}); err != nil {
+		t.Fatalf("SetEgressPolicy after fault cleared: %v", err)
+	}
+	st, err := b.EgressStatus(backendinterface.Handle{IncarnationID: inc.id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Generation != 2 {
+		t.Fatalf("generation = %d after recovery, want 2", st.Generation)
+	}
+	if tmpLeftovers() {
+		t.Fatal("FC-TMP scratch chain leaked after recovery")
 	}
 }
 

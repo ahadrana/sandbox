@@ -43,12 +43,28 @@
 //   - Networking (stage 4, Config.Networking): each incarnation gets a
 //     deterministic TAP device and /30 pair in 192.168.0.0/16, host NAT
 //     (MASQUERADE via the default uplink, ip_forward enabled once), and a
-//     per-incarnation iptables FORWARD chain enforcing the
+//     per-incarnation iptables egress chain enforcing the
 //     network.EgressPolicy carried in Spec.Env["AGENT_SANDBOX_EGRESS"] —
 //     169.254.169.254 is always dropped first, then deny entries, then
 //     allows, with a final DROP when DefaultAllow is false. With Networking
 //     off no NIC is attached at all and NetworkIsolated is declared false.
 //     Requires passwordless sudo and ip/iptables on the host.
+//
+//   - Egress generations, DNS learning, atomic updates (stage 4.1,
+//     CubeSandbox P0.1/P0.2/P0.5 borrows): the egress chain name carries a
+//     policy generation (FC-EGR-<slot>-g<N>); SetEgressPolicy and snapshot
+//     restore bump it and flush the guest's conntrack state. The guest's
+//     resolver is a per-incarnation DNS proxy on the TAP host address:
+//     names are gated through network.EvaluateEgress (metadata/cluster
+//     always denied → NXDOMAIN), allowed answers install (IP,TTL) /32
+//     allow entries reaped on TTL expiry; hostname policy entries are
+//     DNS-gate entries only — never resolved at chain-build time (the FM4
+//     periodic re-resolver is superseded and removed). Every chain
+//     installation builds a scratch FC-TMP-* chain, verifies each rule
+//     with -C, and atomically retargets the jumps; a failure keeps the old
+//     complete chain. A guest hardcoding its own resolver bypasses name
+//     learning — under default-deny that traffic is dropped like any other
+//     non-policy egress (fail-closed by omission).
 //
 // Readiness: Create/Start wait for the API socket to answer and for the
 // serial console log to reach the login prompt (boot) or the workspace

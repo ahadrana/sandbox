@@ -78,10 +78,16 @@ type Config struct {
 	// SupervisorPort is the vsock port the in-guest supervisor listens on;
 	// default 5000.
 	SupervisorPort uint32
-	// ReResolveInterval is how often hostname-based egress policy entries
-	// are re-resolved and the incarnation's chain atomically swapped
-	// (FM4); default 60s, <=0 disables re-resolution.
-	ReResolveInterval time.Duration
+	// DNSUpstream is the resolver the per-incarnation DNS-learning proxy
+	// forwards allowed queries to ("host" or "host:port"); default: the
+	// first nameserver in /etc/resolv.conf, else 8.8.8.8.
+	DNSUpstream string
+	// DNSMinTTL clamps learned (IP,TTL) allow entries to a minimum
+	// lifetime, avoiding chain churn on sub-second TTLs; default 5s.
+	DNSMinTTL time.Duration
+	// DNSMaxLearned caps learned allow entries per incarnation (oldest
+	// evicted); default 1024.
+	DNSMaxLearned int
 }
 
 func (c *Config) withDefaults() Config {
@@ -113,8 +119,11 @@ func (c *Config) withDefaults() Config {
 	if out.MaxSnapshotsPerIncarnation == 0 {
 		out.MaxSnapshotsPerIncarnation = 3
 	}
-	if out.ReResolveInterval == 0 {
-		out.ReResolveInterval = 60 * time.Second
+	if out.DNSMinTTL == 0 {
+		out.DNSMinTTL = 5 * time.Second
+	}
+	if out.DNSMaxLearned == 0 {
+		out.DNSMaxLearned = 1024
 	}
 	return out
 }
@@ -599,6 +608,10 @@ type snapshotMeta struct {
 	// NetSlot records the network slot baked into the snapshot's net
 	// device config (TAP name/MAC/guest IP); restore must reuse it.
 	NetSlot *int `json:"net_slot,omitempty"`
+	// NetGeneration records the egress policy generation at snapshot time;
+	// restore bumps it (generation+1, conntrack flush) so pre-restore
+	// flows cannot continue under the old policy (P0.1).
+	NetGeneration *int `json:"net_generation,omitempty"`
 }
 
 func (b *Backend) snapshotDir(incarnationID string) string {
@@ -711,6 +724,10 @@ func (b *Backend) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoi
 	if inc.net != nil {
 		slot := inc.net.slot
 		meta.NetSlot = &slot
+		inc.net.mu.Lock()
+		gen := inc.net.generation
+		inc.net.mu.Unlock()
+		meta.NetGeneration = &gen
 	}
 	b.mu.Unlock()
 	metaBytes, err := json.Marshal(meta)
@@ -800,7 +817,10 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 
 	// Networking: reallocate the slot recorded in the snapshot metadata so
 	// the TAP name/MAC/guest IP match the net device config the snapshot
-	// restores; the policy comes from the restored spec.
+	// restores; the policy comes from the restored spec. The egress
+	// generation CONTINUES from the snapshot's value (+1 in
+	// setupNetworking, plus a conntrack flush), so flows established
+	// before the restore are invalidated (P0.1).
 	if b.cfg.Networking {
 		b.teardownNetworking(inc)
 		preferred := preferredSlot(inc.id)
@@ -809,6 +829,9 @@ func (b *Backend) Restore(cp backendinterface.CheckpointData) (backendinterface.
 		}
 		b.mu.Lock()
 		err := b.allocateNetworkingLocked(inc, preferred)
+		if err == nil && meta.NetGeneration != nil {
+			inc.net.generation = *meta.NetGeneration
+		}
 		b.mu.Unlock()
 		if err != nil {
 			return backendinterface.Handle{}, err

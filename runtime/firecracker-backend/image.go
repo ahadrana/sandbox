@@ -187,6 +187,8 @@ func injectGuestAgent(rootfsPath, binPath, incarnationID string, port uint32) er
 }
 
 // injectNetworkUnit writes the guest NIC bring-up unit into a rootfs image.
+// The guest resolver is the TAP host address: the incarnation's
+// DNS-learning proxy listens there.
 func injectNetworkUnit(rootfsPath, guestIP, hostIP string) error {
 	tmp, err := os.MkdirTemp("", "fc-net-")
 	if err != nil {
@@ -194,7 +196,7 @@ func injectNetworkUnit(rootfsPath, guestIP, hostIP string) error {
 	}
 	defer os.RemoveAll(tmp)
 	unit := filepath.Join(tmp, "unit")
-	if err := os.WriteFile(unit, []byte(fmt.Sprintf(networkUnitTemplate, guestIP, hostIP)), 0o644); err != nil {
+	if err := os.WriteFile(unit, []byte(fmt.Sprintf(networkUnitTemplate, hostIP, guestIP, hostIP)), 0o644); err != nil {
 		return err
 	}
 	script := filepath.Join(tmp, "cmds")
