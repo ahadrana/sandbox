@@ -176,6 +176,35 @@ func mustGetSandbox2(t *testing.T, mgr *sandboxmanager.Manager, id string) *doma
 	return sb
 }
 
+// Host-agent pod restart (ADR 005): the agent process comes back with the
+// same host ID but an empty backend (its state dir is pod-local). The fleet
+// must declare the previously placed incarnation lost at re-registration —
+// liveness heartbeats alone resume too fast for the down-tick path.
+func TestHostReregisterDeclaresMissingIncarnationLost(t *testing.T) {
+	fs := newFleetSystem(t, 2, 4)
+	d := agentdriver.New(fs.mgr, "tenant-1", "principal-1", 117)
+	sb, _ := d.CreateSandbox("task-podrestart")
+	mustMaterialize(t, d, sb.SandboxID)
+	hostID := fs.placementHost(t, sb.SandboxID)
+
+	// Fresh agent process, fresh backend: nothing of the old pod survives.
+	freshBackend, err := localbackend.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := hostagent.New(hostID, freshBackend, nil, fs.ws, 1<<20, fs.slots, 16)
+	fs.fleet.RegisterHost(restarted)
+
+	fs.tick(1)
+	cur := mustGetSandbox2(t, fs.mgr, sb.SandboxID)
+	if cur.ObservedState != domain.SandboxFailed {
+		t.Fatalf("sandbox state = %s after agent re-register, want FAILED", cur.ObservedState)
+	}
+	if cur.RuntimeIncarnationID != nil {
+		t.Fatal("dead incarnation still referenced")
+	}
+}
+
 // Cold node: a host with an empty cache materializes correctly, populating
 // its cache on demand from the durable store (INV-023).
 func TestColdNodePlacement(t *testing.T) {

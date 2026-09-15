@@ -1,0 +1,130 @@
+# Sandbox platform on k3s (ADR 005): K8s manages execution-host capacity
+# only — no per-sandbox objects (INV-019). host-agentd is a DaemonSet on the
+# execution node(s); control-planed is a Deployment + ClusterIP.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandbox-system
+---
+# Locked-down identities: the platform never calls the K8s API (placement
+# policy lives in the sandbox scheduler, not in kube-scheduler), so the
+# ServiceAccounts get no Roles at all and no API token.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: host-agent
+  namespace: sandbox-system
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-plane
+  namespace: sandbox-system
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: host-agentd
+  namespace: sandbox-system
+spec:
+  selector:
+    matchLabels:
+      app: host-agentd
+  template:
+    metadata:
+      labels:
+        app: host-agentd
+    spec:
+      serviceAccountName: host-agent
+      # hostNetwork: the firecracker backend manages TAP/iptables on the
+      # host's networking stack (enabled later; FC_NETWORKING stays off in
+      # this dev topology). hostPID is deliberately NOT shared: the backend
+      # tracks VMM processes it spawned itself.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Multi-node: pin to dedicated execution nodes, e.g.
+      #   nodeSelector: {sandbox.io/execution: "true"}
+      #   tolerations for the matching taint.
+      containers:
+        - name: host-agentd
+          image: sandbox/host-agentd:dev
+          imagePullPolicy: Never
+          securityContext:
+            # /dev/kvm, jailer namespaces/chroot/cgroup-v2, and (later)
+            # host TAP/iptables all require full privilege.
+            privileged: true
+          env:
+            - name: TOKEN
+              value: dev-token # DEV ONLY — see deploy/k8s/README.md
+            - name: HOST_ID
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+            - name: HOST_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.hostIP }
+            - name: HOST_URL
+              value: "http://$(HOST_IP):8080"
+            - name: CONTROL_PLANE_URL
+              value: "http://control-planed.sandbox-system.svc.cluster.local:8080"
+            - name: MEM_CAPACITY
+              value: "25769803776" # 24 GiB
+            - name: SLOTS
+              value: "16"
+          volumeMounts:
+            - { name: kvm, mountPath: /dev/kvm }
+            - { name: fc-state, mountPath: /var/lib/sandbox-fc }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+      volumes:
+        - name: kvm
+          hostPath: { path: /dev/kvm, type: CharDevice }
+        # VM state is pod-lifetime: a pod restart loses the microVMs and the
+        # control plane reconciles the affected sandboxes to FAILED
+        # explicitly (see the failure drill in README).
+        - name: fc-state
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-planed
+  namespace: sandbox-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: control-planed
+  template:
+    metadata:
+      labels:
+        app: control-planed
+    spec:
+      serviceAccountName: control-plane
+      containers:
+        - name: control-planed
+          image: sandbox/control-planed:dev
+          imagePullPolicy: Never
+          env:
+            - name: TOKEN
+              value: dev-token # DEV ONLY
+            - name: LISTEN_ADDR
+              value: ":8080"
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 1
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-planed
+  namespace: sandbox-system
+spec:
+  selector:
+    app: control-planed
+  ports:
+    - { port: 8080, targetPort: 8080 }

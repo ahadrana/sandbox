@@ -14,6 +14,37 @@ import (
 // before it is declared lost.
 const heartbeatMissThreshold = 3
 
+// Host is the fleet's view of one runtime host: the full supervision surface
+// the fleet routes through. *HostAgent satisfies it in-process; the control
+// plane daemon substitutes an HTTP client (runtime/host-agent/rpc) for
+// hosts reached across the network — placement, fencing, and loss semantics
+// are identical either way.
+type Host interface {
+	HostID() string
+	IncarnationIDs() []string
+	Create(req CreateRequest) (backendinterface.Handle, error)
+	Terminate(handle backendinterface.Handle) error
+	View() scheduler.HostView
+	Tick()
+	Capabilities() backendinterface.Capabilities
+	Start(handle backendinterface.Handle) error
+	Pause(handle backendinterface.Handle) error
+	Resume(handle backendinterface.Handle) error
+	Snapshot(handle backendinterface.Handle) (backendinterface.CheckpointData, error)
+	Stats(handle backendinterface.Handle) (backendinterface.Stats, error)
+	Exec(handle backendinterface.Handle, executionID string, op domain.Operation) error
+	WaitExecution(handle backendinterface.Handle, executionID string) (supervisor.Result, error)
+	LiveNonBaselineDescendants(handle backendinterface.Handle) int
+	ProcessInventory(handle backendinterface.Handle) ([]supervisor.ProcessInfo, error)
+	TerminateBackground(handle backendinterface.Handle) error
+	LiveDescendants(handle backendinterface.Handle) int
+	WorkspaceFiles(handle backendinterface.Handle) (map[string]string, error)
+	Dirty(handle backendinterface.Handle) bool
+	MarkCommitted(handle backendinterface.Handle)
+	KillRuntime(handle backendinterface.Handle)
+	Alive(handle backendinterface.Handle) bool
+}
+
 // Fleet is the simulated execution fleet: it routes every manager operation
 // through placement and the owning host agent, tracks heartbeats, and
 // declares hosts lost after missed heartbeats. It satisfies the
@@ -25,7 +56,7 @@ type Fleet struct {
 	envs  EnvironmentSource
 	ws    WorkspaceStore
 
-	hosts        map[string]*HostAgent
+	hosts        map[string]Host
 	down         map[string]bool
 	missed       map[string]int
 	lostDeclared map[string]bool
@@ -80,7 +111,7 @@ func (f *Fleet) Recommendation() ScaleRecommendation {
 func NewFleet(clock domain.Clock, envs EnvironmentSource, ws WorkspaceStore) *Fleet {
 	return &Fleet{
 		clock: clock, sched: scheduler.New(), envs: envs, ws: ws,
-		hosts: map[string]*HostAgent{}, down: map[string]bool{},
+		hosts: map[string]Host{}, down: map[string]bool{},
 		missed: map[string]int{}, lostDeclared: map[string]bool{},
 		lastSeen:      map[string]time.Time{},
 		byIncarnation: map[string]string{}, fenceOf: map[string]int64{},
@@ -92,9 +123,14 @@ func NewFleet(clock domain.Clock, envs EnvironmentSource, ws WorkspaceStore) *Fl
 // host. On re-registration, any incarnation the host still runs that the
 // fleet no longer tracks — for example terminated via the fleet while the
 // host was lost — is an orphan: it is scrubbed (terminated) and counted so
-// the compute is owned and accounted again (INV-016).
-func (f *Fleet) RegisterHost(h *HostAgent) {
+// the compute is owned and accounted again (INV-016). Symmetrically, any
+// incarnation the fleet tracked on this host that the re-registering host
+// no longer runs (agent process restarted empty) is declared lost so the
+// manager reconciles it (INV-016: loss is observed, never assumed silent).
+func (f *Fleet) RegisterHost(h Host) {
+	running := map[string]bool{}
 	for _, incID := range h.IncarnationIDs() {
+		running[incID] = true
 		f.mu.Lock()
 		_, known := f.byIncarnation[incID]
 		f.mu.Unlock()
@@ -107,6 +143,13 @@ func (f *Fleet) RegisterHost(h *HostAgent) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for incID, hostID := range f.byIncarnation {
+		if hostID == h.HostID() && !running[incID] {
+			delete(f.byIncarnation, incID)
+			delete(f.fenceOf, incID)
+			f.pendingLost = append(f.pendingLost, incID)
+		}
+	}
 	f.hosts[h.HostID()] = h
 	f.down[h.HostID()] = false
 	f.missed[h.HostID()] = 0
@@ -130,7 +173,7 @@ func (f *Fleet) SimulateHostLoss(hostID string) {
 	f.missed[hostID] = 0
 }
 
-func (f *Fleet) hostOf(handle backendinterface.Handle) (*HostAgent, bool, error) {
+func (f *Fleet) hostOf(handle backendinterface.Handle) (Host, bool, error) {
 	hostID, ok := f.byIncarnation[handle.IncarnationID]
 	if !ok {
 		return nil, false, backendinterface.ErrNotFound

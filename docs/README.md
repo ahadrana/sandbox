@@ -121,7 +121,10 @@ milestone to code:
   conformance tests.
 - **M9 — network + credentials:** `network/`, `credential-broker/`.
 - **M10 — scheduler/fleet:** `control-plane/scheduler/`, placement and
-  fleet conformance tests.
+  fleet conformance tests; plus the real-Kubernetes deployment path:
+  `cmd/control-planed` + `cmd/host-agentd` + `runtime/host-agent/rpc`
+  (HTTP/JSON fleet transport) and `deploy/k8s/` (k3s DaemonSet/Deployment
+  manifests, image build, smoke test) — ADR-005.
 - **M11 — chaos:** runtime-loss and node-loss chaos harness in
   `conformance/`.
 - **M12 — agent integration seam:** `integration/` (tool loop, OpenHands
