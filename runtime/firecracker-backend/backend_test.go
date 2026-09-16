@@ -2317,3 +2317,75 @@ func TestSnapshotChainCorruptionDetected(t *testing.T) {
 		t.Fatalf("typed error = %+v, want field mem_sha256", si)
 	}
 }
+
+// C1 (review): publish hooks match `-m addrtype --dst-type LOCAL` — only
+// traffic destined to the host's own addresses is DNAT'd. Proven two ways:
+// rule inspection, and a real dial from the host to a NON-local destination
+// on the same dport (a second guest's server) which must reach that server,
+// not the published guest.
+func TestPublishMatchesLocalAddrOnly(t *testing.T) {
+	b := newNetBackend(t)
+	ext := uplinkIP(t)
+	h1, err := b.Create(egressSpec("inc-local1", network.EgressPolicy{DefaultAllow: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(h1); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { b.Terminate(h1) })
+	if res := execOp(t, b, h1, "srv", "echo guest-one > /tmp/index.txt && nohup python3 -m http.server 8080 --directory /tmp >/tmp/srv.log 2>&1 & echo spawned"); res.ExitCode != 0 {
+		t.Fatalf("server spawn exit = %d", res.ExitCode)
+	}
+
+	if err := b.PublishPort(h1, 8080, 18097); err != nil {
+		t.Fatalf("PublishPort: %v", err)
+	}
+	// Rule inspection: both hooks are LOCAL-scoped.
+	out, err := exec.Command("sudo", "-n", "iptables", "-t", "nat", "-S").CombinedOutput()
+	if err != nil {
+		t.Fatalf("iptables -S: %v", err)
+	}
+	for _, want := range []string{
+		"-A PREROUTING -m addrtype --dst-type LOCAL -j FC-PUB-",
+		// iptables renders the negated -d before the addrtype module match.
+		"-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j FC-PUB-",
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("nat table missing %q:\n%s", want, out)
+		}
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	get := func(url string) string {
+		t.Helper()
+		for i := 0; i < 20; i++ {
+			resp, err := client.Get(url)
+			if err == nil && resp.StatusCode == 200 {
+				data, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				return string(data)
+			}
+			if i == 19 {
+				t.Logf("GET %s last error: %v", url, err)
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		t.Fatalf("GET %s never returned 200", url)
+		return ""
+	}
+	// The published port on the host's own uplink address reaches guest one.
+	if body := get("http://" + ext + ":18097/index.txt"); !strings.Contains(body, "guest-one") {
+		t.Fatalf("published port served %q, want guest-one", body)
+	}
+	// A host outbound connection to a NON-LOCAL destination on the published
+	// dport is NOT hijacked: 192.0.2.1 (TEST-NET-1, RFC 5737) has no server,
+	// so if the OUTPUT hook DNAT'd the dial into the guest it would return
+	// guest-one's page; the dial must simply fail instead.
+	probe := &http.Client{Timeout: 3 * time.Second}
+	resp, err := probe.Get("http://192.0.2.1:18097/index.txt")
+	if err == nil {
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("non-local dial hijacked by publish: got %q", data)
+	}
+}

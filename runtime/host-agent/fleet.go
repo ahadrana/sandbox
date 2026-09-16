@@ -45,8 +45,8 @@ type Host interface {
 	MarkCommitted(handle backendinterface.Handle)
 	KillRuntime(handle backendinterface.Handle)
 	Alive(handle backendinterface.Handle) bool
-	PublishPort(handle backendinterface.Handle, guestPort, hostPort int) error
-	UnpublishPort(handle backendinterface.Handle, hostPort int) error
+	PublishPort(handle backendinterface.Handle, guestPort, hostPort int, fence int64) error
+	UnpublishPort(handle backendinterface.Handle, hostPort int, fence int64) error
 }
 
 // Fleet is the simulated execution fleet: it routes every manager operation
@@ -301,24 +301,31 @@ func (f *Fleet) Snapshot(h backendinterface.Handle) (backendinterface.Checkpoint
 }
 
 // PublishPort routes an endpoint publish to the incarnation's host
-// (ADR-007 data plane).
+// (ADR-007 data plane), carrying the placement fence the host validates
+// (review H2).
 func (f *Fleet) PublishPort(h backendinterface.Handle, guestPort, hostPort int) error {
+	f.mu.Lock()
 	host, _, err := f.hostOf(h)
+	fence := f.fenceOf[h.IncarnationID]
+	f.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	return host.PublishPort(h, guestPort, hostPort)
+	return host.PublishPort(h, guestPort, hostPort, fence)
 }
 
 // UnpublishPort routes an endpoint unpublish to the incarnation's host; a
 // lost host is cleaned locally (its reboot scrubs the rules) and is not an
 // error.
 func (f *Fleet) UnpublishPort(h backendinterface.Handle, hostPort int) error {
+	f.mu.Lock()
 	host, down, err := f.hostOf(h)
+	fence := f.fenceOf[h.IncarnationID]
+	f.mu.Unlock()
 	if err != nil || down {
 		return nil
 	}
-	return host.UnpublishPort(h, hostPort)
+	return host.UnpublishPort(h, hostPort, fence)
 }
 
 // Restore routes a checkpoint restore to the ORIGIN host (ADR-008):

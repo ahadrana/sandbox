@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	firecrackerbackend "github.com/agent-sandbox/platform/runtime/firecracker-backend"
@@ -38,6 +39,21 @@ func envInt(key string, def int64) int64 {
 		}
 	}
 	return def
+}
+
+// publishDenyPorts is the platform port deny-list for endpoint publishing
+// (review H1): the backend defaults (apiserver 6443, platform dev port
+// 8080, kubelet 10250) plus any comma-separated extras in
+// FC_PUBLISH_DENY_PORTS (e.g. "9090,3000" for site services sharing the
+// node's port space).
+func publishDenyPorts() []int {
+	out := append([]int{}, firecrackerbackend.DefaultPublishDenyPorts...)
+	for _, tok := range strings.Split(os.Getenv("FC_PUBLISH_DENY_PORTS"), ",") {
+		if p, err := strconv.Atoi(strings.TrimSpace(tok)); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // remoteWS resolves committed workspace generations from the control plane
@@ -96,6 +112,7 @@ func main() {
 		JailerBin:          envOr("FC_JAILER", "/usr/local/bin/jailer"),
 		GuestSupervisorBin: envOr("FC_GUEST_SUPERVISOR", "/opt/sandbox/guest-supervisor"),
 		Networking:         os.Getenv("FC_NETWORKING") == "true",
+		PublishDenyPorts:   publishDenyPorts(),
 		BootTimeout:        120 * time.Second,
 		DefaultMemMiB:      256,
 	})

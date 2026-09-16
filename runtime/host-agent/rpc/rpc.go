@@ -36,6 +36,9 @@ type request struct {
 	Operation   *domain.Operation                `json:"operation,omitempty"`
 	GuestPort   int                              `json:"guest_port,omitempty"`
 	HostPort    int                              `json:"host_port,omitempty"`
+	// Fence carries the placement fence for fence-validated ops (publish/
+	// unpublish, review H2).
+	Fence int64 `json:"fence,omitempty"`
 }
 
 // response carries the union of all op results.
@@ -74,6 +77,8 @@ func wireError(err error) string {
 		return "runtime unhealthy"
 	case errors.Is(err, supervisor.ErrNotFound):
 		return "execution not found"
+	case errors.Is(err, backendinterface.ErrPortConflict):
+		return "port conflict"
 	}
 	return err.Error()
 }
@@ -95,6 +100,8 @@ func mapError(msg string) error {
 		return supervisor.ErrUnhealthy
 	case "execution not found":
 		return supervisor.ErrNotFound
+	case "port conflict":
+		return backendinterface.ErrPortConflict
 	}
 	return errors.New(msg)
 }
@@ -179,11 +186,11 @@ func dispatch(h hostagent.Host, req request) (resp response) {
 		}
 		return response{OK: true, Handle: handle}
 	case "publish_port":
-		if err := h.PublishPort(req.Handle, req.GuestPort, req.HostPort); err != nil {
+		if err := h.PublishPort(req.Handle, req.GuestPort, req.HostPort, req.Fence); err != nil {
 			return fail(err)
 		}
 	case "unpublish_port":
-		if err := h.UnpublishPort(req.Handle, req.HostPort); err != nil {
+		if err := h.UnpublishPort(req.Handle, req.HostPort, req.Fence); err != nil {
 			return fail(err)
 		}
 	case "stats":
@@ -369,13 +376,13 @@ func (c *Client) Restore(cp backendinterface.CheckpointData) (backendinterface.H
 	return resp.Handle, nil
 }
 
-func (c *Client) PublishPort(h backendinterface.Handle, guestPort, hostPort int) error {
-	_, err := c.call(request{Op: "publish_port", Handle: h, GuestPort: guestPort, HostPort: hostPort})
+func (c *Client) PublishPort(h backendinterface.Handle, guestPort, hostPort int, fence int64) error {
+	_, err := c.call(request{Op: "publish_port", Handle: h, GuestPort: guestPort, HostPort: hostPort, Fence: fence})
 	return err
 }
 
-func (c *Client) UnpublishPort(h backendinterface.Handle, hostPort int) error {
-	_, err := c.call(request{Op: "unpublish_port", Handle: h, HostPort: hostPort})
+func (c *Client) UnpublishPort(h backendinterface.Handle, hostPort int, fence int64) error {
+	_, err := c.call(request{Op: "unpublish_port", Handle: h, HostPort: hostPort, Fence: fence})
 	return err
 }
 

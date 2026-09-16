@@ -71,8 +71,13 @@ type Config struct {
 	// DeleteSnapshotsOnTerminate also removes the incarnation's snapshots
 	// on Terminate (default false: committed checkpoints survive).
 	DeleteSnapshotsOnTerminate bool
-	BootArgs                   string // default: smoke-tested "console=ttyS0 reboot=k panic=1 pci=off"
-	VCPUs                      int64  // default 1
+	// PublishDenyPorts lists host ports a binding may never publish (review
+	// H1), on top of the fixed <1024 floor. nil means
+	// DefaultPublishDenyPorts (the platform's own service ports); an
+	// explicit non-nil slice replaces the defaults.
+	PublishDenyPorts []int
+	BootArgs         string // default: smoke-tested "console=ttyS0 reboot=k panic=1 pci=off"
+	VCPUs            int64  // default 1
 	// DefaultMemMiB applies when Spec.MemoryBytes is 0; default 256.
 	DefaultMemMiB int64
 	BootTimeout   time.Duration // default 90s

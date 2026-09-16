@@ -250,3 +250,45 @@ func TestRestoreReregistersReclaimedIncarnation(t *testing.T) {
 		t.Fatal("restored incarnation not alive on host")
 	}
 }
+
+// Publish/unpublish enforce route+fence over the wire (review H2), and a
+// port conflict keeps its typed identity across serialization (review L3).
+func TestPublishFenceAndConflictRoundTrip(t *testing.T) {
+	backend, err := localbackend.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := workspace.NewMemory(domain.NewManualClock(testNow), domain.NewIDGen())
+	agent := hostagent.New("host-rpc", backend, nil, ws, 1<<30, 4, 16)
+	agent.ProtectPorts(18080)
+	srv := httptest.NewServer(Handler(agent, "tok"))
+	defer srv.Close()
+	c := NewClient(srv.URL, "tok")
+
+	wsID, gen := commitWS(t, ws, map[string]string{})
+	handle, err := c.Create(hostagent.CreateRequest{
+		SandboxID: "sb-1", IncarnationID: "inc-pub-1", Fence: 1, Epoch: 1, MemoryBytes: 64,
+		WorkspaceID: wsID, WorkspaceGeneration: gen,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Protected port with the RIGHT fence: typed conflict survives the wire.
+	if err := c.PublishPort(handle, 9000, 18080, 1); !errors.Is(err, backendinterface.ErrPortConflict) {
+		t.Fatalf("protected port over rpc: err = %v, want ErrPortConflict", err)
+	}
+	// Stale fence and unknown handle are typed too.
+	if err := c.PublishPort(handle, 9000, 18081, 2); !errors.Is(err, hostagent.ErrStaleFence) {
+		t.Fatalf("stale fence publish over rpc: err = %v", err)
+	}
+	if err := c.PublishPort(backendinterface.Handle{IncarnationID: "inc-nope"}, 9000, 18081, 1); !errors.Is(err, backendinterface.ErrNotFound) {
+		t.Fatalf("unknown handle publish over rpc: err = %v", err)
+	}
+	if err := c.UnpublishPort(handle, 18081, 2); !errors.Is(err, hostagent.ErrStaleFence) {
+		t.Fatalf("stale fence unpublish over rpc: err = %v", err)
+	}
+	// Right fence: unpublish is a no-op (local backend cannot publish).
+	if err := c.UnpublishPort(handle, 18081, 1); err != nil {
+		t.Fatalf("unpublish with current fence: %v", err)
+	}
+}

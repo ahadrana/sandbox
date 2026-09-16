@@ -522,9 +522,21 @@ func (h *HostAgent) Restore(cp backendinterface.CheckpointData) (backendinterfac
 
 // PublishPort exposes a guest TCP port on the host address (ADR-007 data
 // plane) when the backend implements backendinterface.PortPublisher;
-// otherwise honestly unsupported.
-func (h *HostAgent) PublishPort(handle backendinterface.Handle, guestPort, hostPort int) error {
+// otherwise honestly unsupported. Like every other routed op the handle
+// must be registered AND the fence must match the current placement
+// (review H2): a stale control-plane view must not install DNAT the
+// ownership model would reject.
+func (h *HostAgent) PublishPort(handle backendinterface.Handle, guestPort, hostPort int, fence int64) error {
 	h.mu.Lock()
+	rec, ok := h.incarnations[handle.IncarnationID]
+	if !ok {
+		h.mu.Unlock()
+		return backendinterface.ErrNotFound
+	}
+	if fence != rec.fence {
+		h.mu.Unlock()
+		return fmt.Errorf("publish fence %d, current placement fence %d: %w", fence, rec.fence, ErrStaleFence)
+	}
 	protected := h.protectedPorts[hostPort]
 	h.mu.Unlock()
 	if protected {
@@ -537,9 +549,22 @@ func (h *HostAgent) PublishPort(handle backendinterface.Handle, guestPort, hostP
 	return pp.PublishPort(handle, guestPort, hostPort)
 }
 
-// UnpublishPort removes a published host port (no-op when the backend
-// cannot publish — there is nothing to remove).
-func (h *HostAgent) UnpublishPort(handle backendinterface.Handle, hostPort int) error {
+// UnpublishPort removes a published host port under the same route+fence
+// discipline as PublishPort (review H2). An unknown incarnation is a no-op
+// (its teardown already removed the rules); a stale fence is a typed error
+// — the current placement's rules are not a stale view's to remove.
+func (h *HostAgent) UnpublishPort(handle backendinterface.Handle, hostPort int, fence int64) error {
+	h.mu.Lock()
+	rec, ok := h.incarnations[handle.IncarnationID]
+	if !ok {
+		h.mu.Unlock()
+		return nil
+	}
+	if fence != rec.fence {
+		h.mu.Unlock()
+		return fmt.Errorf("unpublish fence %d, current placement fence %d: %w", fence, rec.fence, ErrStaleFence)
+	}
+	h.mu.Unlock()
 	pp, ok := h.backend.(backendinterface.PortPublisher)
 	if !ok {
 		return nil

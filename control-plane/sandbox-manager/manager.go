@@ -128,6 +128,11 @@ type Manager struct {
 	enforceFlags   map[string]map[string]bool
 	checkpoints    map[string]checkpointRecord // checkpointID -> record
 	bindings       map[string]*domain.EndpointBinding
+	// publishRetries tracks ACTIVE bindings whose data-plane publish failed
+	// (review L4): bindingID -> attempts so far; retried once per Tick up to
+	// maxPublishRetries, then given up (the EndpointPublishFailed events
+	// already told the operator).
+	publishRetries map[string]int
 	egressPolicies map[string]network.EgressPolicy
 	egressAudit    *network.AuditLog
 	quotas         map[string]domain.Quota
@@ -226,6 +231,7 @@ func New(clock *domain.ManualClock, ids *domain.IDGen, ws workspace.Store, rt Ru
 		leases:         map[string]*domain.Lease{},
 		checkpoints:    map[string]checkpointRecord{},
 		bindings:       map[string]*domain.EndpointBinding{},
+		publishRetries: map[string]int{},
 		quotas:         map[string]domain.Quota{},
 		metrics:        managerMetrics{eventsByType: map[domain.EventType]int64{}},
 		egressPolicies: map[string]network.EgressPolicy{"default": {DefaultAllow: true}},
@@ -699,6 +705,7 @@ func (m *Manager) publishActiveBindingsLocked(sb *domain.Sandbox) {
 			continue
 		}
 		if err := m.publishBinding(b); err != nil {
+			m.publishRetries[b.BindingID] = 0
 			m.emit(sb, sb.SandboxID, domain.EventEndpointPublishFailed, map[string]any{
 				"binding_id": b.BindingID,
 				"error":      err.Error(),
@@ -706,6 +713,10 @@ func (m *Manager) publishActiveBindingsLocked(sb *domain.Sandbox) {
 		}
 	}
 }
+
+// maxPublishRetries bounds the Tick-driven republish of ACTIVE-but-
+// unpublished bindings (review L4): one attempt per Tick, never a hammer.
+const maxPublishRetries = 5
 
 // checkQuotaLocked enforces tenant admission quotas at materialization:
 // exceeding a limit is an explicit QuotaExceededError plus event, never
@@ -1723,6 +1734,15 @@ func (m *Manager) CreateEndpointBinding(req api.CreateEndpointBindingRequest) (*
 	if err := authorizeTenant(sb, req.TenantID); err != nil {
 		return nil, err
 	}
+	// Reject never-routable bindings at creation (review M3): an invalid
+	// port or negative TTL would sit ACTIVE forever with the gateway
+	// denying every route.
+	if req.TargetPort < 1 || req.TargetPort > 65535 {
+		return nil, fmt.Errorf("invalid target port %d", req.TargetPort)
+	}
+	if req.TTL < 0 {
+		return nil, fmt.Errorf("invalid negative TTL %s", req.TTL)
+	}
 	b := &domain.EndpointBinding{
 		BindingID:      m.ids.Next("bind"),
 		TenantID:       sb.TenantID,
@@ -1750,6 +1770,11 @@ func (m *Manager) CreateEndpointBinding(req api.CreateEndpointBindingRequest) (*
 		"execution_epoch": b.ExecutionEpoch,
 	})
 	if err := m.flushTx(); err != nil {
+		// Compensating action (review M6): the publish happened but the
+		// binding did not persist — remove the DNAT and drop the in-memory
+		// binding so the port is not leaked without an owner.
+		delete(m.bindings, b.BindingID)
+		m.unpublishBinding(b)
 		return nil, err
 	}
 	cp := *b
@@ -2025,6 +2050,35 @@ func (m *Manager) Tick(d time.Duration) error {
 					"reason":     "ttl_expired",
 				})
 			}
+		}
+	}
+	// Reconcile (review L4): retry ACTIVE bindings whose publish failed —
+	// one attempt per Tick, bounded; a binding that left ACTIVE (unbound,
+	// suspended) drops out of the retry set.
+	for id, attempts := range m.publishRetries {
+		b, ok := m.bindings[id]
+		if !ok || b.State != domain.EndpointActive || attempts >= maxPublishRetries {
+			delete(m.publishRetries, id)
+			continue
+		}
+		if err := m.publishBinding(b); err != nil {
+			m.publishRetries[id] = attempts + 1
+			if sb := m.sandboxes[b.SandboxID]; sb != nil {
+				m.emit(sb, sb.SandboxID, domain.EventEndpointPublishFailed, map[string]any{
+					"binding_id": b.BindingID,
+					"error":      err.Error(),
+					"attempt":    attempts + 1,
+				})
+			}
+			continue
+		}
+		delete(m.publishRetries, id)
+		if sb := m.sandboxes[b.SandboxID]; sb != nil {
+			m.emit(sb, sb.SandboxID, domain.EventEndpointBound, map[string]any{
+				"binding_id":  b.BindingID,
+				"target_port": b.TargetPort,
+				"republished": true,
+			})
 		}
 	}
 	return m.flushTx()

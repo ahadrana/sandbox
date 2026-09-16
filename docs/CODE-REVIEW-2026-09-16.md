@@ -25,6 +25,9 @@ claims to close. Plus one remote-DoS path in the resume proxy.
   Confidentiality break, not just availability. Likely the real mechanism of the
   "8080 smoke incident". Fix: `-m addrtype --dst-type LOCAL` on both hooks
   (optionally restrict to host addresses).
+  **FIXED** — addrtype LOCAL on PREROUTING, addrtype LOCAL + `! -d 127.0.0.0/8`
+  on OUTPUT; `TestPublishMatchesLocalAddrOnly` (FC) proves host-uplink reach
+  and no hijack of a non-LOCAL dst on the same dport.
 
 ## High
 
@@ -34,9 +37,16 @@ claims to close. Plus one remote-DoS path in the resume proxy.
   traffic into tenant code. No well-known-port floor, no listen check, no
   per-tenant range policy. INV-018/INV-027 fail-open. Fix: refuse <1024 +
   configurable deny-list.
+  **FIXED** — floor 1024 + deny-list (default 6443/8080/10250,
+  `Config.PublishDenyPorts`, `FC_PUBLISH_DENY_PORTS`) in the backend publish
+  path with typed ErrPortConflict; port range validated in backend, manager,
+  and control-planed; `TestPublishPortPolicyFloorAndDenyList`.
 - **H2. Publish/unpublish RPCs bypass HostAgent fencing.** `hostagent.go:455-481`
   skips `h.route(handle)` and carries no fence (`rpc.go:175-183`) — stale
   control-plane views can install/remove DNAT the ownership model would reject.
+  **FIXED** — publish/unpublish RPCs now route via `h.route` and carry a fence;
+  stale fence → typed ErrStaleFence (same sentinel pattern as routed restore);
+  `TestPublishProtectsRPCPort` covers stale/unknown/protected paths.
 - **H3. Unknown-hostname spray = unauthenticated control-plane DoS.**
   `resumeproxy/proxy.go:245`: no negative name caching; every unknown Host →
   `BindingByName` → O(n) scan under the manager's global `m.mu`
@@ -77,9 +87,12 @@ claims to close. Plus one remote-DoS path in the resume proxy.
 - **M6. Publish-before-persist has no compensating action.** `manager.go:1733-42`:
   DNAT installed before `m.tx` commit; later failure leaks rule + port with no
   owning binding.
+  **FIXED** — `CreateEndpointBinding` now unpublishes and drops the binding if
+  the commit after publish fails; `TestEndpointPublishCompensatedOnCommitFailure`.
 - **M7. PublishPort vs teardown race recreates torn-down chain.** `publish.go`
   holds `installMu`; `cleanupNetDevices` never takes it → `-N FC-PUB-*` can
   re-run after `-X`, leaking a publish on a dead incarnation until FM11 sweep.
+  **FIXED** — `cleanupNetDevices`/`cleanupPubRules` now take `ns.installMu`.
 - **M8. gcToolsImages races.** Deletes in-progress `.tmp` builds without
   `toolsMu` (Create then fails ENOENT); scan-under-`b.mu` then delete-unlocked
   races Create's stat→register (live incarnation with deleted tools drive).
@@ -92,11 +105,19 @@ claims to close. Plus one remote-DoS path in the resume proxy.
 
 - L1. Idempotent re-publish skips `ns.published` bookkeeping → later unpublish
   misses the `-D` (teardown is backstop). `publish.go:147-150`.
+  **FIXED** — the `-C` hit path now records `ns.published[hostPort]`.
 - L2. Re-publish same slot with changed guestPort appends a shadowed second
   rule; unpublish removes only newest. `publish.go:132-138`.
+  **FIXED** — same-slot changed-guestPort re-publish is rejected with typed
+  ErrPortConflict (unpublish to remap); documented in publish.go package
+  comment; `TestPublishPortRemapRejected`.
 - L3. `ErrPortConflict` typing does not survive RPC serialization.
+  **FIXED** — `"port conflict"` wire sentinel + mapError reverse, same pattern
+  as stale-fence; `TestPublishFenceAndConflictRoundTrip`.
 - L4. `EndpointPublishFailed` is emit-and-forget — no retry/reconcile on Tick;
   binding stays ACTIVE-but-unreachable.
+  **FIXED** — bounded reconcile-on-Tick retry (maxPublishRetries=5) for
+  ACTIVE-but-unpublished bindings; `TestEndpointPublishRetriedOnTick`.
 - L5. Live in-place restore can regress `rec.fence` below advanced
   `h.fences[sandboxID]`. `hostagent.go:506-508`.
 - L6. RPC `restore` nil-derefs `req.Checkpoint` (recovered as error; same
@@ -142,13 +163,13 @@ claims to close. Plus one remote-DoS path in the resume proxy.
 
 ## Follow-up queue (priority order)
 
-1. C1 addrtype/dst-type LOCAL match on publish hooks.
-2. H1 protected port floor + deny-list.
+1. ~~C1 addrtype/dst-type LOCAL match on publish hooks.~~ FIXED (Batch A).
+2. ~~H1 protected port floor + deny-list.~~ FIXED (Batch A).
 3. H4+H5 atomic pending-placement registration + idempotent restore.
 4. H3 negative name cache + manager name index.
-5. H2 fence/route enforcement on publish RPCs.
-6. M1 transport timeout alignment; M2 typed route verdicts; M3 binding
-   validation (TTL, port); M4 drop m.mu across fleet RPCs.
-7. M5 reject unparseable restore metadata; M6 compensating unpublish;
-   M7 installMu in cleanup; M8 GC locking; M9 capacity-failure reset.
-8. L-items as a batch.
+5. ~~H2 fence/route enforcement on publish RPCs.~~ FIXED (Batch A).
+6. M1 transport timeout alignment; M2 typed route verdicts; ~~M3 binding
+   validation (TTL, port)~~ (M3 FIXED, Batch A); M4 drop m.mu across fleet RPCs.
+7. M5 reject unparseable restore metadata; ~~M6 compensating unpublish;
+   M7 installMu in cleanup~~ (M6/M7 FIXED, Batch A); M8 GC locking; M9 capacity-failure reset.
+8. L-items as a batch (L1–L4 FIXED, Batch A; L5–L14 open).

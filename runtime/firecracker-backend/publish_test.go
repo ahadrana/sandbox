@@ -151,8 +151,8 @@ func TestPublishPortInstallsVerifiedRules(t *testing.T) {
 	// rule appended then verified.
 	for _, want := range []string{
 		"-t nat -N FC-PUB-7",
-		"-t nat -A PREROUTING -j FC-PUB-7",
-		"-t nat -A OUTPUT ! -d 127.0.0.0/8 -j FC-PUB-7",
+		"-t nat -A PREROUTING -m addrtype --dst-type LOCAL -j FC-PUB-7",
+		"-t nat -A OUTPUT -m addrtype --dst-type LOCAL ! -d 127.0.0.0/8 -j FC-PUB-7",
 		"-t nat -A FC-PUB-7 -p tcp --dport 18080 -j DNAT --to-destination 192.168.0.58:8080",
 		"-t nat -C FC-PUB-7 -p tcp --dport 18080 -j DNAT --to-destination 192.168.0.58:8080",
 	} {
@@ -242,13 +242,13 @@ func TestPublishPortConflictDeterministic(t *testing.T) {
 func TestPublishPortRequiresNetworking(t *testing.T) {
 	pubReset(t)
 	b := &Backend{incs: map[string]*incarnation{"inc-nonet": {id: "inc-nonet"}}}
-	err := b.PublishPort(backendinterface.Handle{IncarnationID: "inc-nonet"}, 8080, 8080)
+	err := b.PublishPort(backendinterface.Handle{IncarnationID: "inc-nonet"}, 8080, 18080)
 	if err == nil || !strings.Contains(err.Error(), "networking") {
 		t.Fatalf("err = %v, want networking-required", err)
 	}
 	// Invalid ports rejected before touching iptables.
 	b2 := pubBackend("inc-p", 3)
-	if err := b2.PublishPort(backendinterface.Handle{IncarnationID: "inc-p"}, 0, 8080); err == nil {
+	if err := b2.PublishPort(backendinterface.Handle{IncarnationID: "inc-p"}, 0, 18080); err == nil {
 		t.Fatal("guest port 0 accepted")
 	}
 	if err := b2.PublishPort(backendinterface.Handle{IncarnationID: "inc-p"}, 8080, 70000); err == nil {
@@ -276,8 +276,8 @@ func TestCleanupPubRulesRemovesEverything(t *testing.T) {
 	ns := b.incs["inc-c"].net
 	cleanupPubRules(ns)
 	for _, want := range []string{
-		"-t nat -D PREROUTING -j FC-PUB-5",
-		"-t nat -D OUTPUT ! -d 127.0.0.0/8 -j FC-PUB-5",
+		"-t nat -D PREROUTING -m addrtype --dst-type LOCAL -j FC-PUB-5",
+		"-t nat -D OUTPUT -m addrtype --dst-type LOCAL ! -d 127.0.0.0/8 -j FC-PUB-5",
 		"-t nat -F FC-PUB-5",
 		"-t nat -X FC-PUB-5",
 	} {
@@ -307,5 +307,72 @@ func TestPublishCapabilityHonest(t *testing.T) {
 	}
 	if off.Capabilities().SupportsPortPublish {
 		t.Fatal("SupportsPortPublish true with Networking off")
+	}
+}
+
+// Port policy (review H1): the well-known floor and the deny-list reject
+// with a typed ErrPortConflict before any iptables call; an explicit
+// Config.PublishDenyPorts replaces the defaults.
+func TestPublishPortPolicyFloorAndDenyList(t *testing.T) {
+	pubReset(t)
+	fake := newFakeIPTables()
+	fake.install(t)
+	b := pubBackend("inc-pol", 7)
+	h := backendinterface.Handle{IncarnationID: "inc-pol"}
+	for _, port := range []int{22, 443, 1023} {
+		if err := b.PublishPort(h, 8080, port); !errors.Is(err, backendinterface.ErrPortConflict) {
+			t.Fatalf("floor port %d: err = %v, want ErrPortConflict", port, err)
+		}
+	}
+	for _, port := range DefaultPublishDenyPorts {
+		if err := b.PublishPort(h, 8080, port); !errors.Is(err, backendinterface.ErrPortConflict) {
+			t.Fatalf("deny-listed port %d: err = %v, want ErrPortConflict", port, err)
+		}
+	}
+	if len(fake.cmds) != 0 {
+		t.Fatalf("policy rejection touched iptables: %v", fake.cmds)
+	}
+	// Default ports not on the list publish fine; a replaced deny-list
+	// applies (8080 now allowed, 9090 denied).
+	if err := b.PublishPort(h, 8080, 18080); err != nil {
+		t.Fatal(err)
+	}
+	b2 := pubBackend("inc-pol2", 8)
+	b2.cfg.PublishDenyPorts = []int{9090}
+	if err := b2.PublishPort(backendinterface.Handle{IncarnationID: "inc-pol2"}, 8080, 9090); !errors.Is(err, backendinterface.ErrPortConflict) {
+		t.Fatalf("custom deny port 9090: err = %v", err)
+	}
+	if err := b2.PublishPort(backendinterface.Handle{IncarnationID: "inc-pol2"}, 8080, 8080); err != nil {
+		t.Fatalf("8080 publishable with replaced deny-list: %v", err)
+	}
+}
+
+// One guest port per host port (review L2): a same-slot re-publish with a
+// changed guest port is rejected typed; unpublish then remap works.
+func TestPublishPortRemapRejected(t *testing.T) {
+	pubReset(t)
+	fake := newFakeIPTables()
+	fake.install(t)
+	b := pubBackend("inc-remap", 7)
+	h := backendinterface.Handle{IncarnationID: "inc-remap"}
+	if err := b.PublishPort(h, 8080, 18080); err != nil {
+		t.Fatal(err)
+	}
+	err := b.PublishPort(h, 9090, 18080)
+	if !errors.Is(err, backendinterface.ErrPortConflict) {
+		t.Fatalf("remap: err = %v, want ErrPortConflict", err)
+	}
+	if fake.has("--to-destination 192.168.0.58:9090") {
+		t.Fatal("rejected remap installed a shadow rule")
+	}
+	// The original mapping is intact; unpublish + re-publish remaps.
+	if err := b.UnpublishPort(h, 18080); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.PublishPort(h, 9090, 18080); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.has("--to-destination 192.168.0.58:9090") {
+		t.Fatal("remap after unpublish not installed")
 	}
 }

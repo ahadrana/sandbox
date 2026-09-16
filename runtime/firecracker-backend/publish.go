@@ -26,7 +26,23 @@ package firecrackerbackend
 // Conflict semantics: the host port is fixed (no dynamic remapping, so the
 // address a client holds never lies); a process-local registry keyed by
 // host port fails a port owned by another live incarnation with
-// backendinterface.ErrPortConflict.
+// backendinterface.ErrPortConflict. A published host port maps to exactly
+// ONE guest port: re-publishing the same host port with a different guest
+// port is rejected (typed ErrPortConflict) — unpublish first to remap.
+//
+// Port policy (review H1): the well-known floor (<1024) is never
+// publishable, and a deny-list (Config.PublishDenyPorts, defaulting to the
+// platform's own service ports) rejects ports bound by node services —
+// publishing one would DNAT that service's traffic into tenant code. Both
+// fail with a typed ErrPortConflict, enforced HERE in the backend so
+// in-process runtimes are covered too (the host agent's ProtectPorts is
+// the agent's additional self-protection for its RPC port).
+//
+// Traffic scoping (review C1): both hooks match `-m addrtype --dst-type
+// LOCAL`, so only traffic destined to the host's OWN addresses enters the
+// publish chain. Without it, dport-only matching would redirect outbound
+// host connections to any remote service on the same port (and, via
+// PREROUTING, forwarded/routed traffic) into an untrusted guest.
 //
 // Stateless-policy note: DNAT'd reply packets are guest-originated flows
 // to the client IP, evaluated by the incarnation's egress chain like any
@@ -69,14 +85,45 @@ func dnatRule(guestIP string, guestPort, hostPort int) []string {
 	}
 }
 
-// pubHooks are the nat hooks the publish chain hangs from; OUTPUT excludes
-// loopback (see the package comment above).
+// publishFloor is the well-known-port floor: host ports below it are never
+// publishable (review H1).
+const publishFloor = 1024
+
+// DefaultPublishDenyPorts are the platform/node service ports a binding may
+// never claim (review H1): the k3s apiserver, the platform services' dev
+// port (host-agent RPC, control-plane, endpoint-proxyd all serve :8080 in
+// this topology), and the kubelet. SSH (22) is covered by the floor.
+// Config.PublishDenyPorts overrides; host-agentd extends via env.
+var DefaultPublishDenyPorts = []int{6443, 8080, 10250}
+
+// pubHooks are the nat hooks the publish chain hangs from. Both match only
+// traffic destined to the host's own addresses (dst-type LOCAL, review C1);
+// OUTPUT additionally excludes loopback (see the package comment above).
 var pubHooks = []struct {
 	name  string
 	extra []string
 }{
-	{"PREROUTING", nil},
-	{"OUTPUT", []string{"!", "-d", "127.0.0.0/8"}},
+	{"PREROUTING", []string{"-m", "addrtype", "--dst-type", "LOCAL"}},
+	{"OUTPUT", []string{"-m", "addrtype", "--dst-type", "LOCAL", "!", "-d", "127.0.0.0/8"}},
+}
+
+// checkPortAllowed enforces the floor and deny-list on the host port
+// (review H1): rejections are typed ErrPortConflict so callers can
+// distinguish policy from plumbing.
+func (b *Backend) checkPortAllowed(hostPort int) error {
+	if hostPort < publishFloor {
+		return fmt.Errorf("host port %d is below the well-known port floor %d: %w", hostPort, publishFloor, backendinterface.ErrPortConflict)
+	}
+	deny := b.cfg.PublishDenyPorts
+	if deny == nil {
+		deny = DefaultPublishDenyPorts
+	}
+	for _, p := range deny {
+		if p == hostPort {
+			return fmt.Errorf("host port %d is deny-listed (platform/system service port): %w", hostPort, backendinterface.ErrPortConflict)
+		}
+	}
+	return nil
 }
 
 // ensurePubChain makes the incarnation's publish chain and its hooks exist
@@ -108,6 +155,9 @@ func (b *Backend) PublishPort(h backendinterface.Handle, guestPort, hostPort int
 	if guestPort < 1 || guestPort > 65535 || hostPort < 1 || hostPort > 65535 {
 		return fmt.Errorf("invalid port mapping %d -> %d", hostPort, guestPort)
 	}
+	if err := b.checkPortAllowed(hostPort); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	inc, err := b.get(h)
 	ns := (*netState)(nil)
@@ -120,6 +170,15 @@ func (b *Backend) PublishPort(h backendinterface.Handle, guestPort, hostPort int
 	}
 	if ns == nil {
 		return fmt.Errorf("port publish requires guest networking (incarnation %s has none)", inc.id)
+	}
+	// One guest port per host port (review L2): a same-slot re-publish with a
+	// CHANGED guest port would append a shadowed second rule that unpublish
+	// only half-removes — reject it typed; unpublish first to remap.
+	ns.mu.Lock()
+	prevGuest, prevPublished := ns.published[hostPort]
+	ns.mu.Unlock()
+	if prevPublished && prevGuest != guestPort {
+		return fmt.Errorf("host port %d already published to guest port %d (unpublish to remap): %w", hostPort, prevGuest, backendinterface.ErrPortConflict)
 	}
 	pubPorts.Lock()
 	owner, taken := pubPorts.byPort[hostPort]
@@ -140,7 +199,16 @@ func (b *Backend) PublishPort(h backendinterface.Handle, guestPort, hostPort int
 	rule := dnatRule(ns.guestIP, guestPort, hostPort)
 	check := append([]string{"-t", "nat", "-C", chain}, rule...)
 	if pubSudo(append([]string{"iptables"}, check...)...).Run() == nil {
-		return nil // idempotent re-publish (resume republish)
+		// Idempotent re-publish (resume republish): the rule is in the
+		// kernel — still record the bookkeeping (review L1), or a later
+		// unpublish would miss the -D.
+		ns.mu.Lock()
+		if ns.published == nil {
+			ns.published = map[int]int{}
+		}
+		ns.published[hostPort] = guestPort
+		ns.mu.Unlock()
+		return nil
 	}
 	add := append([]string{"-t", "nat", "-A", chain}, rule...)
 	if err := pubNetRun(append([]string{"iptables"}, add...)...); err != nil {
@@ -207,11 +275,17 @@ func freePubPort(slot, hostPort int) {
 
 // cleanupPubRules removes the incarnation's publish chain, its hooks, and
 // its registry entries. Called from cleanupNetDevices; safe on partial
-// state, never touches other slots.
+// state, never touches other slots. Serialized with PublishPort under
+// installMu (review M7): a concurrent publish must not recreate the chain
+// after teardown removed it.
 func cleanupPubRules(ns *netState) {
+	ns.installMu.Lock()
+	defer ns.installMu.Unlock()
 	chain := pubChainName(ns.slot)
-	pubSudo("iptables", "-t", "nat", "-D", "PREROUTING", "-j", chain).Run()
-	pubSudo("iptables", "-t", "nat", "-D", "OUTPUT", "!", "-d", "127.0.0.0/8", "-j", chain).Run()
+	for _, hook := range pubHooks {
+		del := append(append([]string{"-t", "nat", "-D", hook.name}, hook.extra...), "-j", chain)
+		pubSudo(append([]string{"iptables"}, del...)...).Run()
+	}
 	pubSudo("iptables", "-t", "nat", "-F", chain).Run()
 	pubSudo("iptables", "-t", "nat", "-X", chain).Run()
 	pubPorts.Lock()

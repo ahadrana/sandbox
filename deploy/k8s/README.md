@@ -72,6 +72,10 @@ hostPort)`); the firecracker backend DNATs the host port to the
 incarnation's TAP IP in a per-incarnation nat chain (`FC-PUB-<slot>`)
 hooked from PREROUTING (external and pod clients) and OUTPUT (host-local
 clients, loopback excluded — loopback would hairpin into a black hole).
+Both hooks match `-m addrtype --dst-type LOCAL` (review C1): only traffic
+destined to the host's OWN addresses is redirected — host outbound
+connections to a remote service on the same port, and forwarded/routed
+traffic, are never hijacked into a guest.
 The host port IS the binding's target port: no remapping, so the address
 clients hold never lies; a second sandbox publishing the same host port
 fails the binding creation with a typed port-conflict error. Suspend,
@@ -81,12 +85,15 @@ on the (possibly new) host. Replies need no MASQUERADE (they traverse the
 host and conntrack reverses the DNAT); note DNAT'd replies are evaluated
 by the guest egress chain, so publishing composes with default-allow
 policies — under default-deny the client destinations must be allowed.
-Publishing steals the port NODE-WIDE (every local address, both hooks):
-a binding whose target port collides with a host service hijacks that
-service's traffic into the guest. The host agent therefore refuses to
-publish its own RPC listen port (heartbeats/RPC would be DNAT'd into the
-guest and the host declared lost), and operators must keep binding target
-ports clear of node services (kubelet, kube-proxy, SSH, platform 8080).
+Publishing steals the port on every host address, so the backend enforces
+a port policy (review H1): the well-known floor (<1024, covers SSH) is
+never publishable, and a deny-list — defaulting to the platform/node
+service ports 6443 (apiserver), 8080 (platform dev port: agent RPC,
+control-plane, endpoint-proxyd), 10250 (kubelet), extendable via the
+host-agentd env `FC_PUBLISH_DENY_PORTS="9090,3000"` — rejects ports bound
+by node services, all with typed port-conflict errors. The host agent
+additionally refuses its own RPC listen port (`ProtectPorts`), and the
+publish/unpublish RPCs are fence-validated like every other routed op.
 
 ## Prereqs (deployment host)
 

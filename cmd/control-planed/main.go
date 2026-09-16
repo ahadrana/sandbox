@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -341,6 +342,17 @@ func (s *server) createBinding(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Reject never-routable bindings at the edge (review M3): invalid ports
+	// deny forever, and a TTL that overflows a Duration would expire
+	// immediately-or-never depending on sign.
+	if req.TargetPort < 1 || req.TargetPort > 65535 {
+		http.Error(w, "invalid target_port", http.StatusBadRequest)
+		return
+	}
+	if req.TTLSeconds < 0 || req.TTLSeconds > math.MaxInt64/int64(time.Second) {
+		http.Error(w, "invalid ttl_seconds", http.StatusBadRequest)
 		return
 	}
 	b, err := s.mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
