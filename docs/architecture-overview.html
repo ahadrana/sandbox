@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Sandbox Platform — Architecture Overview</title>
+<style>
+:root{
+  --bg:#0e1117; --bg2:#151a23; --bg3:#1c2330; --line:#2a3344;
+  --fg:#dbe2ee; --dim:#8b96a9; --acc:#5aa9ff; --acc2:#7ee0b8;
+  --warn:#ffcf6e; --bad:#ff8d8d; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--acc)}
+code,kbd{font-family:var(--mono);font-size:.88em;background:var(--bg3);border:1px solid var(--line);border-radius:4px;padding:0 4px}
+.wrap{max-width:1180px;margin:0 auto;padding:0 20px}
+header.hero{padding:56px 0 28px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#121826,var(--bg))}
+header.hero h1{margin:0 0 6px;font-size:30px;letter-spacing:.2px}
+header.hero .sub{color:var(--acc2);font-family:var(--mono);font-size:13px;margin-bottom:18px}
+header.hero p.lede{max-width:880px;color:var(--fg);font-size:16px}
+nav.toc{position:sticky;top:0;z-index:5;background:rgba(14,17,23,.94);border-bottom:1px solid var(--line);backdrop-filter:blur(4px)}
+nav.toc .wrap{display:flex;flex-wrap:wrap;gap:2px;padding-top:6px;padding-bottom:6px}
+nav.toc a{color:var(--dim);text-decoration:none;font-size:13px;padding:5px 10px;border-radius:6px}
+nav.toc a:hover,nav.toc a:focus{color:var(--fg);background:var(--bg3);outline:none}
+section{padding:34px 0 8px}
+h2{font-size:21px;margin:0 0 4px}
+h2 .num{color:var(--acc);font-family:var(--mono);font-size:14px;vertical-align:middle;margin-right:8px}
+p.intro{color:var(--dim);max-width:900px;margin-top:4px}
+.panel{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:14px 0}
+.grid2{display:grid;grid-template-columns:1fr 340px;gap:16px}
+@media(max-width:920px){.grid2{grid-template-columns:1fr}}
+/* SVG diagram */
+.diagram{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:8px}
+svg{display:block;width:100%;height:auto}
+svg .comp{cursor:pointer}
+svg .comp rect{fill:var(--bg3);stroke:var(--line);stroke-width:1.2;rx:8}
+svg .comp:hover rect,svg .comp:focus rect{stroke:var(--acc)}
+svg .comp.sel rect{stroke:var(--acc2);stroke-width:2}
+svg text{fill:var(--fg);font-size:12px}
+svg .sub{font-size:10px;fill:var(--dim)}
+svg .edge{stroke:var(--dim);stroke-width:1.3;fill:none;marker-end:url(#arr)}
+svg .edgeLbl{fill:var(--dim);font-size:9.5px;font-family:var(--mono)}
+/* detail panel */
+#compDetail h3{margin:0 0 6px;font-size:16px;color:var(--acc2)}
+#compDetail dl{margin:8px 0}
+#compDetail dt{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.5px;margin-top:10px}
+#compDetail dd{margin:3px 0 0}
+#compDetail ul{margin:4px 0;padding-left:18px}
+#compDetail li{margin:2px 0;font-family:var(--mono);font-size:12px}
+.tag{display:inline-block;font-family:var(--mono);font-size:11px;border:1px solid var(--line);border-radius:20px;padding:1px 9px;margin:2px 3px 2px 0;color:var(--dim)}
+.tag.inv{color:var(--acc2);border-color:#2c4a3e}
+.tag.adr{color:var(--acc);border-color:#2b3c55}
+/* lifecycle walker */
+.walkTabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}
+.walkTabs button{background:var(--bg3);color:var(--dim);border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:13px;cursor:pointer}
+.walkTabs button[aria-selected="true"]{color:var(--fg);border-color:var(--acc);background:#1b2740}
+.walkTabs button:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+ol.steps{list-style:none;margin:14px 0;padding:0;counter-reset:st}
+ol.steps li{counter-increment:st;position:relative;padding:10px 12px 10px 46px;border:1px solid transparent;border-radius:8px;margin:4px 0;color:var(--dim)}
+ol.steps li::before{content:counter(st);position:absolute;left:12px;top:11px;width:22px;height:22px;border-radius:50%;background:var(--bg3);border:1px solid var(--line);color:var(--dim);font-family:var(--mono);font-size:12px;text-align:center;line-height:22px}
+ol.steps li.active{background:var(--bg3);border-color:var(--acc);color:var(--fg)}
+ol.steps li.active::before{background:var(--acc);color:#06101f;border-color:var(--acc)}
+ol.steps li code{font-size:.84em}
+.walkCtl{display:flex;gap:8px;align-items:center;margin:8px 0}
+.walkCtl button{background:var(--acc);border:none;color:#06101f;font-weight:600;border-radius:8px;padding:7px 16px;cursor:pointer}
+.walkCtl button.secondary{background:var(--bg3);color:var(--fg);border:1px solid var(--line)}
+.walkCtl button:focus-visible{outline:2px solid var(--acc2);outline-offset:1px}
+.walkCtl .pos{color:var(--dim);font-family:var(--mono);font-size:12px}
+/* invariants */
+.invGroup{margin:10px 0}
+.invGroup h3{font-size:15px;margin:14px 0 6px;color:var(--acc)}
+.inv{border:1px solid var(--line);border-radius:8px;padding:9px 12px;margin:6px 0;background:var(--bg2)}
+.inv b{font-family:var(--mono);color:var(--acc2);font-size:13px}
+.inv .t{color:var(--fg);font-size:14px}
+.inv .g{color:var(--dim);font-size:13px;margin-top:2px}
+/* ADR timeline */
+.timeline{border-left:2px solid var(--line);margin:14px 0 14px 8px;padding-left:22px}
+.timeline .adr{position:relative;margin:0 0 16px}
+.timeline .adr::before{content:"";position:absolute;left:-29px;top:5px;width:12px;height:12px;border-radius:50%;background:var(--bg);border:2px solid var(--acc)}
+.timeline .adr b{font-family:var(--mono);color:var(--acc)}
+.timeline .adr .d{color:var(--dim);font-size:13px}
+/* proof */
+.proof ul{padding-left:20px;margin:8px 0}
+.proof li{margin:6px 0}
+.yes::marker{content:"✓  "}
+.no::marker{content:"✗  "}
+.ok{color:var(--acc2)} .missing{color:var(--bad)}
+/* misc */
+footer{border-top:1px solid var(--line);margin-top:40px;padding:18px 0 40px;color:var(--dim);font-size:12.5px}
+.kbdhint{color:var(--dim);font-size:12px}
+@media(max-width:640px){header.hero h1{font-size:24px}}
+</style>
+</head>
+<body>
+
+<header class="hero"><div class="wrap">
+  <h1>Agent Sandbox Platform</h1>
+  <div class="sub">architecture overview · generated from docs/DESIGN.md, docs/INVARIANTS.md, ADR-001…008, deploy/k8s/README.md</div>
+  <p class="lede">A microVM sandbox platform for AI agents. Each agent's workload runs inside a
+  <b>Firecracker microVM</b> (stronger isolation than a Kubernetes namespace, INV-027), behind a
+  <b>durable control plane</b> that treats the sandbox as a logical entity — workspace generations and
+  execution epochs survive the compute they ran on. Sandboxes <b>suspend and resume</b>: full-VM
+  checkpoints form incremental chains (ADR-006), and a suspended sandbox springs back to life when
+  traffic arrives at its endpoint (ADR-007/008). A <b>fail-closed egress policy</b> decides which
+  networks a guest may reach, and <b>endpoint bindings</b> expose selected guest ports to clients —
+  with traffic-triggered resume making suspended sandboxes transparently addressable.</p>
+</div></header>
+
+<nav class="toc" aria-label="Sections"><div class="wrap">
+  <a href="#arch">Architecture</a><a href="#flows">Request lifecycles</a><a href="#trust">Trust &amp; security</a>
+  <a href="#inv">Invariants</a><a href="#adrs">ADR timeline</a><a href="#proof">Proof status</a><a href="#gaps">Gaps &amp; roadmap</a>
+</div></nav>
+
+<main class="wrap">
+
+<!-- ================= ARCHITECTURE ================= -->
+<section id="arch">
+<h2><span class="num">01</span>Architecture — the moving parts</h2>
+<p class="intro">Click any component for what it does, the real files behind it, and the invariants/ADRs that govern it.
+One request path: <code>client → endpoint-proxyd → control-planed → host-agentd → firecracker backend → microVM</code>.</p>
+<div class="grid2">
+<div class="diagram">
+<svg viewBox="0 0 960 560" role="img" aria-label="Architecture diagram" id="archSvg">
+  <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#8b96a9"/></marker></defs>
+
+  <!-- client -->
+  <g class="comp" data-c="client" tabindex="0" role="button" aria-label="Client and agent driver">
+    <rect x="20" y="230" width="130" height="70"/><text x="85" y="258" text-anchor="middle">Client</text>
+    <text x="85" y="276" text-anchor="middle" class="sub">agent-driver / SDK</text>
+  </g>
+
+  <!-- endpoint-proxyd -->
+  <g class="comp" data-c="proxy" tabindex="0" role="button" aria-label="endpoint-proxyd resume proxy">
+    <rect x="200" y="60" width="180" height="80"/><text x="290" y="92" text-anchor="middle">endpoint-proxyd</text>
+    <text x="290" y="110" text-anchor="middle" class="sub">resume proxy · ADR-007</text>
+    <text x="290" y="124" text-anchor="middle" class="sub">control-plane/resumeproxy</text>
+  </g>
+
+  <!-- control-planed group -->
+  <g class="comp" data-c="cp" tabindex="0" role="button" aria-label="control-planed">
+    <rect x="200" y="200" width="180" height="150"/><text x="290" y="222" text-anchor="middle">control-planed</text>
+    <text x="290" y="238" text-anchor="middle" class="sub">Deployment · ADR-005</text>
+  </g>
+  <g class="comp" data-c="manager" tabindex="0" role="button" aria-label="sandbox manager">
+    <rect x="216" y="252" width="148" height="34"/><text x="290" y="273" text-anchor="middle">sandbox-manager</text>
+  </g>
+  <g class="comp" data-c="scheduler" tabindex="0" role="button" aria-label="scheduler">
+    <rect x="216" y="292" width="70" height="34"/><text x="251" y="313" text-anchor="middle">scheduler</text>
+  </g>
+  <g class="comp" data-c="outbox" tabindex="0" role="button" aria-label="event outbox and filestore">
+    <rect x="294" y="292" width="70" height="34"/><text x="329" y="307" text-anchor="middle">outbox +</text>
+    <text x="329" y="319" text-anchor="middle" class="sub">filestore</text>
+  </g>
+
+  <!-- host-agentd -->
+  <g class="comp" data-c="agent" tabindex="0" role="button" aria-label="host-agentd">
+    <rect x="440" y="200" width="170" height="80"/><text x="525" y="232" text-anchor="middle">host-agentd</text>
+    <text x="525" y="250" text-anchor="middle" class="sub">DaemonSet · fleet RPC · ADR-005</text>
+    <text x="525" y="264" text-anchor="middle" class="sub">runtime/host-agent</text>
+  </g>
+
+  <!-- fc backend -->
+  <g class="comp" data-c="fc" tabindex="0" role="button" aria-label="firecracker backend">
+    <rect x="670" y="200" width="150" height="80"/><text x="745" y="232" text-anchor="middle">firecracker</text>
+    <text x="745" y="250" text-anchor="middle" class="sub">backend · ADR-001</text>
+    <text x="745" y="264" text-anchor="middle" class="sub">runtime/firecracker-backend</text>
+  </g>
+
+  <!-- microVM group -->
+  <g class="comp" data-c="vm" tabindex="0" role="button" aria-label="microVM">
+    <rect x="560" y="360" width="360" height="170"/><text x="740" y="384" text-anchor="middle">microVM (jailed VMM, KVM)</text>
+  </g>
+  <g class="comp" data-c="gs" tabindex="0" role="button" aria-label="guest supervisor">
+    <rect x="576" y="398" width="160" height="44"/><text x="656" y="417" text-anchor="middle">guest-supervisor</text>
+    <text x="656" y="431" text-anchor="middle" class="sub">exec / files vsock server</text>
+  </g>
+  <g class="comp" data-c="tools" tabindex="0" role="button" aria-label="tools drive">
+    <rect x="576" y="452" width="160" height="44"/><text x="656" y="471" text-anchor="middle">tools drive</text>
+    <text x="656" y="485" text-anchor="middle" class="sub">tools-&lt;sha256&gt;.ext4, read-only</text>
+  </g>
+  <g class="comp" data-c="egress" tabindex="0" role="button" aria-label="TAP and egress chains">
+    <rect x="756" y="398" width="148" height="44"/><text x="830" y="417" text-anchor="middle">TAP + FC-EGR</text>
+    <text x="830" y="431" text-anchor="middle" class="sub">egress chains, DNS learning</text>
+  </g>
+  <g class="comp" data-c="pub" tabindex="0" role="button" aria-label="FC-PUB port publishing">
+    <rect x="756" y="452" width="148" height="44"/><text x="830" y="471" text-anchor="middle">FC-PUB DNAT</text>
+    <text x="830" y="485" text-anchor="middle" class="sub">endpoint port publish</text>
+  </g>
+
+  <!-- edges -->
+  <path class="edge" d="M150 265 L196 265"/>
+  <text class="edgeLbl" x="173" y="256" text-anchor="middle">HTTP</text>
+  <path class="edge" d="M150 285 C150 110 160 100 196 100"/>
+  <text class="edgeLbl" x="176" y="170" text-anchor="middle">endpoint traffic</text>
+  <path class="edge" d="M290 140 L290 196"/>
+  <text class="edgeLbl" x="340" y="172" text-anchor="middle">route / resume / bindings</text>
+  <path class="edge" d="M380 240 L436 240"/>
+  <text class="edgeLbl" x="408" y="231" text-anchor="middle">fleet RPC (fenced)</text>
+  <path class="edge" d="M610 240 L666 240"/>
+  <path class="edge" d="M745 280 L745 356"/>
+  <path class="edge" d="M290 350 C290 540 540 540 700 530"/>
+  <text class="edgeLbl" x="430" y="545" text-anchor="middle">durable state: events + snapshots + workspace (Tx commit)</text>
+  <path class="edge" d="M290 200 L290 96" style="display:none"/>
+</svg>
+</div>
+
+<div class="panel" id="compDetail" aria-live="polite"><h3>Select a component</h3>
+<p class="intro">Click a box in the diagram (or Tab to it and press Enter) to see its role, key files, invariants, and ADRs.</p></div>
+</div>
+</section>
+
+<!-- ================= LIFECYCLES ================= -->
+<section id="flows">
+<h2><span class="num">02</span>Request lifecycles — step through</h2>
+<p class="intro">Three walks: creating a sandbox, executing inside it, and the full suspend → checkpoint →
+traffic-triggered resume arc. Use the buttons or ←/→ arrow keys.</p>
+<div class="panel">
+<div class="walkTabs" role="tablist" aria-label="Lifecycle walks">
+  <button role="tab" aria-selected="true" data-walk="0">(a) Create sandbox</button>
+  <button role="tab" aria-selected="false" data-walk="1">(b) Execute in sandbox</button>
+  <button role="tab" aria-selected="false" data-walk="2">(c) Suspend → traffic-triggered resume</button>
+</div>
+<div class="walkCtl">
+  <button class="secondary" id="wPrev">← Prev</button>
+  <button id="wNext">Next →</button>
+  <span class="pos" id="wPos"></span>
+</div>
+<ol class="steps" id="wSteps"></ol>
+</div>
+</section>
+
+<!-- ================= TRUST ================= -->
+<section id="trust">
+<h2><span class="num">03</span>Trust &amp; security model</h2>
+<p class="intro">The platform assumes guest code is untrusted (it is AI-generated) and host components can be
+stale, partitioned, or replayed. Every boundary below fails closed.</p>
+
+<div class="panel"><h3 style="margin-top:0">Isolation classes (ADR-001, ADR-004)</h3>
+<p>One <b>production</b> isolation class: Firecracker microVMs — a jailed VMM process per sandbox, KVM-enforced
+boundary, stronger than Kubernetes namespace isolation (INV-027). The fake, local (process), and isolated (bwrap)
+backends exist only as <b>contract-verified test doubles</b>: the same conformance scenarios run against every
+backend with differences expressed as declared capabilities (INV-026). A single Go module, no containerd/Redis
+dependency surface.</p></div>
+
+<div class="panel"><h3 style="margin-top:0">Fail-closed egress (network/network.go, backend egress chains)</h3>
+<p>Default-deny: a guest reaches only what its <code>network.EgressPolicy</code> allows; anything unclassifiable is denied.
+Each incarnation gets per-TAP iptables chains named <code>FC-EGR-&lt;slot&gt;-g&lt;N&gt;</code> — the <b>generation N</b> is
+stamped into the datapath, so a policy change or a snapshot rollback bumps the generation, swaps chains
+atomically (build <code>FC-TMP-*</code> → verify with <code>-C</code> → retarget jumps), and flushes guest conntrack so
+established flows die with the old policy. A per-incarnation <b>DNS-learning proxy</b> on the TAP host address
+answers only allowed names and installs the returned IPs as /32 allows with TTL reaping. The cloud metadata
+address (169.254.169.254) is always blocked; IPv6 is fail-closed by design.</p></div>
+
+<div class="panel"><h3 style="margin-top:0">Port publishing (runtime/firecracker-backend/publish.go)</h3>
+<p>Endpoint bindings DNAT a host port into the guest (<code>FC-PUB-*</code> chains). Three rules keep this safe:
+<b>(1)</b> both hooks (PREROUTING, OUTPUT) match <code>-m addrtype --dst-type LOCAL</code> — only traffic destined to the
+host's own addresses is redirected; forwarded and host-outbound traffic on the same port is never hijacked.
+<b>(2)</b> a <b>floor of 1024</b> plus a configurable deny-list (default 6443, 8080, 10250 — API server, control
+plane/proxy, kubelet) is enforced in the backend with a typed <code>ErrPortConflict</code>.
+<b>(3)</b> publish/unpublish RPCs are <b>fence-validated</b>: a stale control-plane view gets <code>ErrStaleFence</code>, not a DNAT rule.</p></div>
+
+<div class="panel"><h3 style="margin-top:0">Fencing &amp; epochs (ADR-002)</h3>
+<p>Two monotonic counters do the safety work. <b>Execution epochs</b>: volatile execution state has an epoch (INV-007);
+a continuity-preserving resume keeps it, a workspace-only recovery bumps it, and endpoint bindings are fenced to
+the epoch they were created in — stale-epoch bindings deny at the gateway. <b>Placement fences</b>: the scheduler
+issues a per-sandbox fence on every placement; host agents reject creates/restores/publishes carrying an older
+fence, which is how the system guarantees <i>never two live incarnations of one sandbox</i> even across retries,
+lost ACKs, and host restarts.</p></div>
+</section>
+
+<!-- ================= INVARIANTS ================= -->
+<section id="inv">
+<h2><span class="num">04</span>Invariants browser</h2>
+<p class="intro">The 30 architectural invariants from <code>docs/INVARIANTS.md</code>, grouped by theme with a
+plain-English gloss. These are the review rule: any change that breaks one is a bug by definition.</p>
+<div id="invList"></div>
+</section>
+
+<!-- ================= ADRS ================= -->
+<section id="adrs">
+<h2><span class="num">05</span>ADR timeline</h2>
+<p class="intro">Eight accepted decisions, oldest to newest, from <code>docs/adr/</code>.</p>
+<div class="timeline" id="adrList"></div>
+</section>
+
+<!-- ================= PROOF ================= -->
+<section id="proof" class="proof">
+<h2><span class="num">06</span>Proof status — what is actually verified</h2>
+<p class="intro">An honest account. "Green" means <code>go test ./... -count=1</code> with zero FAILs.</p>
+<div class="panel"><h3 style="margin-top:0" class="ok">Proven</h3>
+<ul>
+<li class="yes"><b>Unit/conformance suite</b> — ~10 Go packages covering the in-memory, fake, and local (bwrap)
+  backends plus a chaos harness (host loss, re-registration, interrupted operations). All green locally.</li>
+<li class="yes"><b>Real-microVM proof</b> — <code>FC_TEST=1</code> suites on an aarch64 KVM bare-metal host:
+  conformance ~230s + firecracker-backend ~378s, green. Covers incremental snapshot chains, corruption
+  detection, egress generations, port publish (dst-type-LOCAL scoping), and routed restore.</li>
+<li class="yes"><b>Deployed proof</b> — a k3s cluster on the bare-metal host ran live smoke tests:
+  create → bind → <code>curl</code> via DNAT → guest response; suspend (RAM reclaimed) → hostname request →
+  single-flight routed restore → <b>200 with the epoch preserved</b> and a tmpfs marker alive; denied ports refused.</li>
+</ul></div>
+<div class="panel"><h3 style="margin-top:0" class="missing">Not yet proven</h3>
+<ul>
+<li class="no"><b>Multi-host fleet</b> — a single bare-metal node only; cross-host checkpoint transfer is unimplemented
+  (restore is origin-host-only, ADR-008).</li>
+<li class="no"><b>Scale/load</b> — no density, contention, or load testing beyond the conformance suites.</li>
+<li class="no"><b>Production hardening</b> — dev shared-token auth everywhere; the endpoint proxy dials
+  heartbeat-self-reported host URLs (L11 SSRF posture, accepted for dev).</li>
+<li class="no"><b>Portability</b> — arm64 (aarch64) only so far.</li>
+<li class="no"><b>Long-run stability</b> — no soak testing; one unreproduced flake observed.</li>
+<li class="no"><b>HA control plane</b> — control-planed is a single Deployment with a file store, not a real
+  highly-available control plane.</li>
+</ul></div>
+</section>
+
+<!-- ================= GAPS ================= -->
+<section id="gaps">
+<h2><span class="num">07</span>Known gaps &amp; roadmap</h2>
+<div class="panel"><ul style="padding-left:20px;margin:6px 0">
+<li><b>Cross-host checkpoint transfer</b> — the headline follow-up: checkpoints are host-local and restore routes
+  to the origin host (ADR-008); snapshot-blob streaming or a shared snapshot store is the documented next step.</li>
+<li><b>CubeSandbox borrow list, remaining</b> — the P2 grab-bag (guest-ready MMIO signal, TAP pool pre-warming,
+  flattened workspace-generation chains, per-sandbox traffic tokens, audit fingerprints) and P1.8
+  (HSet-snapshot + capped-stream push pattern to a gateway tier). All P0/P1 items except P1.8 are DONE —
+  see <code>docs/COMPARISON-CUBESANDBOX.md</code>.</li>
+<li><b>Jailer upstream PR</b> — deferred; the backend currently carries its own jail setup.</li>
+<li><b>Accepted lows from the 2026-09-16 code review</b> (Batches A–C fixed the rest):
+  <b>L9</b> netinit sysctl is node-wide and persists after the pod (documented, dedicated nodes assumed);
+  <b>L11</b> the endpoint proxy trusts heartbeat-self-reported host URLs (dev shared-token posture);
+  <b>L12</b> stale name→binding cache for up to CacheTTL after unbind/recreate; caches unbounded;
+  <b>L14</b> jail pre-spawn bind mount is rw without nodev/nosuid (largely inherent).</li>
+<li><b>Tools-image GC</b> — done (content-addressed reference counting with chain coverage); cross-host image
+  distribution remains open alongside cross-host restore.</li>
+</ul></div>
+</section>
+
+</main>
+
+<footer><div class="wrap">
+Agent Sandbox Platform · architecture overview · grounded in docs/DESIGN.md, docs/INVARIANTS.md,
+docs/PLAN.md, docs/adr/001–008, docs/COMPARISON-CUBESANDBOX.md, docs/CODE-REVIEW-2026-09-16.md,
+deploy/k8s/README.md · single self-contained file, no external resources.
+</div></footer>
+
+<script>
+"use strict";
+/* ---------- component details ---------- */
+var COMPONENTS = {
+client:{t:"Client / agent-driver",d:"The outside world: an LLM agent runtime or CLI driving sandboxes over HTTP+JSON with a dev token. agent-driver/ is the reference driver; conformance/ replays deterministic scenarios against the whole platform. Kubernetes objects never appear in this API (INV-019).",
+f:["agent-driver/driver.go","conformance/conformance_test.go","api/api.go"],i:["INV-019","INV-020","INV-030"],a:["ADR-005"]},
+proxy:{t:"endpoint-proxyd — ingress resume proxy",d:"The single ingress hop for endpoint traffic (ADR-007). Resolves the binding by X-Endpoint-Binding header or <logical-name>.<ENDPOINT_DOMAIN> hostname, routes through the control plane's gateway verdicts (typed Resumable/LookupError), single-flights a resume when the sandbox is suspended, and reverse-proxies to the host's published port. Live bindings forward from a 2s cache with zero control-plane calls; unknown names are negative-cached so a spray never reaches the control plane.",
+f:["cmd/endpoint-proxyd/main.go","control-plane/resumeproxy/proxy.go"],i:["INV-017","INV-002","INV-018"],a:["ADR-007","ADR-008"]},
+cp:{t:"control-planed — control plane daemon",d:"Single Deployment hosting the HTTP API: sandbox lifecycle, executions, endpoint bindings, gateway route verdicts, host registry. Holds no compute — it is the durable brain: state transitions + events committed transactionally, rebuilt from the store on restart (FR-AV-001).",
+f:["cmd/control-planed/main.go","control-plane/sandbox-manager/manager.go"],i:["INV-001","INV-005","INV-007"],a:["ADR-002","ADR-005"]},
+manager:{t:"sandbox-manager — state machines & durability",d:"Owns the domain state machines: sandbox lifecycle, execution epochs, workspace generations, endpoint bindings, leases/quotas, suspend/resume. Every mutation goes through a Tx (state + events) committed atomically; blocking fleet RPCs run outside the manager lock with revalidation after re-acquire.",
+f:["control-plane/sandbox-manager/manager.go","domain/statemachine.go","control-plane/sandbox-manager/filestore.go"],i:["INV-001","INV-006","INV-008","INV-009"],a:["ADR-002","ADR-003"]},
+scheduler:{t:"scheduler — placement & fencing",d:"Deterministic scoring placement: capacity dominates, cache locality is a bonus, pressure a penalty. Issues the per-sandbox placement fence that host agents enforce. Checkpoint-locality bonus (+3) applies only when the checkpoint's Guard (arch, kernel release, CPU part) matches the host exactly.",
+f:["control-plane/scheduler/scheduler.go"],i:["INV-023","INV-024"],a:["ADR-008"]},
+outbox:{t:"event-service outbox + FileStore",d:"Transactional outbox: every state change appends events in the same commit (ADR-002/003 — schema-versioned, model-independent, INV-030). FileStore journal lines carry a CRC32 prefix; torn tails are discarded whole; inline compaction bounds recovery time.",
+f:["control-plane/event-service/","control-plane/sandbox-manager/filestore.go"],i:["INV-005","INV-025","INV-030"],a:["ADR-002","ADR-003"]},
+agent:{t:"host-agentd — runtime host daemon",d:"DaemonSet on each execution host: owns incarnations (create/restore/exec/snapshot), enforces placement fences and capacity, adopts still-live incarnations on restart, heartbeats to the fleet. The fleet routes every operation to the owning host over fenced HTTP RPC (ADR-005).",
+f:["cmd/host-agentd/main.go","runtime/host-agent/hostagent.go","runtime/host-agent/fleet.go","runtime/host-agent/rpc/rpc.go"],i:["INV-016","INV-024","INV-026"],a:["ADR-005","ADR-008"]},
+fc:{t:"firecracker backend — VMM lifecycle",d:"The production runtime (ADR-001): boots one jailed Firecracker VMM per incarnation — rootfs copy + injected systemd units, TAP networking with egress chains, snapshot/restore with incremental diff chains (ADR-006), port publishing (FC-PUB). Tools images are content-addressed and GC'd by reference counting.",
+f:["runtime/firecracker-backend/backend.go","runtime/firecracker-backend/snapshot.go","runtime/firecracker-backend/publish.go","runtime/firecracker-backend/image.go"],i:["INV-027","INV-018"],a:["ADR-001","ADR-004","ADR-006"]},
+vm:{t:"microVM — the sandbox itself",d:"One Firecracker microVM per incarnation: KVM isolation, jailed VMM (chroot + seccomp + cgroups). This is where untrusted, AI-generated code runs. A sandbox's identity outlives any single VM — suspend checkpoints it, restore boots a fresh VMM from the chain.",
+f:["runtime/firecracker-backend/jail.go"],i:["INV-001","INV-027","INV-007"],a:["ADR-001"]},
+gs:{t:"guest-supervisor — in-guest agent",d:"Statically-linked agent running inside the guest: executes operations (exec, file writes), reports results, exports the process inventory the manager uses for quiescence and background-policy accounting. Talks to the host over vsock — no guest network needed for control (INV-025).",
+f:["runtime/guest-supervisor/","cmd/guest-supervisor/"],i:["INV-012","INV-014","INV-025"],a:["ADR-001"]},
+tools:{t:"tools drive — agent delivery",d:"The supervisor binary ships on one content-addressed read-only ext4 (tools-<sha256>.ext4, label fc-tools) attached as an extra virtio-blk drive to every microVM — upgrades decouple from rootfs builds. Referenced images are never deleted while a live incarnation or retained snapshot link needs them.",
+f:["runtime/firecracker-backend/image.go"],i:["INV-021","INV-022"],a:["ADR-006"]},
+egress:{t:"TAP + FC-EGR — guest networking & egress policy",d:"Each incarnation gets a TAP device and per-slot iptables chains FC-EGR-<slot>-g<N>: default-deny policy, generation-stamped so policy changes and snapshot restores invalidate established flows (conntrack flush), atomic chain swaps via FC-TMP scratch chains, and a DNS-learning proxy that turns allowed name lookups into TTL-bound /32 allows.",
+f:["network/network.go","runtime/firecracker-backend/netdev.go"],i:["INV-018"],a:["ADR-001"]},
+pub:{t:"FC-PUB — endpoint port publishing",d:"The endpoint data plane: a binding's target port is DNAT'd from the host address into the guest. Rules match -m addrtype --dst-type LOCAL only (no hijack of forwarded/outbound traffic); ports below 1024 and a deny-list (6443/8080/10250) are refused with typed ErrPortConflict; install/verify/undo discipline with teardown under installMu.",
+f:["runtime/firecracker-backend/publish.go","deploy/k8s/README.md"],i:["INV-017","INV-018"],a:["ADR-007"]}
+};
+
+var det = document.getElementById('compDetail');
+function showComp(id){
+  var c = COMPONENTS[id]; if(!c) return;
+  var h = '<h3>'+c.t+'</h3><p style="margin:4px 0;color:var(--dim)">'+c.d+'</p>';
+  h += '<dt>Key files</dt><dd><ul>'+c.f.map(function(x){return '<li>'+x+'</li>'}).join('')+'</ul></dd>';
+  h += '<dt>Invariants</dt><dd>'+c.i.map(function(x){return '<span class="tag inv">'+x+'</span>'}).join('')+'</dd>';
+  h += '<dt>ADRs</dt><dd>'+c.a.map(function(x){return '<span class="tag adr">'+x+'</span>'}).join('')+'</dd>';
+  det.innerHTML = h;
+  document.querySelectorAll('#archSvg .comp').forEach(function(g){
+    g.classList.toggle('sel', g.getAttribute('data-c')===id);
+  });
+}
+document.querySelectorAll('#archSvg .comp').forEach(function(g){
+  var id = g.getAttribute('data-c');
+  g.addEventListener('click', function(){ showComp(id); });
+  g.addEventListener('keydown', function(e){ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); showComp(id); }});
+});
+
+/* ---------- lifecycle walks ---------- */
+var WALKS = [
+{ name:"(a) Create sandbox", steps:[
+ "Client: <code>POST /v1/sandboxes</code> with a workload spec. control-planed authenticates the dev token and delegates to the sandbox-manager.",
+ "Manager validates tenant admission quota (PLAN §13) and records the sandbox UNMATERIALIZED — the logical entity exists before any compute does (INV-002).",
+ "<code>POST /v1/sandboxes/{id}/materialize</code>: the scheduler scores host views (capacity, cache locality, pressure) and issues a per-sandbox <b>placement fence</b>.",
+ "Fleet routes a fenced Create to the chosen host-agentd (ADR-005). The host assembles the environment artifact + workspace generation overlay and pins the env against eviction.",
+ "firecracker backend: copies the rootfs, injects systemd units (workspace, network, guest-supervisor), attaches the content-addressed <b>tools drive</b>, reserves a TAP slot, boots the jailed VMM.",
+ "guest-supervisor comes up over vsock; startup commands run; the workspace commits as generation 1.",
+ "Manager transitions the sandbox to RUNNING with <b>execution epoch 1</b>, emits SandboxMaterialized through the outbox, and commits state+events atomically to the FileStore."
+]},
+{ name:"(b) Execute in sandbox", steps:[
+ "Client: <code>POST /v1/sandboxes/{id}/exec</code> with a command and an idempotency key (INV-011 — retries are safe, replays return the recorded outcome).",
+ "Manager checks the sandbox is in an exec-startable state and registers the execution — every execution is independently addressable (INV-010).",
+ "Fleet routes the op to the host owning the live incarnation; the host agent validates the handle and forwards to the guest-supervisor over vsock (control path, not bulk data — INV-025).",
+ "The supervisor runs the command inside the microVM and applies file writes; completion is reported as a structured result.",
+ "<code>WaitExecution</code> finalizes the execution with the recorded outcome. Note: command completion is <i>not</i> sandbox quiescence (INV-012) — background processes are tracked separately.",
+ "Workspace writes commit at an explicit boundary (INV-006): the workspace generation advances, durable and independent of the compute that produced it (INV-005).",
+ "All events (execution finalized, workspace committed) flow through the outbox in the same transaction — clients and auditors replay one ordered log."
+]},
+{ name:"(c) Suspend → checkpoint → traffic-triggered resume", steps:[
+ "<b>Suspend.</b> Manager chooses the checkpoint path: the backend pauses the VMM and writes memory + vCPU state. With incremental snapshots (ADR-006) this is a sparse <b>diff</b> chained to its parent — meta.json records kind/parent/depth, per-link sha256, and host facts (arch, kernel release, CPU part).",
+ "The incarnation is terminated: RAM and slots are reclaimed, the placement is erased, endpoint bindings go SUSPENDED (their DNAT is removed). The checkpoint record is durable in the manager store.",
+ "Idle sandboxes now cost nothing but storage (INV-029: a large logical-agent population needs no matching live-sandbox population).",
+ "<b>Traffic arrives.</b> A client requests <code>ep1.endpoints.sandbox.local/...</code>. endpoint-proxyd resolves the name to a binding (O(1) name index; unknown names are negative-cached).",
+ "The gateway verdict comes back <b>denied but Resumable</b> (typed flag — binding SUSPENDED / sandbox not live). The proxy single-flights one Manager.Resume for the sandbox; concurrent waiters share the flight.",
+ "<b>Routed restore (ADR-008).</b> Fleet.Restore routes to the checkpoint's <b>origin host</b> — the bits are host-local. A pending placement is registered before the RPC (a host re-registration mid-restore can't orphan-scrub the VM), the snapshot chain is validated link-by-link (facts + hashes) and merged host-side, and the VMM boots from it. Failure rolls back: the possibly-booted incarnation is terminated — never two live incarnations.",
+ "Continuity is preserved: <b>same execution epoch</b>, no ExecutionStateReset (FR-SR-005). Bindings whose epoch fence still matches reactivate and are republished (FC-PUB DNAT reinstalled on the host).",
+ "The proxy re-routes (allowed now) and reverse-proxies the original request to the published port — the client gets the guest's <b>200</b>, unaware the sandbox was suspended."
+]}];
+
+var curWalk = 0, curStep = 0;
+var tabs = document.querySelectorAll('.walkTabs button');
+var stepsEl = document.getElementById('wSteps'), posEl = document.getElementById('wPos');
+function renderWalk(){
+  stepsEl.innerHTML = '';
+  WALKS[curWalk].steps.forEach(function(s, i){
+    var li = document.createElement('li');
+    li.innerHTML = s;
+    if (i === curStep) li.className = 'active';
+    stepsEl.appendChild(li);
+  });
+  posEl.textContent = 'step ' + (curStep+1) + ' / ' + WALKS[curWalk].steps.length;
+  tabs.forEach(function(b, i){ b.setAttribute('aria-selected', i===curWalk ? 'true' : 'false'); });
+}
+function step(d){
+  curStep = Math.min(WALKS[curWalk].steps.length-1, Math.max(0, curStep + d));
+  renderWalk();
+}
+document.getElementById('wNext').addEventListener('click', function(){
+  if (curStep < WALKS[curWalk].steps.length-1) step(1);
+  else { curStep = 0; renderWalk(); }
+});
+document.getElementById('wPrev').addEventListener('click', function(){ step(-1); });
+tabs.forEach(function(b, i){
+  b.addEventListener('click', function(){ curWalk = i; curStep = 0; renderWalk(); });
+});
+document.addEventListener('keydown', function(e){
+  if (document.activeElement && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight') step(1);
+  if (e.key === 'ArrowLeft') step(-1);
+});
+renderWalk();
+
+/* ---------- invariants ---------- */
+var INV_GROUPS = [
+{g:"Identity, durability & epochs", inv:[
+ ["INV-001","Logical sandbox state follows the task; physical compute does not","A sandbox is a durable logical entity; VMs come and go beneath it."],
+ ["INV-002","Agent activation does not imply sandbox materialization","Creating a sandbox costs nothing until you materialize it."],
+ ["INV-005","Committed workspace state is durable and independent of compute","Files survive the VM that wrote them."],
+ ["INV-006","Workspace durability has explicit commit boundaries","You know exactly what can be lost: everything since the last commit."],
+ ["INV-007","Volatile execution state has an epoch","Running processes are stamped with a generation; the platform never confuses two lives of one sandbox."],
+ ["INV-008","Loss of volatile state is never invisible","If the running state died, the agent runtime is told — no silent amnesia."],
+ ["INV-009","Snapshots preserve continuity but are never the sole source of truth","Checkpoints restore convenience, not correctness; the durable store is authoritative."]]},
+{g:"Execution & resource accounting", inv:[
+ ["INV-010","Every execution is independently addressable","Each command run has its own ID and outcome."],
+ ["INV-011","Execution creation is retry-safe","Idempotency keys make retried execs run exactly once."],
+ ["INV-012","Command completion is not sandbox quiescence","A finished command doesn't mean the sandbox is idle — background work is tracked."],
+ ["INV-013","All computation is transitively owned by a work lease","Every CPU cycle belongs to a lease; nothing runs unattributed."],
+ ["INV-014","Explicit async APIs are coordination, not accounting","Async handles synchronize work; the lease does the metering."],
+ ["INV-015","Background compute is allowed but bounded","Background processes are fine — within declared, enforced limits."],
+ ["INV-016","CPU consumption must be attributable","Usage can always be traced back to a sandbox and tenant."]]},
+{g:"Endpoints, network & security", inv:[
+ ["INV-017","Temporary service exposure is a control-plane binding","Exposing a port is a managed, fenced object — not a side effect."],
+ ["INV-018","Network and credentials are capabilities, not ambient privileges","Guests get exactly the egress and secrets their policy grants; nothing by default."],
+ ["INV-027","Security isolation is stronger than Kubernetes namespace isolation","Untrusted code runs in microVMs, not containers."]]},
+{g:"Fleet, placement & Kubernetes", inv:[
+ ["INV-019","Kubernetes is fleet infrastructure, not the agent API","K8s manages hosts; it never leaks into the public surface."],
+ ["INV-020","Kubernetes is not on the hot path of each tool call","Tool calls route straight to the host — no API-server round trips."],
+ ["INV-023","Node locality is an optimization, never a correctness dependency","Being near data is a bonus; being wrong about it is never fatal."],
+ ["INV-024","Failure and preemption are normal paths","Host loss is exercised in the chaos harness, not treated as exceptional."],
+ ["INV-026","Runtime implementation is substitutable","Backends are interchangeable behind declared capabilities — but only Firecracker is production."]]},
+{g:"Environments, data & scale", inv:[
+ ["INV-003","Agent runtime and sandbox runtime are separate systems","The LLM's process and the sandbox's compute fail independently."],
+ ["INV-004","A sandbox may span many LLM turns","State persists across the whole conversation, not one tool call."],
+ ["INV-021","Prepared environments are immutable, versioned inputs","Base images are content-addressed and never mutate under a running task."],
+ ["INV-022","Shared immutable state is deduplicated; mutable task state is isolated","One copy of the base layer; private writes per sandbox."],
+ ["INV-025","Control events and bulk data use different paths","vsock/RPC for control; separate paths for file payloads."],
+ ["INV-028","Multiple clients may attach to one sandbox without changing ownership","Extra attachers watch; they don't become owners."],
+ ["INV-029","A large logical-agent population must not require a matching live-sandbox population","Idle sandboxes suspend to storage — scale is not limited by RAM."],
+ ["INV-030","Events are model-independent","The event log names no LLM vendor; it describes sandbox facts only."]]}
+];
+var invHtml = '';
+INV_GROUPS.forEach(function(gr){
+  invHtml += '<div class="invGroup"><h3>'+gr.g+'</h3>';
+  gr.inv.forEach(function(v){
+    invHtml += '<div class="inv"><b>'+v[0]+'</b> <span class="t">— '+v[1]+'</span><div class="g">'+v[2]+'</div></div>';
+  });
+  invHtml += '</div>';
+});
+document.getElementById('invList').innerHTML = invHtml;
+
+/* ---------- ADRs ---------- */
+var ADRS = [
+ ["ADR-001","2026-09-13/14","Runtime isolation backend — Firecracker","One jailed microVM VMM per sandbox; KVM isolation as the production boundary."],
+ ["ADR-002","2026-09-13","Durability and execution-epoch semantics","Durable logical state + epochs for volatile state; loss is always visible, never silent."],
+ ["ADR-003","2026-09-13","Event and state schema versioning","Every stored record and event carries a schema version for replay across upgrades."],
+ ["ADR-004","2026-09-14","One production isolation class","Fake/local/isolated backends are contract-verified test doubles, not production backends."],
+ ["ADR-005","2026-09-15","Kubernetes manages execution-host capacity only","K8s owns host lifecycle; the sandbox scheduler keeps placement; fenced HTTP/JSON RPC is the fleet transport."],
+ ["ADR-006","2026-09-15","Incremental (diff) memory snapshots","Sparse diff checkpoints chained to a full base (depth-capped), validated link-by-link on restore."],
+ ["ADR-007","2026-09-15","Traffic-triggered resume","An ingress resume-proxy makes suspended sandboxes transparently addressable: single-flight resume, then forward."],
+ ["ADR-008","2026-09-16","Routed checkpoint restore, origin-host-only","Restore routes to the checkpoint's origin host under a fresh fence; pending placement + rollback keep it atomic (Batch C amendment)."]
+];
+var adrHtml = '';
+ADRS.forEach(function(a){
+  adrHtml += '<div class="adr"><b>'+a[0]+'</b> <span class="d">'+a[1]+'</span><div><b style="color:var(--fg);font-family:inherit">'+a[2]+'</b></div><div class="d">'+a[3]+'</div></div>';
+});
+document.getElementById('adrList').innerHTML = adrHtml;
+</script>
+</body>
+</html>
