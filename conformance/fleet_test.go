@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -904,4 +905,386 @@ func commitEmptyWS(t *testing.T, ws *workspace.Memory) (string, int64) {
 		t.Fatal(err)
 	}
 	return w.WorkspaceID, gen.Generation
+}
+
+// --- Review Batch C: routed-restore atomicity (ADR-008 amendment) ---
+
+// scriptedHost wraps a real HostAgent with a controllable Restore (gate +
+// injected error) and Terminate/IncarnationIDs recording, for the H4/H5
+// races that need mid-RPC control.
+type scriptedHost struct {
+	*hostagent.HostAgent
+	restoreGate chan struct{}
+	inFlight    chan struct{}
+	once        sync.Once
+	restoreErr  error
+	running     []string
+	mu          sync.Mutex
+	terminated  []string
+}
+
+func newScriptedHost(agent *hostagent.HostAgent) *scriptedHost {
+	return &scriptedHost{
+		HostAgent:   agent,
+		restoreGate: make(chan struct{}),
+		inFlight:    make(chan struct{}),
+	}
+}
+
+func (s *scriptedHost) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
+	s.once.Do(func() { close(s.inFlight) })
+	<-s.restoreGate
+	if s.restoreErr != nil {
+		return backendinterface.Handle{}, s.restoreErr
+	}
+	return s.HostAgent.Restore(cp)
+}
+
+func (s *scriptedHost) Terminate(h backendinterface.Handle) error {
+	s.mu.Lock()
+	s.terminated = append(s.terminated, h.IncarnationID)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *scriptedHost) IncarnationIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string{}, s.running...)
+}
+
+func (s *scriptedHost) setRunning(ids ...string) {
+	s.mu.Lock()
+	s.running = ids
+	s.mu.Unlock()
+}
+
+func (s *scriptedHost) terminatedIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string{}, s.terminated...)
+}
+
+func restoreCheckpoint(origin string) backendinterface.CheckpointData {
+	return backendinterface.CheckpointData{
+		IncarnationID: "inc-x",
+		Metadata: map[string]string{
+			"origin_host":  origin,
+			"sandbox_id":   "sb-x",
+			"memory_bytes": "64",
+		},
+	}
+}
+
+// H4: a restore RPC in flight holds a PENDING placement; a host
+// re-registration in that window must treat the restoring incarnation as
+// owned — never scrub it as an orphan.
+func TestFleetRestorePendingSurvivesReregister(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC))
+	ws := workspace.NewMemory(clock, domain.NewIDGen())
+	fleet := hostagent.NewFleet(clock, nil, ws)
+	agent := hostagent.New("host-1", fakebackend.New(), nil, ws, 1<<20, 4, 16)
+	sh := newScriptedHost(agent)
+	fleet.RegisterHost(sh)
+
+	cp := restoreCheckpoint("host-1")
+	type result struct {
+		h   backendinterface.Handle
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		h, err := fleet.Restore(cp)
+		done <- result{h, err}
+	}()
+	<-sh.inFlight // restore RPC is on the wire; placement is still pending
+
+	// The host re-registers mid-restore, reporting the (already booting)
+	// incarnation as running: pending placement must protect it.
+	sh.setRunning("inc-x")
+	fleet.RegisterHost(sh)
+	if got := sh.terminatedIDs(); len(got) != 0 {
+		t.Fatalf("pending restore scrubbed as orphan: %v", got)
+	}
+	if got := fleet.OrphansScrubbed(); got != 0 {
+		t.Fatalf("orphans scrubbed = %d, want 0", got)
+	}
+
+	close(sh.restoreGate)
+	res := <-done
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	host, _, ok := fleet.PlacementOf(res.h.IncarnationID)
+	if !ok || host != "host-1" {
+		t.Fatalf("placement after restore = %q, %v", host, ok)
+	}
+}
+
+// H4/H5 rollback: a failed restore RPC drops the pending placement AND
+// terminates the possibly-booted incarnation on the host, best-effort — a
+// lost ACK must not leave a fleet-invisible VM running.
+func TestFleetRestoreRollbackTerminatesOnFailure(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC))
+	ws := workspace.NewMemory(clock, domain.NewIDGen())
+	fleet := hostagent.NewFleet(clock, nil, ws)
+	agent := hostagent.New("host-1", fakebackend.New(), nil, ws, 1<<20, 4, 16)
+	sh := newScriptedHost(agent)
+	sh.restoreErr = errors.New("rpc timeout: ack lost")
+	close(sh.restoreGate)
+	fleet.RegisterHost(sh)
+
+	if _, err := fleet.Restore(restoreCheckpoint("host-1")); err == nil {
+		t.Fatal("restore succeeded despite injected error")
+	}
+	got := sh.terminatedIDs()
+	if len(got) != 1 || got[0] != "inc-x" {
+		t.Fatalf("rollback terminates = %v, want [inc-x]", got)
+	}
+	if _, _, ok := fleet.PlacementOf("inc-x"); ok {
+		t.Fatal("placement registered after failed restore")
+	}
+}
+
+// countingRestoreBackend counts backend Restore calls (re-boots).
+type countingRestoreBackend struct {
+	*fakebackend.Backend
+	restores int32
+}
+
+func (c *countingRestoreBackend) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
+	atomic.AddInt32(&c.restores, 1)
+	return c.Backend.Restore(cp)
+}
+
+// H5a: a retried restore of an already-live incarnation under the same
+// fence is an idempotent replay — the handle is returned, the backend is
+// NOT re-booted (the first attempt's ACK was lost).
+func TestHostAgentRestoreIdempotentReplay(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC))
+	ws := workspace.NewMemory(clock, domain.NewIDGen())
+	backend := &countingRestoreBackend{Backend: fakebackend.New()}
+	agent := hostagent.New("host-1", backend, nil, ws, 1<<20, 4, 16)
+	wsID, wsGen := commitEmptyWS(t, ws)
+	h, err := agent.Create(hostagent.CreateRequest{
+		SandboxID: "sb-r", IncarnationID: "inc-r", Fence: 1, Epoch: 1,
+		WorkspaceID: wsID, WorkspaceGeneration: wsGen, MemoryBytes: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.Start(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.Pause(h); err != nil {
+		t.Fatal(err)
+	}
+	cp, err := agent.Snapshot(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := agent.Restore(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&backend.restores); got != 1 {
+		t.Fatalf("backend restores after first restore = %d, want 1", got)
+	}
+	// Retry with the same incarnation/fence: replay, no re-boot.
+	h3, err := agent.Restore(cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h3 != h2 {
+		t.Fatalf("replay returned %v, want %v", h3, h2)
+	}
+	if got := atomic.LoadInt32(&backend.restores); got != 1 {
+		t.Fatalf("retry re-booted the incarnation (restores = %d), want 1", got)
+	}
+}
+
+// H5b: a restore error may be a lost ACK with the incarnation actually
+// booted — the resume path terminates the checkpoint's incarnation before
+// materializing a replacement, so two live incarnations never coexist.
+type ambiguousRuntime struct {
+	*fakebackend.Backend
+	failRestore bool
+	mu          sync.Mutex
+	terminated  []string
+}
+
+func (a *ambiguousRuntime) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
+	h, err := a.Backend.Restore(cp) // the boot actually happens...
+	if a.failRestore {
+		return h, errors.New("rpc timeout: ack lost") // ...but the ACK is lost
+	}
+	return h, err
+}
+
+func (a *ambiguousRuntime) Terminate(h backendinterface.Handle) error {
+	a.mu.Lock()
+	a.terminated = append(a.terminated, h.IncarnationID)
+	a.mu.Unlock()
+	return a.Backend.Terminate(h)
+}
+
+func (a *ambiguousRuntime) terminatedIDs() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string{}, a.terminated...)
+}
+
+func TestResumeAmbiguousRestoreReconciles(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC))
+	ids := domain.NewIDGen()
+	ws := workspace.NewMemory(clock, ids)
+	outbox := eventservice.NewOutbox()
+	rt := &ambiguousRuntime{Backend: fakebackend.New()}
+	mgr := sandboxmanager.New(clock, ids, ws, rt, outbox, sandboxmanager.NewMemoryStore(), "host-1")
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-h5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+	old, err := mgr.GetSandbox(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldInc := *old.RuntimeIncarnationID
+	if err := mgr.Suspend(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	rt.failRestore = true
+	report, err := mgr.Resume(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.NewEpoch == report.PriorEpoch {
+		t.Fatal("ambiguous restore kept continuity?")
+	}
+	// The possibly-booted incarnation was terminated before the replacement.
+	found := false
+	for _, id := range rt.terminatedIDs() {
+		if id == oldInc {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("checkpoint incarnation %s never terminated: %v", oldInc, rt.terminatedIDs())
+	}
+	if rt.Alive(backendinterface.Handle{IncarnationID: oldInc}) {
+		t.Fatal("lost-ACK incarnation still alive after reconcile")
+	}
+	cur, err := mgr.GetSandbox(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newInc := *cur.RuntimeIncarnationID
+	if newInc == oldInc {
+		t.Fatal("replacement reuses the ambiguous incarnation")
+	}
+	if !rt.Alive(backendinterface.Handle{IncarnationID: newInc}) {
+		t.Fatal("replacement incarnation not live")
+	}
+}
+
+// M5: a checkpoint missing its accounting facts (sandbox_id,
+// memory_bytes) is rejected with a typed error at the enforcement point —
+// no skipped fence check, no zero capacity charge.
+func TestHostAgentRestoreRejectsMissingFacts(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC))
+	ws := workspace.NewMemory(clock, domain.NewIDGen())
+	agent := hostagent.New("host-1", fakebackend.New(), nil, ws, 1<<20, 4, 16)
+	mk := func(md map[string]string) backendinterface.CheckpointData {
+		return backendinterface.CheckpointData{IncarnationID: "inc-f", Metadata: md}
+	}
+	for _, md := range []map[string]string{
+		{"memory_bytes": "64"}, // missing sandbox_id
+		{"sandbox_id": "sb-f"}, // missing memory_bytes
+		{"sandbox_id": "sb-f", "memory_bytes": "garbage"},
+		{"sandbox_id": "sb-f", "memory_bytes": "0"},
+	} {
+		if _, err := agent.Restore(mk(md)); !errors.Is(err, hostagent.ErrInvalidCheckpoint) {
+			t.Fatalf("restore with facts %v: err = %v, want ErrInvalidCheckpoint", md, err)
+		}
+		if v := agent.View(); v.UsedSlots != 0 || v.UsedMemory != 0 {
+			t.Fatalf("rejected restore charged capacity: %+v", v)
+		}
+	}
+	if _, err := agent.Restore(mk(map[string]string{"sandbox_id": "sb-f", "memory_bytes": "64"})); err != nil {
+		t.Fatalf("restore with complete facts: %v", err)
+	}
+	if v := agent.View(); v.UsedSlots != 1 || v.UsedMemory != 64 {
+		t.Fatalf("capacity after valid restore = %d slots/%d mem, want 1/64", v.UsedSlots, v.UsedMemory)
+	}
+}
+
+// M9: restore placement failures do NOT feed the fleet-wide scale-out
+// counter (the restore is pinned to the origin host), and a successful
+// restore resets the streak exactly like Create.
+func TestFleetCapacityFailuresResetOnRestore(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC))
+	ws := workspace.NewMemory(clock, domain.NewIDGen())
+	fleet := hostagent.NewFleet(clock, nil, ws)
+	agent := hostagent.New("host-1", fakebackend.New(), nil, ws, 1<<20, 1, 16)
+	fleet.RegisterHost(agent)
+	wsID, wsGen := commitEmptyWS(t, ws)
+	spec := backendinterface.Spec{SandboxID: "sb-1", IncarnationID: "inc-1", Epoch: 1, MemoryBytes: 64, WorkspaceID: wsID, WorkspaceGeneration: wsGen}
+	h, err := fleet.Create(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fill the single slot, then burn the scale-out streak on real creates.
+	if err := fleet.Start(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := fleet.Pause(h); err != nil {
+		t.Fatal(err)
+	}
+	cp, err := fleet.Snapshot(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp.Metadata["origin_host"] = "host-1"
+	// Reclaim inc-1 (snapshot-class suspend), then fill the freed slot with
+	// another incarnation so the origin host is full.
+	if err := fleet.Terminate(h); err != nil {
+		t.Fatal(err)
+	}
+	fill := spec
+	fill.SandboxID = "sb-fill"
+	fill.IncarnationID = "inc-fill"
+	hFill, err := fleet.Create(fill)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		full := spec
+		full.SandboxID = fmt.Sprintf("sb-full-%d", i)
+		full.IncarnationID = fmt.Sprintf("inc-full-%d", i)
+		if _, err := fleet.Create(full); err == nil {
+			t.Fatal("create on full host succeeded")
+		}
+	}
+	if got := fleet.Recommendation(); got.AddHosts == 0 {
+		t.Fatal("no scale-out recommendation after capacity failures")
+	}
+	// A pinned restore against the full origin fails WITHOUT ratcheting the
+	// counter further (it never increments it at all).
+	if _, err := fleet.Restore(cp); err == nil {
+		t.Fatal("restore onto full origin succeeded")
+	}
+	if got := fleet.Recommendation(); got.AddHosts != 1 {
+		t.Fatalf("recommendation after failed pinned restore = %+v, want AddHosts 1 (unchanged)", got)
+	}
+	// Free the slot; the successful restore resets the streak like Create.
+	if err := fleet.Terminate(hFill); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fleet.Restore(cp); err != nil {
+		t.Fatal(err)
+	}
+	if got := fleet.Recommendation(); got.AddHosts != 0 {
+		t.Fatalf("recommendation after successful restore = %+v, want zero", got)
+	}
 }

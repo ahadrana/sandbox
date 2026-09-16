@@ -62,11 +62,22 @@ claims to close. Plus one remote-DoS path in the resume proxy.
   incarnations. Agent restart in that window → VM killed while the manager
   already took the continuity path (epoch preserved, bindings republished to a
   dead VM). Fix: pending-placement registration under `f.mu` before the RPC.
+  **FIXED** — `Fleet.Restore` registers a pending placement before the RPC;
+  `RegisterHost` treats pending incarnations as owned; failure rolls back
+  with a best-effort host Terminate; ADR-008 amendment;
+  `TestFleetRestorePendingSurvivesReregister`,
+  `TestFleetRestoreRollbackTerminatesOnFailure`.
 - **H5. Lost restore ACK strands a fleet-invisible live incarnation; Restore not
   idempotent.** Lost response → manager falls back to workspace-only, restored
   VM keeps running unknown to the fleet; retried Restore with same fence
   re-boots the incarnation (`hostagent.go:500-503`). Fix: idempotent restore
   replay + reconcile.
+  **FIXED** — (a) `HostAgent.Restore` of an already-live incarnation under
+  the same fence returns the handle without re-booting;
+  (b) fleet rollback Terminate on restore-RPC error + manager Resume
+  terminates the checkpoint incarnation unconditionally before
+  workspace-only fallback; `TestHostAgentRestoreIdempotentReplay`,
+  `TestResumeAmbiguousRestoreReconciles`.
 
 ## Medium
 
@@ -101,6 +112,9 @@ claims to close. Plus one remote-DoS path in the resume proxy.
   `hostagent.go:481-499`: missing `sandbox_id` → fence check skipped + outside
   bySandbox (no orphan protection); unparseable `memory_bytes` → capacity
   charge 0. Reject unparseable accounting facts instead of defaulting.
+  **FIXED** — re-registration restore requires parseable `sandbox_id` and
+  `memory_bytes`, else typed `ErrInvalidCheckpoint`;
+  `TestHostAgentRestoreRejectsMissingFacts`.
 - **M6. Publish-before-persist has no compensating action.** `manager.go:1733-42`:
   DNAT installed before `m.tx` commit; later failure leaks rule + port with no
   owning binding.
@@ -120,6 +134,10 @@ claims to close. Plus one remote-DoS path in the resume proxy.
 - **M9. `capacityFailures` asymmetry.** `Fleet.Restore` increments on failed
   Place, never resets on success (Create does); restore is pinned to one host
   so a full origin ratchets the fleet-wide scale-out signal permanently.
+  **FIXED** — pinned-origin restore placement failures no longer increment
+  the fleet-wide counter at all (a full origin says nothing about fleet
+  capacity; justified in code comment), and a successful restore resets the
+  streak like Create; `TestFleetCapacityFailuresResetOnRestore`.
 
 ## Low
 
@@ -140,13 +158,22 @@ claims to close. Plus one remote-DoS path in the resume proxy.
   ACTIVE-but-unpublished bindings; `TestEndpointPublishRetriedOnTick`.
 - L5. Live in-place restore can regress `rec.fence` below advanced
   `h.fences[sandboxID]`. `hostagent.go:506-508`.
+  **FIXED** — fence adoption is a max, never an assignment;
+  `TestRestoreFenceNoRegression`.
 - L6. RPC `restore` nil-derefs `req.Checkpoint` (recovered as error; same
   pre-existing pattern as `exec`).
+  **FIXED** — nil checkpoint rejected with a typed bad-request error before
+  deref; `TestRestoreNilCheckpointRejected`.
 - L7. `scheduler.Guard` drops the `arch` fact (P0.4 restore validation still
   fails closed — placement-quality only).
+  **FIXED** — `Guard`/`HostView` gain `Arch` (exact match when set, empty =
+  legacy unguarded), populated from `CheckpointFacts["arch"]` and
+  `HostAgent.View`; `TestCheckpointGuardArch`.
 - L8. Empty/partial CheckpointFacts map → `Guard{"",""}` → unconditional
   locality bonus (legacy behavior the guard exists to gate); safe only because
   the sole producer filters empties.
+  **FIXED** — fleet guard construction treats an all-empty Guard as "no
+  guard" (defense in depth).
 - L9. netinit sysctl is node-wide and persists after the pod
   (`ip_unprivileged_port_start=0` on hostNetwork) — documented but unenforced
   host-hardening regression; dedicated nodes assumed, not enforced.
@@ -189,14 +216,16 @@ claims to close. Plus one remote-DoS path in the resume proxy.
 
 1. ~~C1 addrtype/dst-type LOCAL match on publish hooks.~~ FIXED (Batch A).
 2. ~~H1 protected port floor + deny-list.~~ FIXED (Batch A).
-3. H4+H5 atomic pending-placement registration + idempotent restore.
+3. ~~H4+H5 atomic pending-placement registration + idempotent restore.~~
+   FIXED (Batch C).
 4. ~~H3 negative name cache + manager name index.~~ FIXED (Batch B).
 5. ~~H2 fence/route enforcement on publish RPCs.~~ FIXED (Batch A).
 6. ~~M1 transport timeout alignment; M2 typed route verdicts~~ (M1/M2 FIXED,
    Batch B); ~~M3 binding validation (TTL, port)~~ (M3 FIXED, Batch A);
    ~~M4 drop m.mu across fleet RPCs~~ FIXED (Batch B).
-7. M5 reject unparseable restore metadata; ~~M6 compensating unpublish;
-   M7 installMu in cleanup~~ (M6/M7 FIXED, Batch A); ~~M8 GC locking~~
-   FIXED (Batch B); M9 capacity-failure reset.
-8. L-items as a batch (L1–L4 FIXED, Batch A; L10 FIXED, Batch B; L5–L9,
-   L11–L14 open).
+7. ~~M5 reject unparseable restore metadata~~ FIXED (Batch C); ~~M6
+   compensating unpublish; M7 installMu in cleanup~~ (M6/M7 FIXED, Batch A);
+   ~~M8 GC locking~~ FIXED (Batch B); ~~M9 capacity-failure reset~~ FIXED
+   (Batch C).
+8. L-items as a batch (L1–L4 FIXED, Batch A; L10 FIXED, Batch B; L5–L8
+   FIXED, Batch C; L9, L11–L14 open).

@@ -1681,7 +1681,7 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 			// fresh materialization, placement must still prefer the host
 			// holding the checkpoint — gated on exact host-facts match.
 			checkpointFacts = checkpointFactsOf(record.data)
-			h, live := m.handles[sandboxID]
+			_, live := m.handles[sandboxID]
 			// Reclaim-class backends drop the handle at suspend; continuity
 			// is still available via Restore from the checkpoint, and the
 			// fresh handle is re-registered.
@@ -1693,9 +1693,13 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 					restoreErr = err.Error()
 				}
 				// Continuity broken: clean the stale incarnation and fall
-				// back to workspace-only recovery.
+				// back to workspace-only recovery. The terminate is
+				// unconditional (review H5): a restore error may be a lost
+				// ACK with the incarnation actually booted — never
+				// materialize a replacement while a possibly-live
+				// incarnation of this sandbox runs fleet-invisible.
+				m.rt.Terminate(backendinterface.Handle{IncarnationID: record.data.IncarnationID})
 				if live {
-					m.rt.Terminate(h)
 					delete(m.handles, sandboxID)
 				}
 			}

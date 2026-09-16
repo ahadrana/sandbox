@@ -180,6 +180,9 @@ func dispatch(h hostagent.Host, req request) (resp response) {
 		}
 		return response{OK: true, Checkpoint: &cp}
 	case "restore":
+		if req.Checkpoint == nil {
+			return fail(fmt.Errorf("bad request: restore requires a checkpoint"))
+		}
 		handle, err := h.Restore(*req.Checkpoint)
 		if err != nil {
 			return fail(err)

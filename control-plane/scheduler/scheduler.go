@@ -31,6 +31,9 @@ type HostView struct {
 	// checkpoint's guard. Populated by HostAgent.View.
 	KernelRelease string
 	CPUPart       string
+	// Arch is the machine architecture (uname -m) — the coarsest checkpoint
+	// compatibility fact (review L7).
+	Arch string
 }
 
 // Guard describes the host facts a checkpoint depends on (P1.7). A host's
@@ -40,6 +43,7 @@ type HostView struct {
 type Guard struct {
 	KernelRelease string
 	CPUPart       string
+	Arch          string
 }
 
 // Request describes one incarnation placement.
@@ -130,6 +134,9 @@ func checkpointCompatible(g *Guard, h HostView) bool {
 		return false
 	}
 	if g.CPUPart != "" && h.CPUPart != g.CPUPart {
+		return false
+	}
+	if g.Arch != "" && h.Arch != g.Arch {
 		return false
 	}
 	return true

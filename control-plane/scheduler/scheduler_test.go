@@ -105,3 +105,43 @@ func TestCheckpointGuardScoresLocality(t *testing.T) {
 		t.Fatalf("placed on %q, want guard-matching host", p.HostID)
 	}
 }
+
+// Review L7: the guard carries the arch fact — a host whose arch differs
+// from the checkpoint's earns no locality bonus, exactly like a
+// kernel/cpu-part mismatch; an empty arch fact keeps legacy semantics.
+func TestCheckpointGuardArch(t *testing.T) {
+	host := HostView{
+		HostID:            "h1",
+		Healthy:           true,
+		CapacitySlots:     4,
+		CapacityMemory:    1 << 30,
+		CachedCheckpoints: map[string]bool{"sb-1": true},
+		KernelRelease:     "6.8.0-1063-aws",
+		CPUPart:           "0xd40",
+		Arch:              "aarch64",
+	}
+	noCp := host
+	noCp.CachedCheckpoints = map[string]bool{}
+	req := Request{
+		SandboxID:      "sb-1",
+		MemoryRequired: 1 << 28,
+		CheckpointGuard: &Guard{
+			Arch:          "x86_64", // checkpoint taken on another arch
+			KernelRelease: "6.8.0-1063-aws",
+			CPUPart:       "0xd40",
+		},
+	}
+	if got, want := score(req, host), score(req, noCp); got != want {
+		t.Fatalf("arch-mismatched host score %v != no-checkpoint score %v", got, want)
+	}
+	// Matching arch keeps the bonus.
+	req.CheckpointGuard.Arch = "aarch64"
+	if got, want := score(req, host)-score(req, noCp), 3.0; got != want {
+		t.Fatalf("arch-matched bonus = %v, want %v", got, want)
+	}
+	// Empty arch fact: legacy semantics (arch not guarded).
+	req.CheckpointGuard.Arch = ""
+	if got, want := score(req, host)-score(req, noCp), 3.0; got != want {
+		t.Fatalf("empty-arch guard bonus = %v, want %v", got, want)
+	}
+}

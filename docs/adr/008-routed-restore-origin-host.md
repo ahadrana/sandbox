@@ -107,3 +107,32 @@ the fleet path actually succeeds.
   create-time one. The window requires a stale control-plane decision
   racing a host restart and is no worse than the pre-existing fence
   persistence story.
+
+## Amendment (2026-09-16, review Batch C): restore atomicity
+
+The original decision registered the restored incarnation's placement only
+after the host RPC returned, leaving three windows the 2026-09-16 review
+flagged (H4/H5). The mechanism is amended:
+
+- **Pending placement (H4).** `Fleet.Restore` registers a *pending*
+  placement under `f.mu` before the restore RPC. `RegisterHost`'s orphan
+  scrub treats pending incarnations as owned — a host re-registration
+  mid-restore can no longer kill a just-restored VM the manager is about
+  to adopt (INV-008/009 hold across the window). On RPC return the
+  pending entry is promoted to a real placement, or rolled back.
+- **Rollback on failure (H4/H5).** A failed/ambiguous restore RPC
+  (timeout, lost ACK) is followed by a best-effort `Terminate` of the
+  incarnation on the origin host, so nothing runs fleet-invisible; the
+  manager's resume path additionally terminates the checkpoint's
+  incarnation unconditionally before falling back to workspace-only
+  recovery. Settled invariant: never two live incarnations of one
+  sandbox, never a live incarnation the fleet doesn't know about.
+- **Idempotent restore replay (H5).** `HostAgent.Restore` of an
+  already-live incarnation under the same fence returns the existing
+  handle without re-booting the backend (Create's fence-replay semantics
+  extended to restore), so a retried restore after a lost ACK is safe.
+- **Restore validation (M5/L5).** Re-registration requires parseable
+  accounting facts (`sandbox_id`, `memory_bytes`) — missing/unparseable
+  facts are a typed `ErrInvalidCheckpoint`, never a skipped fence check
+  or a zero capacity charge. Fence adoption on a live in-place restore is
+  a max, never a regression.

@@ -66,10 +66,15 @@ type Fleet struct {
 	lostDeclared map[string]bool
 	lastSeen     map[string]time.Time
 
-	byIncarnation   map[string]string // incarnationID -> hostID
-	fenceOf         map[string]int64  // incarnationID -> fence
-	pendingLost     []string          // incarnation IDs awaiting manager reconciliation
-	orphansScrubbed int               // host incarnations scrubbed at re-registration
+	byIncarnation map[string]string // incarnationID -> hostID
+	fenceOf       map[string]int64  // incarnationID -> fence
+	// pendingRestore marks incarnations whose restore RPC is in flight:
+	// placement is registered only after the RPC returns (review H4), and a
+	// host re-registration in that window must treat the incarnation as
+	// owned, never as an orphan to scrub.
+	pendingRestore  map[string]bool
+	pendingLost     []string // incarnation IDs awaiting manager reconciliation
+	orphansScrubbed int      // host incarnations scrubbed at re-registration
 	DefaultMemory   int64
 
 	capacityFailures int // consecutive capacity-caused placement failures
@@ -119,7 +124,8 @@ func NewFleet(clock domain.Clock, envs EnvironmentSource, ws WorkspaceStore) *Fl
 		missed: map[string]int{}, lostDeclared: map[string]bool{},
 		lastSeen:      map[string]time.Time{},
 		byIncarnation: map[string]string{}, fenceOf: map[string]int64{},
-		DefaultMemory: 128,
+		pendingRestore: map[string]bool{},
+		DefaultMemory:  128,
 	}
 }
 
@@ -137,8 +143,12 @@ func (f *Fleet) RegisterHost(h Host) {
 		running[incID] = true
 		f.mu.Lock()
 		_, known := f.byIncarnation[incID]
+		pending := f.pendingRestore[incID]
 		f.mu.Unlock()
-		if !known {
+		// An incarnation with a restore RPC in flight is owned (review H4):
+		// its placement registers when the RPC returns, so a host
+		// re-registration in that window must not scrub it as an orphan.
+		if !known && !pending {
 			h.Terminate(backendinterface.Handle{IncarnationID: incID})
 			f.mu.Lock()
 			f.orphansScrubbed++
@@ -230,9 +240,16 @@ func (f *Fleet) Create(spec backendinterface.Spec) (backendinterface.Handle, err
 	// whose facts match exactly (a mismatched host could not restore it
 	// anyway, ADR-001 P0.4 validation).
 	if len(spec.CheckpointFacts) > 0 {
-		req.CheckpointGuard = &scheduler.Guard{
+		g := scheduler.Guard{
+			Arch:          spec.CheckpointFacts["arch"],
 			KernelRelease: spec.CheckpointFacts["kernel_release"],
 			CPUPart:       spec.CheckpointFacts["cpu_part"],
+		}
+		// Review L8: an all-empty guard is meaningless (every host would
+		// "match") — treat it as no guard, defense in depth even though the
+		// manager already filters empty facts out of CheckpointFacts.
+		if g != (scheduler.Guard{}) {
+			req.CheckpointGuard = &g
 		}
 	}
 	placement, err := f.sched.Place(req, views)
@@ -380,17 +397,23 @@ func (f *Fleet) Restore(cp backendinterface.CheckpointData) (backendinterface.Ha
 		mem = f.DefaultMemory
 	}
 	// Placement on the single admissible host: capacity is re-validated and
-	// a fresh placement fence issued.
+	// a fresh placement fence issued. A failure here does NOT feed the
+	// fleet-wide scale-out counter (review M9): the restore is pinned to
+	// the origin host, so a full origin says nothing about fleet capacity —
+	// counting it would ratchet a false scale-out signal permanently.
 	placement, err := f.sched.Place(scheduler.Request{
 		SandboxID:      cp.Metadata["sandbox_id"],
 		MemoryRequired: mem,
 	}, []scheduler.HostView{view})
 	if err != nil {
-		f.mu.Lock()
-		f.capacityFailures++
-		f.mu.Unlock()
 		return backendinterface.Handle{}, err
 	}
+	// Review H4: register a PENDING placement before the RPC so a host
+	// re-registration mid-restore treats the incarnation as owned (never an
+	// orphan to scrub); promote on success, roll back on failure.
+	f.mu.Lock()
+	f.pendingRestore[cp.IncarnationID] = true
+	f.mu.Unlock()
 	// Refresh the fence in a COPY of the metadata — the caller's checkpoint
 	// record is shared state.
 	md := make(map[string]string, len(cp.Metadata)+1)
@@ -403,13 +426,23 @@ func (f *Fleet) Restore(cp backendinterface.CheckpointData) (backendinterface.Ha
 		Files:         cp.Files,
 		Metadata:      md,
 	})
+	f.mu.Lock()
+	delete(f.pendingRestore, cp.IncarnationID)
+	if err == nil {
+		f.byIncarnation[handle.IncarnationID] = placement.HostID
+		f.fenceOf[handle.IncarnationID] = placement.Fence
+		// A successful restore proves placement capacity exists — reset the
+		// scale-out failure streak exactly like Create does (review M9).
+		f.capacityFailures = 0
+	}
+	f.mu.Unlock()
 	if err != nil {
+		// Rollback (review H4/H5): the error may be a lost ACK with the
+		// incarnation actually booted on the host — terminate best-effort so
+		// nothing runs fleet-invisible before the caller falls back.
+		_ = host.Terminate(backendinterface.Handle{IncarnationID: cp.IncarnationID})
 		return backendinterface.Handle{}, err
 	}
-	f.mu.Lock()
-	f.byIncarnation[handle.IncarnationID] = placement.HostID
-	f.fenceOf[handle.IncarnationID] = placement.Fence
-	f.mu.Unlock()
 	return handle, nil
 }
 

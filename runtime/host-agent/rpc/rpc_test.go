@@ -1,9 +1,11 @@
 package rpc
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -319,5 +321,35 @@ func TestPostJSONTimeoutPlumbing(t *testing.T) {
 	defer fast.Close()
 	if err := PostJSON(fast.URL, "", nil, nil); err != nil {
 		t.Fatalf("default PostJSON: %v", err)
+	}
+}
+
+// Review L6: a restore request without a checkpoint is a typed bad-request
+// error, never a nil-deref panic.
+func TestRestoreNilCheckpointRejected(t *testing.T) {
+	backend, err := localbackend.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := hostagent.New("host-rpc-nil", backend, nil, nil, 1<<30, 4, 16)
+	srv := httptest.NewServer(Handler(agent, ""))
+	defer srv.Close()
+	resp, err := http.Post(srv.URL+"/rpc", "application/json", strings.NewReader(`{"op":"restore"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.OK || !strings.Contains(out.Error, "bad request") {
+		t.Fatalf("nil-checkpoint restore = %+v, want bad-request error", out)
+	}
+	if strings.Contains(out.Error, "panic") {
+		t.Fatalf("nil-checkpoint restore panicked: %q", out.Error)
 	}
 }

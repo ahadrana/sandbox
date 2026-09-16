@@ -22,6 +22,9 @@ var (
 	ErrStaleFence = errors.New("stale placement fence")
 	ErrCapacity   = errors.New("host capacity exceeded")
 	ErrHostDown   = errors.New("host unreachable")
+	// ErrInvalidCheckpoint marks a restore checkpoint whose accounting facts
+	// (sandbox_id, memory_bytes) are missing or unparseable (review M5).
+	ErrInvalidCheckpoint = errors.New("invalid checkpoint")
 )
 
 // RuntimeBackend is the backend surface a HostAgent supervises: the full
@@ -473,6 +476,14 @@ func (h *HostAgent) Snapshot(handle backendinterface.Handle) (backendinterface.C
 // reclaimed one is charged capacity again. The placement fence in the
 // checkpoint metadata — refreshed by the fleet at restore placement time —
 // is validated and adopted exactly like Create's.
+//
+// Retry semantics (review H5): restoring an already-live incarnation under
+// the SAME fence is an idempotent replay — the first attempt's ACK was
+// lost; the existing handle is returned and the backend is NOT re-booted.
+// Accounting facts are mandatory for a re-registration (review M5): a
+// checkpoint with a missing sandbox_id or unparseable memory_bytes is
+// rejected with ErrInvalidCheckpoint rather than skipping the fence check
+// or charging 0 capacity.
 func (h *HostAgent) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -489,8 +500,20 @@ func (h *HostAgent) Restore(cp backendinterface.CheckpointData) (backendinterfac
 			return backendinterface.Handle{}, ErrStaleFence
 		}
 	}
+	if known && !rec.paused && (!hasFence || fence == rec.fence) {
+		// Lost-ACK replay: the incarnation is already live from a prior
+		// restore under this fence — return it, never re-boot (review H5).
+		return backendinterface.Handle{IncarnationID: cp.IncarnationID}, nil
+	}
 	var memory int64
-	fmt.Sscanf(cp.Metadata["memory_bytes"], "%d", &memory)
+	if !known {
+		if sandboxID == "" {
+			return backendinterface.Handle{}, fmt.Errorf("checkpoint %s missing sandbox_id: %w", cp.IncarnationID, ErrInvalidCheckpoint)
+		}
+		if n, _ := fmt.Sscanf(cp.Metadata["memory_bytes"], "%d", &memory); n != 1 || memory <= 0 {
+			return backendinterface.Handle{}, fmt.Errorf("checkpoint %s has unparseable memory_bytes %q: %w", cp.IncarnationID, cp.Metadata["memory_bytes"], ErrInvalidCheckpoint)
+		}
+	}
 	if !known && (h.slotsUsed+1 > h.slots || h.memUsed+memory > h.memCapacity) {
 		return backendinterface.Handle{}, ErrCapacity
 	}
@@ -500,7 +523,9 @@ func (h *HostAgent) Restore(cp backendinterface.CheckpointData) (backendinterfac
 	}
 	if known {
 		rec.paused = false
-		if hasFence {
+		// Never regress the record fence below an already-advanced value
+		// (review L5): adoption is a max, not an assignment.
+		if hasFence && fence > rec.fence {
 			rec.fence = fence
 		}
 	} else {
@@ -688,6 +713,7 @@ func (h *HostAgent) View() scheduler.HostView {
 		// P1.7: host facts gate the checkpoint-locality bonus on restore.
 		KernelRelease: facts.KernelRelease,
 		CPUPart:       facts.CPUPart,
+		Arch:          facts.Arch,
 	}
 	if h.memCapacity > 0 {
 		v.Pressure = float64(h.memUsed) / float64(h.memCapacity)
