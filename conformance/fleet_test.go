@@ -3,6 +3,7 @@ package conformance
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1286,5 +1287,111 @@ func TestFleetCapacityFailuresResetOnRestore(t *testing.T) {
 	}
 	if got := fleet.Recommendation(); got.AddHosts != 0 {
 		t.Fatalf("recommendation after successful restore = %+v, want zero", got)
+	}
+}
+
+// Bug-1 regression (k3s soak, 2026-09-16): the control-plane tick loop
+// latches a host down once its heartbeat is stale, and the latch used to
+// clear only at full re-registration — so a single >stale-after stall
+// permanently excluded a live, heartbeating host from placement ("no
+// healthy host with sufficient capacity" on every create). The heartbeat
+// handler now calls HostSeen on every beat; a host that resumes
+// heartbeating must become placement-eligible again without re-registering.
+func TestHostHeartbeatRevivesDownedFleetMember(t *testing.T) {
+	fs := newFleetSystem(t, 1, 4)
+	d := agentdriver.New(fs.mgr, "tenant-1", "principal-1", 131)
+
+	fs.fleet.SimulateHostLoss("host-1") // what the tick loop does on a stale beat
+	if !fs.fleet.HostDown("host-1") {
+		t.Fatal("host not latched down after simulated loss")
+	}
+	downed, err := d.CreateSandbox("task-downed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.EnsureMaterialized(downed.SandboxID); err == nil {
+		t.Fatal("placement succeeded with the only host down")
+	}
+
+	fs.fleet.HostSeen("host-1") // what the heartbeat handler does per beat
+	if fs.fleet.HostDown("host-1") {
+		t.Fatal("host still down after a resumed heartbeat")
+	}
+	sb, err := d.CreateSandbox("task-revived")
+	if err != nil {
+		t.Fatalf("placement failed after heartbeat revival: %v", err)
+	}
+	mustMaterialize(t, d, sb.SandboxID)
+	if got := fs.placementHost(t, sb.SandboxID); got != "host-1" {
+		t.Fatalf("revived placement = %q, want host-1", got)
+	}
+}
+
+// Bug-2 regression (k3s soak, 2026-09-16): a control-plane restart resets
+// the IDGen counter to 1, so unscoped IDs (sb-1, inc-1, ...) collided with
+// incarnation records the long-lived host agent still held ("incarnation
+// inc-4 already exists"). Boot-scoped IDs make each boot's ID space
+// disjoint: a restarted plane adopts/scrubs the old boot's incarnations and
+// allocates fresh ones without collision.
+func TestControlPlaneRestartNoIDCollision(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC))
+	ws := workspace.NewMemory(clock, domain.NewIDGen())
+	backend, err := localbackend.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One long-lived host agent outlives every control-plane boot.
+	agent := hostagent.New("host-1", backend, nil, ws, 1<<20, 4, 16)
+
+	boot := func(scope string) (*hostagent.Fleet, *sandboxmanager.Manager) {
+		ids := domain.NewScopedIDGen(scope)
+		fleet := hostagent.NewFleet(clock, nil, ws)
+		fleet.RegisterHost(agent) // the agent's heartbeat re-registers it
+		mgr := sandboxmanager.New(clock, ids, ws, fleet, eventservice.NewOutbox(), sandboxmanager.NewMemoryStore(), "cp")
+		return fleet, mgr
+	}
+
+	// Boot 1: create a sandbox; the host retains its incarnation record.
+	_, mgr1 := boot("boota")
+	d1 := agentdriver.New(mgr1, "tenant-1", "principal-1", 137)
+	sb1, err := d1.CreateSandbox("task-pre-restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterialize(t, d1, sb1.SandboxID)
+	cur1, err := mgr1.GetSandbox(sb1.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inc1 := *cur1.RuntimeIncarnationID
+	if !strings.Contains(inc1, "-boota-") {
+		t.Fatalf("boot-1 incarnation %q lacks its boot scope", inc1)
+	}
+
+	// Control-plane restart: fresh fleet/manager/IDGen, same host agent.
+	// Re-registration scrubs the previous boot's incarnation as an orphan.
+	fleet2, mgr2 := boot("bootb")
+	if got := fleet2.OrphansScrubbed(); got != 1 {
+		t.Fatalf("orphans scrubbed at restart = %d, want 1", got)
+	}
+	if got := agent.IncarnationIDs(); len(got) != 0 {
+		t.Fatalf("pre-restart incarnation still live after scrub: %v", got)
+	}
+
+	// The restarted plane's counter is back at 1; with the boot scope the
+	// new incarnation ID cannot collide with the record the host held.
+	d2 := agentdriver.New(mgr2, "tenant-1", "principal-1", 139)
+	sb2, err := d2.CreateSandbox("task-post-restart")
+	if err != nil {
+		t.Fatalf("create after control-plane restart: %v", err)
+	}
+	mustMaterialize(t, d2, sb2.SandboxID)
+	cur2, err := mgr2.GetSandbox(sb2.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inc2 := *cur2.RuntimeIncarnationID
+	if inc2 == inc1 || !strings.Contains(inc2, "-bootb-") {
+		t.Fatalf("post-restart incarnation %q collides with or matches pre-restart %q", inc2, inc1)
 	}
 }

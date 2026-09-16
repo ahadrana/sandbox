@@ -43,3 +43,23 @@ func TestClockAndIDGenConcurrent(t *testing.T) {
 		seen[id] = true
 	}
 }
+
+// Boot-scoped IDGen: two control-plane boots with the same prefixes produce
+// disjoint ID spaces, so a restarted plane can never reissue an ID a
+// long-lived host agent still remembers. Unscoped NewIDGen is unchanged.
+func TestScopedIDGen(t *testing.T) {
+	a := NewScopedIDGen("boota")
+	b := NewScopedIDGen("bootb")
+	if got := a.Next("inc"); got != "inc-boota-1" {
+		t.Fatalf("scoped ID = %q, want inc-boota-1", got)
+	}
+	if got := b.Next("inc"); got != "inc-bootb-1" {
+		t.Fatalf("scoped ID = %q, want inc-bootb-1", got)
+	}
+	if a.Next("inc") == b.Next("inc") {
+		t.Fatal("scoped IDGens from different boots collided")
+	}
+	if got := NewIDGen().Next("inc"); got != "inc-1" {
+		t.Fatalf("unscoped ID = %q, want inc-1", got)
+	}
+}

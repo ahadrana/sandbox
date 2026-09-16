@@ -161,14 +161,28 @@ curl -s -H "$T" -d '{}' localhost:18080/v1/sandboxes/$SB/terminate
 ## State / loss semantics
 
 - control-planed keeps in-memory workspace/store/outbox (restart loses
-  control-plane state; durable stores are separate M3+ work).
+  control-plane state; durable stores are separate M3+ work). Because the
+  store is ephemeral, sandbox/incarnation IDs are boot-scoped
+  (`sb-<base36>-N`): after a control-plane restart the ID counter restarts
+  at 1, and the scope segment keeps the new boot's IDs disjoint from the
+  incarnation records a long-lived host agent still holds — the host
+  re-registers, the previous boot's incarnations are scrubbed as orphans,
+  and new placements can never collide with them.
 - Host agents heartbeat every 2s with a per-process boot ID; the control
   plane simulates host loss after ~6s of silence, the fleet declares the
   host lost after 3 missed ticks, and the manager marks affected sandboxes
-  `FAILED` explicitly (`smoke.sh drill` verifies). A DaemonSet replacement
+  `FAILED` explicitly (`smoke.sh drill` verifies). Every accepted heartbeat
+  also clears the fleet's down latch (`Fleet.HostSeen`), so a host that
+  stalls once and resumes is placement-eligible again immediately — the
+  latch is never permanent while heartbeats arrive. A DaemonSet replacement
   re-registers under the same host ID (node name) with a new boot ID, which
   also declares the previous process's incarnations lost (pod restart =
   microVM loss = explicit reconcile), then serves new placements.
+- Fleet registration pins the host ID from the authenticated heartbeat
+  (`rpc.NewClientWithID`): the fleet must never be keyed by an RPC-queried
+  host ID, because a transient failure there returns "" and corrupts every
+  host index (a later placement then resolves a HostID the fleet never
+  recorded).
 
 ## Notes / simplifications in this topology
 

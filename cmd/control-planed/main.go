@@ -68,7 +68,11 @@ func main() {
 	listen := envOr("LISTEN_ADDR", ":8080")
 	token := os.Getenv("TOKEN") // shared dev token; empty disables the check
 	clock := domain.NewManualClock(time.Now())
-	ids := domain.NewIDGen()
+	// Boot-scoped IDs: after a control-plane restart the counter restarts at
+	// 1, so unscoped IDs would collide with incarnation records long-lived
+	// host agents still hold. The scope segment makes every boot's ID space
+	// disjoint.
+	ids := domain.NewScopedIDGen(strconv.FormatInt(time.Now().UnixNano(), 36))
 	ws := workspace.NewMemory(clock, ids)
 	outbox := eventservice.NewOutbox()
 	store := sandboxmanager.NewMemoryStore()
@@ -151,10 +155,15 @@ func (s *server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		if beat.BootID != "" {
 			h.bootID = beat.BootID
 		}
+		// A live beat revives a host the tick loop latched as down during a
+		// stall: without this the down flag is cleared only by full
+		// re-registration, so one >stale-after stall would permanently
+		// exclude the host from placement despite resumed heartbeats.
+		s.fleet.HostSeen(beat.HostID)
 	}
 	s.mu.Unlock()
 	if reregister {
-		client := rpc.NewClient(beat.URL, s.token)
+		client := rpc.NewClientWithID(beat.URL, s.token, beat.HostID)
 		s.fleet.RegisterHost(client)
 		s.mu.Lock()
 		s.hosts[beat.HostID] = &remoteHost{client: client, url: beat.URL, bootID: beat.BootID, lastSeen: time.Now()}
@@ -401,11 +410,12 @@ func (s *server) hostViews(w http.ResponseWriter, r *http.Request) {
 		HostID   string      `json:"host_id"`
 		URL      string      `json:"url"`
 		LastSeen time.Time   `json:"last_seen"`
+		Down     bool        `json:"down"`
 		View     interface{} `json:"view"`
 	}
 	out := []hostEntry{}
 	for id, h := range s.hosts {
-		out = append(out, hostEntry{HostID: id, URL: h.url, LastSeen: h.lastSeen, View: h.client.View()})
+		out = append(out, hostEntry{HostID: id, URL: h.url, LastSeen: h.lastSeen, Down: s.fleet.HostDown(id), View: h.client.View()})
 	}
 	s.mu.Unlock()
 	writeJSON(w, map[string]interface{}{"hosts": out, "capabilities": s.fleet.Capabilities()})

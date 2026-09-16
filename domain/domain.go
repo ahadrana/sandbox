@@ -36,16 +36,26 @@ func (c *ManualClock) Advance(d time.Duration) {
 
 // IDGen generates deterministic, unique IDs. It is goroutine-safe.
 type IDGen struct {
-	mu sync.Mutex
-	n  int64
+	mu    sync.Mutex
+	n     int64
+	scope string
 }
 
 func NewIDGen() *IDGen { return &IDGen{} }
+
+// NewScopedIDGen returns an IDGen whose IDs embed a scope segment:
+// "prefix-scope-N" instead of "prefix-N". A control-plane process uses a
+// per-boot scope so IDs it allocates after a restart can never collide with
+// IDs a long-lived host-agent still remembers from a previous boot.
+func NewScopedIDGen(scope string) *IDGen { return &IDGen{scope: scope} }
 
 func (g *IDGen) Next(prefix string) string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.n++
+	if g.scope != "" {
+		return prefix + "-" + g.scope + "-" + itoa(g.n)
+	}
 	return prefix + "-" + itoa(g.n)
 }
 

@@ -146,6 +146,14 @@ func NewFleet(clock domain.Clock, envs EnvironmentSource, ws WorkspaceStore) *Fl
 // no longer runs (agent process restarted empty) is declared lost so the
 // manager reconciles it (INV-016: loss is observed, never assumed silent).
 func (f *Fleet) RegisterHost(h Host) {
+	// Resolve the host ID once: for RPC hosts each HostID() call is a remote
+	// round-trip that can transiently fail (returning ""), and registration
+	// under an empty or shifting key corrupts every fleet index (a later
+	// Create places on the view's real HostID and finds no host entry).
+	id := h.HostID()
+	if id == "" {
+		return
+	}
 	running := map[string]bool{}
 	for _, incID := range h.IncarnationIDs() {
 		running[incID] = true
@@ -166,17 +174,17 @@ func (f *Fleet) RegisterHost(h Host) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for incID, hostID := range f.byIncarnation {
-		if hostID == h.HostID() && !running[incID] {
+		if hostID == id && !running[incID] {
 			delete(f.byIncarnation, incID)
 			delete(f.fenceOf, incID)
 			f.pendingLost = append(f.pendingLost, incID)
 		}
 	}
-	f.hosts[h.HostID()] = h
-	f.down[h.HostID()] = false
-	f.missed[h.HostID()] = 0
-	f.lostDeclared[h.HostID()] = false
-	f.lastSeen[h.HostID()] = f.clock.Now()
+	f.hosts[id] = h
+	f.down[id] = false
+	f.missed[id] = 0
+	f.lostDeclared[id] = false
+	f.lastSeen[id] = f.clock.Now()
 }
 
 // OrphansScrubbed reports how many orphaned host incarnations the fleet has
@@ -185,6 +193,29 @@ func (f *Fleet) OrphansScrubbed() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.orphansScrubbed
+}
+
+// HostSeen records a live signal (e.g. a control-plane heartbeat) from a
+// registered host. It clears any latched-down state so a host that resumes
+// heartbeating after a stall is placement-eligible again without waiting for
+// a full re-registration.
+func (f *Fleet) HostSeen(hostID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, known := f.hosts[hostID]; !known {
+		return
+	}
+	f.down[hostID] = false
+	f.missed[hostID] = 0
+	f.lostDeclared[hostID] = false
+	f.lastSeen[hostID] = f.clock.Now()
+}
+
+// HostDown reports whether the host is currently latched as unreachable.
+func (f *Fleet) HostDown(hostID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.down[hostID]
 }
 
 // SimulateHostLoss cuts heartbeats and reachability for a host.
@@ -269,6 +300,12 @@ func (f *Fleet) Create(spec backendinterface.Spec) (backendinterface.Handle, err
 	f.capacityFailures = 0
 	host := f.hosts[placement.HostID]
 	f.mu.Unlock()
+	if host == nil {
+		// The scheduler placed on a HostID the fleet has no entry for (e.g.
+		// a view RPC reporting an ID the registration never recorded) —
+		// treat it as a capacity failure, never a panic.
+		return backendinterface.Handle{}, fmt.Errorf("fleet: placed on unknown host %q", placement.HostID)
+	}
 
 	handle, err := host.Create(CreateRequest{
 		SandboxID:           spec.SandboxID,

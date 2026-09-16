@@ -1,8 +1,10 @@
 package rpc
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -351,5 +353,56 @@ func TestRestoreNilCheckpointRejected(t *testing.T) {
 	}
 	if strings.Contains(out.Error, "panic") {
 		t.Fatalf("nil-checkpoint restore panicked: %q", out.Error)
+	}
+}
+
+// Registration-hardening regression (k3s soak, 2026-09-16): a transient
+// host_id RPC failure at fleet registration keyed the fleet under "", and a
+// later Create placed on the view's real HostID and panicked on the missing
+// host entry. The fleet now refuses empty host IDs, and a client with a
+// pinned ID (what the control plane's heartbeat handler uses, since the
+// beat's ID is authenticated) never depends on that RPC for identity.
+func TestRegisterHostFlakyHostIDRPC(t *testing.T) {
+	backend, err := localbackend.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := domain.NewManualClock(testNow)
+	ws := workspace.NewMemory(clock, domain.NewIDGen())
+	agent := hostagent.New("host-rpc", backend, nil, ws, 1<<30, 4, 16)
+	inner := Handler(agent, "tok")
+	failHostID := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if failHostID && strings.Contains(string(body), `"host_id"`) {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	fleet := hostagent.NewFleet(clock, nil, ws)
+	wsID, gen := commitWS(t, ws, map[string]string{"a": "1"})
+	spec := backendinterface.Spec{
+		SandboxID: "sb-1", IncarnationID: "inc-flaky-1", Epoch: 1,
+		WorkspaceID: wsID, WorkspaceGeneration: gen, MemoryBytes: 64,
+	}
+
+	// Unpinned client + failing host_id RPC: registration must be skipped
+	// (empty ID), not recorded under "" — placement keeps failing cleanly.
+	fleet.RegisterHost(NewClient(srv.URL, "tok"))
+	if _, err := fleet.Create(spec); err == nil {
+		t.Fatal("create succeeded with no registered host")
+	}
+
+	// Pinned client: identity needs no RPC, registration succeeds even while
+	// the host_id op is still failing; once the agent answers views again,
+	// placement works.
+	fleet.RegisterHost(NewClientWithID(srv.URL, "tok", "host-rpc"))
+	failHostID = false
+	if _, err := fleet.Create(spec); err != nil {
+		t.Fatalf("create after pinned registration: %v", err)
 	}
 }

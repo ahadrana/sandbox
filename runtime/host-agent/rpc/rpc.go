@@ -302,11 +302,21 @@ type Client struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client // optional; WaitExecution can block, so no default timeout
+	// ID, when set, is returned by HostID without an RPC: callers that
+	// already know the host's authenticated identity (e.g. the control
+	// plane's heartbeat handler) pin it so a transient RPC failure at
+	// registration can never key the fleet under an empty host ID.
+	ID string
 }
 
 // NewClient returns a Client for baseURL (e.g. "http://10.0.0.5:8080").
 func NewClient(baseURL, token string) *Client {
 	return &Client{BaseURL: baseURL, Token: token}
+}
+
+// NewClientWithID returns a Client whose host ID is pinned to id.
+func NewClientWithID(baseURL, token, id string) *Client {
+	return &Client{BaseURL: baseURL, Token: token, ID: id}
 }
 
 func (c *Client) call(req request) (response, error) {
@@ -351,6 +361,9 @@ func (c *Client) call(req request) (response, error) {
 }
 
 func (c *Client) HostID() string {
+	if c.ID != "" {
+		return c.ID
+	}
 	resp, err := c.call(request{Op: "host_id"})
 	if err != nil {
 		return ""
