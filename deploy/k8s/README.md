@@ -191,3 +191,43 @@ curl -s -H "$T" -d '{}' localhost:18080/v1/sandboxes/$SB/terminate
 - Kernel/roots artifacts and the patched jailer are baked into the image;
   VM state lives in an `emptyDir` (pod restart = microVM loss = explicit
   reconcile).
+
+## Simulation harness: sandbox-sim
+
+`cmd/sandbox-sim` validates the deployed cluster with N concurrent
+sandboxes and visualizes it live. It creates each sandbox with a guest
+workload (a python HTTP server answering `hello from sandbox sim-i
+counter=<n>` where the counter lives in guest tmpfs — a genuine RAM
+continuity marker) plus an endpoint binding (`sim-i`, target port 8000+i),
+then runs a scenario loop and records every action in a ring buffer:
+
+- `steady` — periodic exec ticks (counter increments) and endpoint curls
+  through endpoint-proxyd.
+- `churn` — random suspend → routed-restore cycles; after each resume the
+  sim checks continuity (epoch preserved AND tmpfs counter not regressed)
+  and marks PASS/FAIL.
+- `storm` — bursts of concurrent endpoint requests at a suspended sandbox,
+  exercising the proxy's single-flight resume.
+
+Run (against the port-forwarded control plane):
+
+```
+kubectl -n sandbox-system port-forward svc/control-planed 18080:8080 &
+kubectl -n sandbox-system port-forward svc/endpoint-proxyd 18081:8080 &
+go build ./cmd/sandbox-sim
+./sandbox-sim -cp http://localhost:18080 -proxy http://localhost:18081 \
+  -token dev-token -sandboxes 4 -scenario churn -ui :9100
+```
+
+The UI is a single self-contained page at `http://<node>:9100` (sandbox
+cards color-coded by state with epoch/ws-generation/continuity, an
+aggregate stats header, and a scrolling event log; click a card to
+filter). `/api/state` serves the same data as JSON (sandboxes, events,
+stats). Note: the control plane has no list-sandboxes endpoint, so ground
+truth is refreshed per-sandbox — the sim only tracks sandboxes it created.
+
+"Good" looks like: all sandboxes live with exec ticks and endpoint 200s
+flowing, churn restores at 100% continuity PASS (epoch preserved, counter
+intact), and a suspended sandbox answering a proxied request with the
+guest's 200 after single-flight resume (observed: 1.5–15s cold-restore
+latency, then millisecond responses).
