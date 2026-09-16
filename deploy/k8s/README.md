@@ -52,20 +52,27 @@ fleet-wide behind one hop), it scales independently of execution hosts,
 and a sidecar in the hostNetwork pod would share the node's port space
 with the backend's TAP/iptables datapath.
 
-## Routed restore (ADR 008): the resume keeps continuity
+## Routed restore (ADR 008/009): the resume keeps continuity
 
 With the manager's runtime being a fleet of host agents, `Resume` routes
-`Fleet.Restore` to the checkpoint's ORIGIN host — checkpoint bits are
-host-local (the firecracker snapshot dir travels by reference, there is no
-cross-host transfer). The host agent re-registers the reclaimed
-incarnation from the self-describing checkpoint metadata under a fresh
-placement fence. The execution epoch is preserved, so the suspended
+`Fleet.Restore` to the checkpoint's ORIGIN host first — the bits are
+host-local and no transfer is needed. When the origin cannot place it
+(full, facts-changed across a kernel upgrade), the restore fails over to a
+guard-matching peer that PULLS the snapshot package from the origin over
+the host-agent RPC (ADR-009: manifest + blob streaming under the same
+token auth, per-file sha256 verified against capture-time hashes, staged
+atomic install, source-side GC pinning). The host agent re-registers the
+reclaimed incarnation from the self-describing checkpoint metadata under a
+fresh placement fence. The execution epoch is preserved, so the suspended
 binding's epoch fence still matches: it reactivates, its host port is
 republished, and the proxy's triggering request returns the guest's
-response (200), not a 503. A checkpoint whose origin host is gone fails
-honestly and the manager falls back to workspace-only recovery (epoch
-bump; bindings stay suspended). Cross-host checkpoint transfer is a
-documented follow-up.
+response (200), not a 503. A checkpoint whose origin host is GONE (down —
+it cannot serve the package either) fails honestly and the manager falls
+back to workspace-only recovery (epoch bump; bindings stay suspended). A
+shared snapshot store for the origin-destroyed case is a documented
+follow-up. This single-node deployment still pins every sandbox to its one
+host, so the cross-host path is exercised by the two-agent single-node
+test topology, not by this cluster.
 
 Two deployment facts make this work in the container image: util-linux
 `mount`/`umount` are baked in (the jailed snapshot path bind-mounts the

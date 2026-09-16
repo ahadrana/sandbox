@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/agent-sandbox/platform/control-plane/scheduler"
@@ -39,24 +40,30 @@ type request struct {
 	// Fence carries the placement fence for fence-validated ops (publish/
 	// unpublish, review H2).
 	Fence int64 `json:"fence,omitempty"`
+	// IncarnationID/Tip address a snapshot package for the manifest op;
+	// SourceURL is the origin host's base URL for restore_from (ADR-009).
+	IncarnationID string `json:"incarnation_id,omitempty"`
+	Tip           string `json:"tip,omitempty"`
+	SourceURL     string `json:"source_url,omitempty"`
 }
 
 // response carries the union of all op results.
 type response struct {
-	OK           bool                             `json:"ok"`
-	Error        string                           `json:"error,omitempty"`
-	Handle       backendinterface.Handle          `json:"handle,omitempty"`
-	Checkpoint   *backendinterface.CheckpointData `json:"checkpoint,omitempty"`
-	Stats        *backendinterface.Stats          `json:"stats,omitempty"`
-	Result       *supervisor.Result               `json:"result,omitempty"`
-	Int          int                              `json:"int,omitempty"`
-	Bool         bool                             `json:"bool,omitempty"`
-	Files        map[string]string                `json:"files,omitempty"`
-	Processes    []supervisor.ProcessInfo         `json:"processes,omitempty"`
-	View         *scheduler.HostView              `json:"view,omitempty"`
-	Capabilities *backendinterface.Capabilities   `json:"capabilities,omitempty"`
-	IDs          []string                         `json:"ids,omitempty"`
-	HostID       string                           `json:"host_id,omitempty"`
+	OK           bool                                      `json:"ok"`
+	Error        string                                    `json:"error,omitempty"`
+	Handle       backendinterface.Handle                   `json:"handle,omitempty"`
+	Checkpoint   *backendinterface.CheckpointData          `json:"checkpoint,omitempty"`
+	Stats        *backendinterface.Stats                   `json:"stats,omitempty"`
+	Result       *supervisor.Result                        `json:"result,omitempty"`
+	Int          int                                       `json:"int,omitempty"`
+	Bool         bool                                      `json:"bool,omitempty"`
+	Files        map[string]string                         `json:"files,omitempty"`
+	Processes    []supervisor.ProcessInfo                  `json:"processes,omitempty"`
+	View         *scheduler.HostView                       `json:"view,omitempty"`
+	Capabilities *backendinterface.Capabilities            `json:"capabilities,omitempty"`
+	IDs          []string                                  `json:"ids,omitempty"`
+	HostID       string                                    `json:"host_id,omitempty"`
+	Manifest     *backendinterface.SnapshotPackageManifest `json:"manifest,omitempty"`
 }
 
 // wireError renders err for the wire, preserving sentinel identity for the
@@ -123,7 +130,28 @@ func Handler(h hostagent.Host, token string) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, dispatch(h, req))
+		writeJSON(w, dispatch(h, req, token))
+	})
+	// ADR-009: raw snapshot-blob streaming for host-to-host pull transfers,
+	// same server, same token auth. rel is validated against the package
+	// path whitelist by the backend before any file is opened.
+	mux.HandleFunc("/v1/snapshots/blob", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		if token != "" && r.Header.Get(TokenHeader) != token {
+			http.Error(w, "bad token", http.StatusUnauthorized)
+			return
+		}
+		rc, err := h.FetchPackageFile(r.URL.Query().Get("incarnation"), r.URL.Query().Get("rel"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		defer rc.Close()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		io.Copy(w, rc)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -131,7 +159,7 @@ func Handler(h hostagent.Host, token string) http.Handler {
 	return mux
 }
 
-func dispatch(h hostagent.Host, req request) (resp response) {
+func dispatch(h hostagent.Host, req request, token string) (resp response) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			resp = response{Error: fmt.Sprintf("panic: %v", rec)}
@@ -188,6 +216,24 @@ func dispatch(h hostagent.Host, req request) (resp response) {
 			return fail(err)
 		}
 		return response{OK: true, Handle: handle}
+	case "restore_from":
+		// ADR-009: pull the checkpoint's package from the origin host (the
+		// shared dev token authenticates the pull), then restore locally.
+		if req.Checkpoint == nil || req.SourceURL == "" {
+			return fail(fmt.Errorf("bad request: restore_from requires a checkpoint and source_url"))
+		}
+		src := NewClient(req.SourceURL, token)
+		handle, err := h.RestoreFrom(*req.Checkpoint, src)
+		if err != nil {
+			return fail(err)
+		}
+		return response{OK: true, Handle: handle}
+	case "package_manifest":
+		m, err := h.SnapshotPackageManifest(req.IncarnationID, req.Tip)
+		if err != nil {
+			return fail(err)
+		}
+		return response{OK: true, Manifest: &m}
 	case "publish_port":
 		if err := h.PublishPort(req.Handle, req.GuestPort, req.HostPort, req.Fence); err != nil {
 			return fail(err)
@@ -377,6 +423,61 @@ func (c *Client) Restore(cp backendinterface.CheckpointData) (backendinterface.H
 		return backendinterface.Handle{}, err
 	}
 	return resp.Handle, nil
+}
+
+// SourceBaseURL exposes the host's RPC base URL so a peer Client can be
+// asked to pull a package from this host (ADR-009 restore_from).
+func (c *Client) SourceBaseURL() string { return c.BaseURL }
+
+// RestoreFrom asks the remote host to pull cp's snapshot package from src
+// and restore it (ADR-009). src must be URL-addressable (a *Client).
+func (c *Client) RestoreFrom(cp backendinterface.CheckpointData, src backendinterface.PackageSource) (backendinterface.Handle, error) {
+	u, ok := src.(interface{ SourceBaseURL() string })
+	if !ok || u.SourceBaseURL() == "" {
+		return backendinterface.Handle{}, fmt.Errorf("restore_from source is not URL-addressable")
+	}
+	resp, err := c.call(request{Op: "restore_from", Checkpoint: &cp, SourceURL: u.SourceBaseURL()})
+	if err != nil {
+		return backendinterface.Handle{}, err
+	}
+	return resp.Handle, nil
+}
+
+// SnapshotPackageManifest fetches the package manifest this host can serve
+// for the checkpoint chain ending at tip (ADR-009).
+func (c *Client) SnapshotPackageManifest(incarnationID, tip string) (backendinterface.SnapshotPackageManifest, error) {
+	resp, err := c.call(request{Op: "package_manifest", IncarnationID: incarnationID, Tip: tip})
+	if err != nil {
+		return backendinterface.SnapshotPackageManifest{}, err
+	}
+	return *resp.Manifest, nil
+}
+
+// FetchPackageFile streams one manifest-listed file from this host
+// (ADR-009 blob endpoint).
+func (c *Client) FetchPackageFile(incarnationID, rel string) (io.ReadCloser, error) {
+	u := fmt.Sprintf("%s/v1/snapshots/blob?incarnation=%s&rel=%s", c.BaseURL, url.QueryEscape(incarnationID), url.QueryEscape(rel))
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.Token != "" {
+		req.Header.Set(TokenHeader, c.Token)
+	}
+	hc := c.HTTP
+	if hc == nil {
+		hc = &http.Client{Timeout: 0}
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("blob fetch %s: %s: %s", rel, resp.Status, bytes.TrimSpace(data))
+	}
+	return resp.Body, nil
 }
 
 func (c *Client) PublishPort(h backendinterface.Handle, guestPort, hostPort int, fence int64) error {

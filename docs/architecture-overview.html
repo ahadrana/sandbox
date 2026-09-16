@@ -302,8 +302,10 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
 </ul></div>
 <div class="panel"><h3 style="margin-top:0" class="missing">Not yet proven</h3>
 <ul>
-<li class="no"><b>Multi-host fleet</b> — a single bare-metal node only; cross-host checkpoint transfer is unimplemented
-  (restore is origin-host-only, ADR-008).</li>
+<li class="no"><b>Multi-host fleet</b> — a single bare-metal node only. Cross-host checkpoint restore is
+  implemented (ADR-009, host-to-host pull streaming) and proven in the two-agent single-node topology
+  (two host agents, separate roots, real microVM pulled + restored across them); true multi-node operation
+  is untested.</li>
 <li class="no"><b>Scale/load</b> — no density, contention, or load testing beyond the conformance suites.</li>
 <li class="no"><b>Production hardening</b> — dev shared-token auth everywhere; the endpoint proxy dials
   heartbeat-self-reported host URLs (L11 SSRF posture, accepted for dev).</li>
@@ -318,8 +320,10 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
 <section id="gaps">
 <h2><span class="num">07</span>Known gaps &amp; roadmap</h2>
 <div class="panel"><ul style="padding-left:20px;margin:6px 0">
-<li><b>Cross-host checkpoint transfer</b> — the headline follow-up: checkpoints are host-local and restore routes
-  to the origin host (ADR-008); snapshot-blob streaming or a shared snapshot store is the documented next step.</li>
+<li><b>Origin-destroyed checkpoint recovery</b> — cross-host restore (ADR-009) ships: the destination host
+  pulls the snapshot package from the origin over the host-agent RPC (per-file sha256 against capture-time
+  hashes, staged atomic install, GC pinning). It needs the origin alive to serve the package; a shared
+  snapshot store for the origin-destroyed case is the documented next step.</li>
 <li><b>CubeSandbox borrow list, remaining</b> — the P2 grab-bag (guest-ready MMIO signal, TAP pool pre-warming,
   flattened workspace-generation chains, per-sandbox traffic tokens, audit fingerprints) and P1.8
   (HSet-snapshot + capped-stream push pattern to a gateway tier). All P0/P1 items except P1.8 are DONE —
@@ -330,8 +334,9 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
   <b>L11</b> the endpoint proxy trusts heartbeat-self-reported host URLs (dev shared-token posture);
   <b>L12</b> stale name→binding cache for up to CacheTTL after unbind/recreate; caches unbounded;
   <b>L14</b> jail pre-spawn bind mount is rw without nodev/nosuid (largely inherent).</li>
-<li><b>Tools-image GC</b> — done (content-addressed reference counting with chain coverage); cross-host image
-  distribution remains open alongside cross-host restore.</li>
+<li><b>Tools-image GC</b> — done (content-addressed reference counting with chain coverage); the tools image
+  also travels with the snapshot package on cross-host restore (ADR-009), and the destination's meta.json
+  is rewritten to its local path at install time.</li>
 </ul></div>
 </section>
 
@@ -419,7 +424,7 @@ var WALKS = [
  "Idle sandboxes now cost nothing but storage (INV-029: a large logical-agent population needs no matching live-sandbox population).",
  "<b>Traffic arrives.</b> A client requests <code>ep1.endpoints.sandbox.local/...</code>. endpoint-proxyd resolves the name to a binding (O(1) name index; unknown names are negative-cached).",
  "The gateway verdict comes back <b>denied but Resumable</b> (typed flag — binding SUSPENDED / sandbox not live). The proxy single-flights one Manager.Resume for the sandbox; concurrent waiters share the flight.",
- "<b>Routed restore (ADR-008).</b> Fleet.Restore routes to the checkpoint's <b>origin host</b> — the bits are host-local. A pending placement is registered before the RPC (a host re-registration mid-restore can't orphan-scrub the VM), the snapshot chain is validated link-by-link (facts + hashes) and merged host-side, and the VMM boots from it. Failure rolls back: the possibly-booted incarnation is terminated — never two live incarnations.",
+ "<b>Routed restore (ADR-008/009).</b> Fleet.Restore prefers the checkpoint's <b>origin host</b> — the bits are host-local. When the origin can't place it, a guard-matching peer <b>pulls the package</b> from the origin (manifest + blob streaming, per-file sha256, staged atomic install). A pending placement is registered before the RPC (a host re-registration mid-restore can't orphan-scrub the VM), the snapshot chain is validated link-by-link (facts + hashes) and merged host-side, and the VMM boots from it. Failure rolls back: the possibly-booted incarnation is terminated — never two live incarnations.",
  "Continuity is preserved: <b>same execution epoch</b>, no ExecutionStateReset (FR-SR-005). Bindings whose epoch fence still matches reactivate and are republished (FC-PUB DNAT reinstalled on the host).",
  "The proxy re-routes (allowed now) and reverse-proxies the original request to the published port — the client gets the guest's <b>200</b>, unaware the sandbox was suspended."
 ]}];
@@ -514,7 +519,8 @@ var ADRS = [
  ["ADR-005","2026-09-15","Kubernetes manages execution-host capacity only","K8s owns host lifecycle; the sandbox scheduler keeps placement; fenced HTTP/JSON RPC is the fleet transport."],
  ["ADR-006","2026-09-15","Incremental (diff) memory snapshots","Sparse diff checkpoints chained to a full base (depth-capped), validated link-by-link on restore."],
  ["ADR-007","2026-09-15","Traffic-triggered resume","An ingress resume-proxy makes suspended sandboxes transparently addressable: single-flight resume, then forward."],
- ["ADR-008","2026-09-16","Routed checkpoint restore, origin-host-only","Restore routes to the checkpoint's origin host under a fresh fence; pending placement + rollback keep it atomic (Batch C amendment)."]
+ ["ADR-008","2026-09-16","Routed checkpoint restore, origin-host-only","Restore routes to the checkpoint's origin host under a fresh fence; pending placement + rollback keep it atomic (Batch C amendment)."],
+ ["ADR-009","2026-09-16","Cross-host checkpoint restore (pull streaming)","Destination host pulls the snapshot package from the origin over the host-agent RPC (manifest + blob endpoints, per-file sha256, staged atomic install, GC pinning); origin preferred, guard-matching peers as failover."]
 ];
 var adrHtml = '';
 ADRS.forEach(function(a){

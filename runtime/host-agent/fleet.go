@@ -2,6 +2,7 @@ package hostagent
 
 import (
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -33,6 +34,13 @@ type Host interface {
 	Resume(handle backendinterface.Handle) error
 	Snapshot(handle backendinterface.Handle) (backendinterface.CheckpointData, error)
 	Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error)
+	// RestoreFrom restores a checkpoint whose package lives on another host,
+	// pulling it from src first (ADR-009 cross-host restore).
+	RestoreFrom(cp backendinterface.CheckpointData, src backendinterface.PackageSource) (backendinterface.Handle, error)
+	// SnapshotPackageManifest and FetchPackageFile serve the source side of
+	// a cross-host transfer (ADR-009).
+	SnapshotPackageManifest(incarnationID, tip string) (backendinterface.SnapshotPackageManifest, error)
+	FetchPackageFile(incarnationID, rel string) (io.ReadCloser, error)
 	Stats(handle backendinterface.Handle) (backendinterface.Stats, error)
 	Exec(handle backendinterface.Handle, executionID string, op domain.Operation) error
 	WaitExecution(handle backendinterface.Handle, executionID string) (supervisor.Result, error)
@@ -345,15 +353,16 @@ func (f *Fleet) UnpublishPort(h backendinterface.Handle, hostPort int) error {
 	return host.UnpublishPort(h, hostPort, fence)
 }
 
-// Restore routes a checkpoint restore to the ORIGIN host (ADR-008):
-// checkpoint bits are host-local artifacts and the RPC carries them by
-// reference, so only the host that wrote the checkpoint can boot from it.
-// An incarnation that is still live (STOP/CONT class, never terminated)
-// resumes in place with no re-placement; a reclaimed incarnation is
-// re-placed on the origin host under a fresh fence — capacity and the
-// checkpoint's host-facts guard (kernel release, CPU part) are enforced,
-// so a mismatched or exhausted origin host fails the restore honestly and
-// the caller falls back to workspace-only recovery.
+// Restore routes a checkpoint restore (ADR-008/ADR-009). An incarnation
+// that is still live (STOP/CONT class, never terminated) resumes in place
+// with no re-placement. A reclaimed incarnation is re-placed on its ORIGIN
+// host under a fresh fence (the bits are host-local; no transfer) — or,
+// when the origin cannot place it (down, facts mismatch, capacity), on the
+// best guard-matching peer with capacity, which pulls the snapshot package
+// from the origin host first (ADR-009). Capacity and the checkpoint's
+// host-facts guard (arch, kernel release, CPU part) are enforced either
+// way, so an inadmissible fleet fails the restore honestly and the caller
+// falls back to workspace-only recovery.
 func (f *Fleet) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
 	f.mu.Lock()
 	if hostID, ok := f.byIncarnation[cp.IncarnationID]; ok {
@@ -371,79 +380,134 @@ func (f *Fleet) Restore(cp backendinterface.CheckpointData) (backendinterface.Ha
 		f.mu.Unlock()
 		return backendinterface.Handle{}, fmt.Errorf("checkpoint %s records no origin host: %w", cp.IncarnationID, backendinterface.ErrNotFound)
 	}
-	host, ok := f.hosts[origin]
+	originHost, ok := f.hosts[origin]
 	if !ok {
 		f.mu.Unlock()
 		return backendinterface.Handle{}, fmt.Errorf("checkpoint origin host %q not in fleet: %w", origin, backendinterface.ErrNotFound)
 	}
+	// A down origin cannot boot the checkpoint NOR serve its package to a
+	// peer (ADR-009): both paths fail honestly and the manager falls back.
 	if f.down[origin] {
 		f.mu.Unlock()
 		return backendinterface.Handle{}, fmt.Errorf("checkpoint origin host %q unavailable: %w", origin, backendinterface.ErrRuntimeGone)
 	}
-	view := host.View()
+	originView := originHost.View()
+	// Candidate views for the cross-host failover: every non-down host
+	// whose facts match the checkpoint's recorded guard exactly (a
+	// mismatched host could never boot it, ADR-001 P0.4).
+	factsMatch := func(v scheduler.HostView) bool {
+		if kr := cp.Metadata["kernel_release"]; kr != "" && kr != v.KernelRelease {
+			return false
+		}
+		if part := cp.Metadata["cpu_part"]; part != "" && part != v.CPUPart {
+			return false
+		}
+		if arch := cp.Metadata["arch"]; arch != "" && arch != v.Arch {
+			return false
+		}
+		return true
+	}
+	var peerViews []scheduler.HostView
+	for id, h := range f.hosts {
+		if id == origin || f.down[id] {
+			continue
+		}
+		if v := h.View(); factsMatch(v) {
+			peerViews = append(peerViews, v)
+		}
+	}
 	f.mu.Unlock()
-	// The checkpoint's recorded host facts must match the origin host
-	// exactly — a mismatched host could never boot it (ADR-001 P0.4), and
-	// this fleet has no cross-host transfer to route around it.
-	if kr := cp.Metadata["kernel_release"]; kr != "" && kr != view.KernelRelease {
-		return backendinterface.Handle{}, fmt.Errorf("checkpoint kernel_release %q does not match origin host %q: %w", kr, view.KernelRelease, supervisor.ErrUnsupported)
-	}
-	if part := cp.Metadata["cpu_part"]; part != "" && part != view.CPUPart {
-		return backendinterface.Handle{}, fmt.Errorf("checkpoint cpu_part %q does not match origin host %q: %w", part, view.CPUPart, supervisor.ErrUnsupported)
-	}
+
 	var mem int64
 	fmt.Sscanf(cp.Metadata["memory_bytes"], "%d", &mem)
 	if mem == 0 {
 		mem = f.DefaultMemory
 	}
-	// Placement on the single admissible host: capacity is re-validated and
-	// a fresh placement fence issued. A failure here does NOT feed the
-	// fleet-wide scale-out counter (review M9): the restore is pinned to
-	// the origin host, so a full origin says nothing about fleet capacity —
-	// counting it would ratchet a false scale-out signal permanently.
-	placement, err := f.sched.Place(scheduler.Request{
+	req := scheduler.Request{
 		SandboxID:      cp.Metadata["sandbox_id"],
 		MemoryRequired: mem,
-	}, []scheduler.HostView{view})
+	}
+	if g := (scheduler.Guard{
+		Arch:          cp.Metadata["arch"],
+		KernelRelease: cp.Metadata["kernel_release"],
+		CPUPart:       cp.Metadata["cpu_part"],
+	}); g != (scheduler.Guard{}) {
+		req.CheckpointGuard = &g
+	}
+
+	// placeAndRestore runs the shared restore tail (review H4/H5): a PENDING
+	// placement is registered before the RPC so a host re-registration
+	// mid-restore treats the incarnation as owned; on success the placement
+	// is promoted, on failure rolled back with a best-effort terminate (a
+	// lost ACK must not leave a fleet-invisible VM running). A failure here
+	// does NOT feed the fleet-wide scale-out counter (review M9): the
+	// restore is pinned to admissible hosts, so a full one says nothing
+	// about fleet capacity.
+	placeAndRestore := func(host Host, placement scheduler.Placement, src backendinterface.PackageSource) (backendinterface.Handle, error) {
+		f.mu.Lock()
+		f.pendingRestore[cp.IncarnationID] = true
+		f.mu.Unlock()
+		// Refresh the fence in a COPY of the metadata — the caller's
+		// checkpoint record is shared state.
+		md := make(map[string]string, len(cp.Metadata)+1)
+		for k, v := range cp.Metadata {
+			md[k] = v
+		}
+		md["fence"] = fmt.Sprintf("%d", placement.Fence)
+		restoreCP := backendinterface.CheckpointData{
+			IncarnationID: cp.IncarnationID,
+			Files:         cp.Files,
+			Metadata:      md,
+		}
+		var handle backendinterface.Handle
+		var err error
+		if src != nil {
+			handle, err = host.RestoreFrom(restoreCP, src)
+		} else {
+			handle, err = host.Restore(restoreCP)
+		}
+		f.mu.Lock()
+		delete(f.pendingRestore, cp.IncarnationID)
+		if err == nil {
+			f.byIncarnation[handle.IncarnationID] = placement.HostID
+			f.fenceOf[handle.IncarnationID] = placement.Fence
+			// A successful restore proves placement capacity exists — reset
+			// the scale-out failure streak exactly like Create does (M9).
+			f.capacityFailures = 0
+		}
+		f.mu.Unlock()
+		if err != nil {
+			_ = host.Terminate(backendinterface.Handle{IncarnationID: cp.IncarnationID})
+			return backendinterface.Handle{}, err
+		}
+		return handle, nil
+	}
+
+	// Origin fast path (ADR-008): no transfer — the bits are already local.
+	// Only placement-stage failures (facts mismatch, capacity) fail over to
+	// the cross-host path; a restore RPC error on the origin is returned
+	// as-is (a typed incompatibility would repeat on any peer).
+	if factsMatch(originView) {
+		placement, err := f.sched.Place(req, []scheduler.HostView{originView})
+		if err == nil {
+			return placeAndRestore(originHost, placement, nil)
+		}
+	}
+
+	// Cross-host failover (ADR-009): place on the best guard-matching peer
+	// with capacity; that host pulls the package from the origin, then
+	// restores through the unchanged path.
+	if len(peerViews) == 0 {
+		return backendinterface.Handle{}, fmt.Errorf("checkpoint %s: origin host %q cannot place it and no guard-matching peer is available: %w", cp.IncarnationID, origin, supervisor.ErrUnsupported)
+	}
+	placement, err := f.sched.Place(req, peerViews)
 	if err != nil {
 		return backendinterface.Handle{}, err
 	}
-	// Review H4: register a PENDING placement before the RPC so a host
-	// re-registration mid-restore treats the incarnation as owned (never an
-	// orphan to scrub); promote on success, roll back on failure.
 	f.mu.Lock()
-	f.pendingRestore[cp.IncarnationID] = true
+	dest := f.hosts[placement.HostID]
 	f.mu.Unlock()
-	// Refresh the fence in a COPY of the metadata — the caller's checkpoint
-	// record is shared state.
-	md := make(map[string]string, len(cp.Metadata)+1)
-	for k, v := range cp.Metadata {
-		md[k] = v
-	}
-	md["fence"] = fmt.Sprintf("%d", placement.Fence)
-	handle, err := host.Restore(backendinterface.CheckpointData{
-		IncarnationID: cp.IncarnationID,
-		Files:         cp.Files,
-		Metadata:      md,
-	})
-	f.mu.Lock()
-	delete(f.pendingRestore, cp.IncarnationID)
-	if err == nil {
-		f.byIncarnation[handle.IncarnationID] = placement.HostID
-		f.fenceOf[handle.IncarnationID] = placement.Fence
-		// A successful restore proves placement capacity exists — reset the
-		// scale-out failure streak exactly like Create does (review M9).
-		f.capacityFailures = 0
-	}
-	f.mu.Unlock()
-	if err != nil {
-		// Rollback (review H4/H5): the error may be a lost ACK with the
-		// incarnation actually booted on the host — terminate best-effort so
-		// nothing runs fleet-invisible before the caller falls back.
-		_ = host.Terminate(backendinterface.Handle{IncarnationID: cp.IncarnationID})
-		return backendinterface.Handle{}, err
-	}
-	return handle, nil
+	return placeAndRestore(dest, placement, originHost)
 }
 
 // Terminate scrubs the incarnation on its host; a lost host is cleaned up
@@ -591,8 +655,10 @@ func (f *Fleet) Alive(h backendinterface.Handle) bool {
 // surfaces: the weakest isolation class and only the features every host
 // supports. An empty fleet has zero-value capabilities (declaring VM-class
 // with no hosts would be a lie). SupportsRestore means routed restore works
-// — with the ADR-008 scoping that a checkpoint boots only on its origin
-// host (checkpoint bits are host-local; there is no cross-host transfer).
+// — on the origin host, or on any guard-matching peer that can pull the
+// package from a reachable origin (ADR-009); it is still gated on facts
+// match, never an unconditional promise (an unreachable origin fails
+// honestly).
 func (f *Fleet) Capabilities() backendinterface.Capabilities {
 	f.mu.Lock()
 	defer f.mu.Unlock()

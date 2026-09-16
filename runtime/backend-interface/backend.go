@@ -2,7 +2,10 @@
 // expose vendor-specific (Firecracker/Kubernetes) concepts (INV-026).
 package backendinterface
 
-import "errors"
+import (
+	"errors"
+	"io"
+)
 
 var (
 	ErrRuntimeGone     = errors.New("runtime incarnation gone")
@@ -133,4 +136,79 @@ type Backend interface {
 	Restore(cp CheckpointData) (Handle, error)
 	Terminate(h Handle) error
 	Stats(h Handle) (Stats, error)
+}
+
+// --- Cross-host snapshot package transfer (ADR-009) ---
+
+// FileExtent is a [Offset, Offset+Length) data range of a sparse file.
+// Diff memory files are sparse (ADR-006): streaming one as raw bytes turns
+// holes into literal zeros, which would corrupt the merged memory — so the
+// manifest carries each sparse file's extents and the receiver writes only
+// those ranges (the sha256 of the result is identical: holes read as zero).
+type FileExtent struct {
+	Offset int64 `json:"offset"`
+	Length int64 `json:"length"`
+}
+
+// PackageFile is one file of a snapshot package: its path relative to the
+// backend's storage root (a chain link file "<link>/<name>" or a shared
+// artifact such as "tools/tools-<sha>.ext4"), its size, and its sha256.
+// For memory/state files the sha256 is the digest recorded at capture time,
+// so a receiver verifies streamed bytes against capture-time integrity.
+type PackageFile struct {
+	Rel    string `json:"rel"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+	// Extents lists the data ranges of a sparse file (nil = treat the whole
+	// file as data; always the case for non-sparse files).
+	Extents []FileExtent `json:"extents,omitempty"`
+}
+
+// SnapshotPackageManifest describes every file a destination host must pull
+// to restore the checkpoint chain ending at Tip: each link's metadata,
+// memory, state, and drive files, plus any shared artifacts the saved state
+// references (e.g. the tools image). Derived artifacts (merged memory
+// files) are never listed; the destination rebuilds them.
+type SnapshotPackageManifest struct {
+	IncarnationID string        `json:"incarnation_id"`
+	Tip           string        `json:"tip"`
+	Files         []PackageFile `json:"files"`
+}
+
+// PackageProvider is the source side of a cross-host transfer (ADR-009): a
+// backend that can enumerate and serve one incarnation's snapshot package.
+// OPTIONAL capability interface — backends assert it, never the Backend
+// contract.
+type PackageProvider interface {
+	// SnapshotPackageManifest returns the package manifest for the chain
+	// ending at tip (a snapshot dir name within the incarnation's snapshot
+	// root). Serving a manifest pins the chain against GC for a bounded
+	// lease so the package cannot be reclaimed mid-transfer.
+	SnapshotPackageManifest(incarnationID, tip string) (SnapshotPackageManifest, error)
+	// OpenPackageFile opens one manifest-listed file for reading and
+	// refreshes the GC pin. rel is validated against the manifest's path
+	// rules; anything outside the snapshot/tools roots is rejected.
+	OpenPackageFile(incarnationID, rel string) (io.ReadCloser, error)
+}
+
+// PackageReceiver is the destination side of a cross-host transfer
+// (ADR-009): a backend that can stage, verify, and atomically install a
+// snapshot package pulled from a peer, returning the local snapshot dir the
+// checkpoint's snapshot_dir metadata should point at. OPTIONAL capability
+// interface.
+type PackageReceiver interface {
+	// ReceiveSnapshotPackage streams every manifest file through fetch,
+	// verifies each against its manifest sha256, and atomically installs
+	// the chain. A failure removes all staged bytes: no partial package is
+	// visible, and a retry skips link dirs already installed (they are
+	// immutable and complete). Returns the local tip snapshot dir.
+	ReceiveSnapshotPackage(m SnapshotPackageManifest, fetch func(rel string) (io.ReadCloser, error)) (string, error)
+}
+
+// PackageSource pulls a snapshot package from a (possibly remote) package
+// provider; host agents use it to orchestrate a cross-host restore without
+// depending on a concrete transport.
+type PackageSource interface {
+	SnapshotPackageManifest(incarnationID, tip string) (SnapshotPackageManifest, error)
+	FetchPackageFile(incarnationID, rel string) (io.ReadCloser, error)
 }

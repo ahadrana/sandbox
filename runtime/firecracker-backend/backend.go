@@ -213,6 +213,10 @@ type Backend struct {
 	// lazily under mu on first Snapshot.
 	kernelSHA string
 	fcVersion string
+	// pins holds GC pin leases (incarnationID -> expiry) for snapshot chains
+	// being served to a peer host (ADR-009): a chain mid-transfer must not
+	// be reclaimed by gcSnapshots.
+	pins map[string]time.Time
 }
 
 // JailerStatus reports the jailer fallback reason ("" when the jailer is
@@ -250,7 +254,7 @@ func New(cfg Config) (*Backend, error) {
 		}
 		sweepStaleNetworking()
 	}
-	b := &Backend{cfg: c, incs: map[string]*incarnation{}, nextCID: c.VsockBaseCID}
+	b := &Backend{cfg: c, incs: map[string]*incarnation{}, nextCID: c.VsockBaseCID, pins: map[string]time.Time{}}
 	if c.JailerBin != "" {
 		b.sweepStaleJails()
 		if err := jailerProbe(c.JailerBin); err != nil {
@@ -830,6 +834,13 @@ func (b *Backend) snapshotDir(incarnationID string) string {
 // reclaimed once their tip dir is gone and no live incarnation's RAM is
 // backed by them.
 func (b *Backend) gcSnapshots(incarnationID string) {
+	// ADR-009: a chain being served to a peer host is pinned against GC.
+	b.mu.Lock()
+	pinned := b.pinActiveLocked(incarnationID)
+	b.mu.Unlock()
+	if pinned {
+		return
+	}
 	max := b.cfg.MaxSnapshotsPerIncarnation
 	root := b.snapshotDir(incarnationID)
 	entries, err := os.ReadDir(root)

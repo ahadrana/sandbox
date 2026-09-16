@@ -80,7 +80,10 @@ the fleet path actually succeeds.
   gigabyte RAM images; transfer also interacts with the incremental-chain
   layout (ADR-006: parents must travel too) and with the by-reference
   tools-image cache. This is the natural follow-up when cold-start on a
-  drained host matters.
+  drained host matters. **Implemented by ADR-009 (2026-09-16): host-to-host
+  pull streaming with per-file sha256 verification, staged atomic install,
+  source-side GC pinning, and origin-preferred/guard-matching-peer
+  placement.**
 - **Any-host restore with the P0.4 typed failure as the filter.** Rely on
   the backend's snapshot-package validation to reject wrong hosts.
   Rejected as a *routing* strategy: the scheduler would place on hosts
