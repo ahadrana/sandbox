@@ -1577,6 +1577,9 @@ func TestCrashRecoverySweep(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.GuestSupervisorBin = buildGuestSupervisor(t)
 	cfg.Networking = true
+	// The sweep is opt-in (a second backend must never delete a live foreign
+	// process's plumbing); this test is the sweep's owner.
+	cfg.SweepStaleNetworking = true
 	b1, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1623,6 +1626,44 @@ func TestCrashRecoverySweep(t *testing.T) {
 		if out, err := sudo(bin, "-S", chain).CombinedOutput(); err == nil {
 			t.Fatalf("stale chain %s survived New() sweep: %s", chain, out)
 		}
+	}
+}
+
+// Sweep safety regression (k3s soak, 2026-09-16): a second backend's New()
+// with default config must NOT sweep a live foreign backend's plumbing —
+// on a shared host (test suite next to the production host-agentd) the old
+// unconditional sweep deleted every running VM's TAP and publish chains.
+func TestNewDoesNotSweepForeignNetworkingByDefault(t *testing.T) {
+	owner := newNetBackend(t)
+	h, err := owner.Create(egressSpec("inc-foreign", network.EgressPolicy{DefaultAllow: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Start(h); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	owner.mu.Lock()
+	ns := owner.incs["inc-foreign"].net
+	owner.mu.Unlock()
+	if ns == nil {
+		t.Fatal("no network state")
+	}
+	defer owner.Terminate(h)
+
+	// A second backend (a test/dev process sharing the host) starts with
+	// Networking but no sweep opt-in: the owner's TAP and chains survive.
+	cfg := testConfig(t)
+	cfg.Networking = true
+	other, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { other.Close() })
+	if err := exec.Command("ip", "link", "show", ns.tap).Run(); err != nil {
+		t.Fatalf("live TAP %s swept by a foreign New() with default config", ns.tap)
+	}
+	if _, err := sudo("iptables", "-S", ns.chain).CombinedOutput(); err != nil {
+		t.Fatalf("live chain %s swept by a foreign New() with default config", ns.chain)
 	}
 }
 

@@ -112,9 +112,15 @@ func main() {
 		JailerBin:          envOr("FC_JAILER", "/usr/local/bin/jailer"),
 		GuestSupervisorBin: envOr("FC_GUEST_SUPERVISOR", "/opt/sandbox/guest-supervisor"),
 		Networking:         os.Getenv("FC_NETWORKING") == "true",
-		PublishDenyPorts:   publishDenyPorts(),
-		BootTimeout:        120 * time.Second,
-		DefaultMemMiB:      256,
+		// The daemon owns the host's fc networking: at pod start, any
+		// platform-named TAP/chain belongs to a crashed predecessor (pod
+		// teardown kills its VMMs), so the FM11 sweep is safe here — and
+		// here only (default-off keeps test/dev backends on the same host
+		// from destroying this daemon's live plumbing).
+		SweepStaleNetworking: os.Getenv("FC_NETWORKING") == "true",
+		PublishDenyPorts:     publishDenyPorts(),
+		BootTimeout:          120 * time.Second,
+		DefaultMemMiB:        256,
 	})
 	if err != nil {
 		log.Fatalf("firecracker backend: %v", err)

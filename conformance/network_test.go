@@ -787,6 +787,57 @@ func TestRoutedRestoreReactivatesBindings(t *testing.T) {
 	}
 }
 
+// Idempotent-resume regression (k3s soak, 2026-09-16): the resume proxy's
+// flight racing a client's Resume serialized on m.mu — the loser found the
+// sandbox RUNNING and 400'd ("illegal state transition") into the proxy's
+// negative cache, which then 503'd the healthy endpoint for seconds and
+// failed the sim's post-restore continuity curl. A Resume against a live
+// sandbox must succeed, keep the epoch, and leave the binding ACTIVE and
+// published.
+func TestResumeLiveSandboxIdempotent(t *testing.T) {
+	mgr, rt, _ := newPublishSystem(t)
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-idem"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+	b, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 8080, LogicalName: "web", TTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rt.isPublished(8080) {
+		t.Fatal("binding not published while live")
+	}
+
+	// Duplicate resume against the live sandbox (the proxy-flight race).
+	rep, err := mgr.Resume(sb.SandboxID)
+	if err != nil {
+		t.Fatalf("resume of live sandbox: %v", err)
+	}
+	if rep.NewEpoch != rep.PriorEpoch {
+		t.Fatalf("idempotent resume changed epoch %d -> %d", rep.PriorEpoch, rep.NewEpoch)
+	}
+	cur, err := mgr.GetSandbox(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch cur.ObservedState {
+	case domain.SandboxRunning, domain.SandboxQuiescent, domain.SandboxBackgroundActive:
+	default:
+		t.Fatalf("state after idempotent resume = %s, want a live state", cur.ObservedState)
+	}
+	got := mgr.ListEndpointBindings(sb.SandboxID)
+	if len(got) != 1 || got[0].BindingID != b.BindingID || got[0].State != domain.EndpointActive {
+		t.Fatalf("binding disturbed by idempotent resume: %+v", got)
+	}
+	if !rt.isPublished(8080) {
+		t.Fatal("port unpublished by idempotent resume")
+	}
+}
+
 // failStore injects one Commit failure (review M6 test).
 type failStore struct {
 	*sandboxmanager.MemoryStore

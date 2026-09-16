@@ -196,6 +196,13 @@ curl -s -H "$T" -d '{}' localhost:18080/v1/sandboxes/$SB/terminate
   `net.ipv4.ip_unprivileged_port_start=0` (the per-incarnation DNS-learning
   proxies bind :53 on their TAP host addresses) on the host netns at pod
   start. The backend also applies both sysctls itself at runtime.
+  host-agentd is the ONLY process allowed to run the New()-time FM11 crash
+  sweep (`Config.SweepStaleNetworking`, default off): the sweep deletes
+  every platform-named TAP/chain not registered to its own process, so a
+  second backend on the same host (the FC test suite, a dev process) would
+  otherwise destroy the live fleet's networking — including every
+  `FC-PUB-*` endpoint chain, surfacing as endpoint 502s on active
+  sandboxes.
 - k3s (v1.36 and v1.32 alike) crash-looped on this host's 7.0.0-1012-aws
   AND 6.17.0-1017-aws kernels: `kubelet: could not detect number of cpus`.
   The host's ACPI MADT marks only CPUs 0-3 enabled and kernels ≥ 6.16 only

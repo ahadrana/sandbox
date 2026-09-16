@@ -58,6 +58,14 @@ type Config struct {
 	// Spec.Env["AGENT_SANDBOX_EGRESS"]). Requires passwordless sudo and
 	// ip/iptables. When false no NIC exists at all (fail-closed).
 	Networking bool
+	// SweepStaleNetworking enables the New()-time crash sweep (FM11): every
+	// platform-named TAP/chain not registered to THIS process is deleted.
+	// That is only safe in the process that owns the host's fc networking
+	// (the production host-agentd, recovering from a crashed predecessor);
+	// any second backend sharing the host/netns — a test suite, a dev
+	// process — would destroy the owner's live plumbing. Default false:
+	// New() never deletes foreign resources.
+	SweepStaleNetworking bool
 	// MaxSnapshotsPerIncarnation bounds retained snapshots per incarnation
 	// (oldest GC'd after each Snapshot); default 3, <=0 keeps all.
 	MaxSnapshotsPerIncarnation int
@@ -252,7 +260,9 @@ func New(cfg Config) (*Backend, error) {
 		if err := checkNetPrereqs(); err != nil {
 			return nil, err
 		}
-		sweepStaleNetworking()
+		if c.SweepStaleNetworking {
+			sweepStaleNetworking()
+		}
 	}
 	b := &Backend{cfg: c, incs: map[string]*incarnation{}, nextCID: c.VsockBaseCID, pins: map[string]time.Time{}}
 	if c.JailerBin != "" {

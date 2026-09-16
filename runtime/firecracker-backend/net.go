@@ -913,6 +913,9 @@ WantedBy=multi-user.target
 // exact naming conventions are touched, and a slot still registered to a
 // live incarnation of THIS process is never swept (defense in depth: a
 // fresh New has none, but a second Backend in the same process might).
+// It runs only when Config.SweepStaleNetworking is set: the sweep cannot
+// distinguish a crashed process's leftovers from a LIVE foreign process's
+// plumbing, so it is restricted to the process that owns the host.
 // Errors are logged loudly, never fatal.
 func sweepStaleNetworking() {
 	slots := map[int]bool{}

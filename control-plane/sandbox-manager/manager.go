@@ -1670,6 +1670,26 @@ func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 	if !ok {
 		return nil, domain.ErrNotFound
 	}
+	// Idempotent resume (ADR-007): duplicate triggers — the resume proxy's
+	// flight racing a client's Resume — serialize on m.mu, so the loser
+	// finds the sandbox already live. It must succeed here, not 400 its way
+	// into the proxy's negative cache (which then 503s a healthy endpoint
+	// for seconds). Suspended bindings are reactivated as on any resume.
+	if publishableState(sb.ObservedState) {
+		if _, live := m.handles[sandboxID]; live {
+			m.reactivateBindingsLocked(sb)
+			if err := m.flushTx(); err != nil {
+				return nil, err
+			}
+			return &api.RestoreReport{
+				Version:            api.SchemaVersionV1,
+				SandboxID:          sandboxID,
+				PriorEpoch:         sb.ExecutionEpoch,
+				NewEpoch:           sb.ExecutionEpoch,
+				RestoredGeneration: sb.WorkspaceGeneration,
+			}, nil
+		}
+	}
 	if err := m.transition(sb, domain.SandboxResuming); err != nil {
 		return nil, err
 	}
