@@ -66,7 +66,7 @@ func doReq(t *testing.T, p *Proxy) *httptest.ResponseRecorder {
 // ADR-007: N concurrent requests to a suspended sandbox share ONE resume.
 func TestSingleFlightUnderConcurrency(t *testing.T) {
 	up := backendServer(t)
-	rt := &stubRouter{dec: network.RouteDecision{Reason: "sandbox not live", SandboxID: "sb1", Port: 8080}}
+	rt := &stubRouter{dec: network.RouteDecision{Reason: "sandbox not live", Resumable: true, SandboxID: "sb1", Port: 8080}}
 	var resumeCalls int32
 	release := make(chan struct{})
 	p := New(Config{
@@ -150,7 +150,7 @@ func TestPassThroughHotPath(t *testing.T) {
 // ADR-007: resume failure is bounded (attempt budget), then the negative
 // cache fails fast without new control-plane calls.
 func TestResumeFailureBounded(t *testing.T) {
-	rt := &stubRouter{dec: network.RouteDecision{Reason: "sandbox not live", SandboxID: "sb1", Port: 8080}}
+	rt := &stubRouter{dec: network.RouteDecision{Reason: "sandbox not live", Resumable: true, SandboxID: "sb1", Port: 8080}}
 	var resumeCalls int32
 	p := New(Config{
 		Router: rt,
@@ -189,7 +189,7 @@ func TestResumeFailureBounded(t *testing.T) {
 // continues; the next request joins the SAME flight (no second resume).
 func TestResumeTimeout(t *testing.T) {
 	up := backendServer(t)
-	rt := &stubRouter{dec: network.RouteDecision{Reason: "sandbox not live", SandboxID: "sb1", Port: 8080}}
+	rt := &stubRouter{dec: network.RouteDecision{Reason: "sandbox not live", Resumable: true, SandboxID: "sb1", Port: 8080}}
 	release := make(chan struct{})
 	var resumeCalls int32
 	p := New(Config{
@@ -287,11 +287,12 @@ func TestManagerIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
-		Version:    api.SchemaVersionV1,
-		SandboxID:  sb.SandboxID,
-		TenantID:   "t1",
-		TargetPort: 8080,
-		TTL:        time.Hour,
+		Version:     api.SchemaVersionV1,
+		SandboxID:   sb.SandboxID,
+		TenantID:    "t1",
+		TargetPort:  8080,
+		LogicalName: "ep1",
+		TTL:         time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -363,7 +364,7 @@ func nameLookup(table map[string]string) (func(string) (string, bool), *int32) {
 // explicit header.
 func TestHostBasedResumeTrigger(t *testing.T) {
 	up := backendServer(t)
-	rt := &stubRouter{dec: network.RouteDecision{Reason: "sandbox not live", SandboxID: "sb1", Port: 8080}}
+	rt := &stubRouter{dec: network.RouteDecision{Reason: "sandbox not live", Resumable: true, SandboxID: "sb1", Port: 8080}}
 	lookup, lookupCalls := nameLookup(map[string]string{"ep1": "b1"})
 	var resumeCalls int32
 	p := New(Config{
@@ -472,5 +473,71 @@ func TestCachedResolutionPurity(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(lookupCalls); got != 2 {
 		t.Fatalf("name lookups after TTL expiry = %d, want 2", got)
+	}
+}
+
+// Unknown-hostname spray (review H3): N requests for an unknown name hit
+// LookupBinding at most once per NameNegativeTTL; the negative cache
+// answers the rest with 404s and counts them.
+func TestUnknownNameSprayNegativeCached(t *testing.T) {
+	rt := &stubRouter{dec: network.RouteDecision{Allowed: true, SandboxID: "sb1", Port: 8080}}
+	lookup, calls := nameLookup(map[string]string{"known": "b1"})
+	p := New(Config{
+		Router:          rt,
+		Resume:          func(id string) error { return nil },
+		Upstream:        func(string, int) (string, error) { return "", errors.New("unused") },
+		EndpointDomain:  "endpoints.sandbox.local",
+		LookupBinding:   lookup,
+		NameNegativeTTL: 200 * time.Millisecond,
+	})
+	const N = 20
+	for i := 0; i < N; i++ {
+		rec := doHostReq(t, p, "ghost.endpoints.sandbox.local")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("unknown name status = %d, want 404", rec.Code)
+		}
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("LookupBinding calls for %d sprayed requests = %d, want 1", N, got)
+	}
+	m := p.Metrics()
+	if m.NegativeNameHits != N-1 {
+		t.Fatalf("NegativeNameHits = %d, want %d", m.NegativeNameHits, N-1)
+	}
+	if m.UnknownNames != 1 {
+		t.Fatalf("UnknownNames = %d, want 1", m.UnknownNames)
+	}
+	// Fail-closed semantics preserved: a name created after the negative
+	// window resolves normally.
+	lookup2, _ := nameLookup(map[string]string{"ghost": "b9"})
+	p.cfg.LookupBinding = lookup2
+	time.Sleep(250 * time.Millisecond)
+	rec := doHostReq(t, p, "ghost.endpoints.sandbox.local")
+	// Route allowed but upstream errors -> 502, proving we passed resolution.
+	if rec.Code == http.StatusNotFound {
+		t.Fatal("known-after-window name still negatively cached past TTL")
+	}
+}
+
+// Typed route outcomes (review M2): a route LOOKUP failure (transport/5xx
+// against the control plane, marked LookupError by the client) is a 502,
+// never a 403 and never a resume trigger.
+func TestRouteLookupErrorIsBadGatewayNotDeny(t *testing.T) {
+	rt := &stubRouter{dec: network.RouteDecision{Reason: "route lookup: connection refused", LookupError: true}}
+	var resumeCalls int32
+	p := New(Config{
+		Router:   rt,
+		Resume:   func(id string) error { atomic.AddInt32(&resumeCalls, 1); return nil },
+		Upstream: func(string, int) (string, error) { return "", errors.New("unused") },
+	})
+	rec := doReq(t, p)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("lookup-error route status = %d, want 502", rec.Code)
+	}
+	if got := atomic.LoadInt32(&resumeCalls); got != 0 {
+		t.Fatalf("lookup error triggered %d resumes, want 0", got)
+	}
+	if m := p.Metrics(); m.RouteErrors != 1 {
+		t.Fatalf("RouteErrors = %d, want 1", m.RouteErrors)
 	}
 }

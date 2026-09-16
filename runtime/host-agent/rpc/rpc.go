@@ -467,6 +467,13 @@ var _ hostagent.Host = (*Client)(nil)
 // PostJSON is a small helper for the daemons' own control-plane calls
 // (registration/heartbeat, workspace materialize).
 func PostJSON(url, token string, in, out interface{}) error {
+	return PostJSONWithTimeout(url, token, 15*time.Second, in, out)
+}
+
+// PostJSONWithTimeout is PostJSON with an explicit transport timeout; the
+// resume path needs one >= the proxy's ResumeTimeout (review M1) so a
+// slow-but-healthy restore is not cut off mid-flight.
+func PostJSONWithTimeout(url, token string, timeout time.Duration, in, out interface{}) error {
 	body, err := json.Marshal(in)
 	if err != nil {
 		return err
@@ -479,7 +486,7 @@ func PostJSON(url, token string, in, out interface{}) error {
 	if token != "" {
 		req.Header.Set(TokenHeader, token)
 	}
-	hc := &http.Client{Timeout: 15 * time.Second}
+	hc := &http.Client{Timeout: timeout}
 	resp, err := hc.Do(req)
 	if err != nil {
 		return err

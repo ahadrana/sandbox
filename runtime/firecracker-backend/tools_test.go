@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // writeToolsMeta writes a snapshot dir whose meta records the given
@@ -101,5 +102,37 @@ func TestToolsImageGCLiveIncarnation(t *testing.T) {
 	b.gcToolsImages()
 	if _, err := os.Stat(pLive); !os.IsNotExist(err) {
 		t.Fatal("dead incarnation's unreferenced image survived GC")
+	}
+}
+
+// M8: a .tmp from an IN-FLIGHT build (toolsMu held by the builder) is never
+// deleted — the GC blocks on toolsMu until the build finishes; only after
+// the builder releases (crash or completion) is the leftover collected.
+func TestToolsImageGCSkipsInFlightTmp(t *testing.T) {
+	b, toolsDir := toolsBackend(t)
+	tmp := filepath.Join(toolsDir, "tools-building.ext4.tmp")
+	if err := os.WriteFile(tmp, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an in-progress build: the builder holds toolsMu.
+	b.toolsMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		b.gcToolsImages()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("gc completed while a build held toolsMu")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if _, err := os.Stat(tmp); err != nil {
+		t.Fatal("in-flight .tmp deleted by GC")
+	}
+	// Build finishes (crashed): the leftover is now collectible.
+	b.toolsMu.Unlock()
+	<-done
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatal("stale .tmp survived GC after build released toolsMu")
 	}
 }

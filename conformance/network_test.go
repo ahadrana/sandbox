@@ -487,11 +487,15 @@ type recordPublisher struct {
 	mu        sync.Mutex
 	published map[int]int // hostPort -> guestPort
 	failNext  error
+	failAll   error
 }
 
 func (r *recordPublisher) PublishPort(h backendinterface.Handle, guestPort, hostPort int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failAll != nil {
+		return r.failAll
+	}
 	if r.failNext != nil {
 		err := r.failNext
 		r.failNext = nil
@@ -780,5 +784,248 @@ func TestRoutedRestoreReactivatesBindings(t *testing.T) {
 	}
 	if !pub.isPublished(8080) {
 		t.Fatal("port not republished after routed restore")
+	}
+}
+
+// failStore injects one Commit failure (review M6 test).
+type failStore struct {
+	*sandboxmanager.MemoryStore
+	failNext bool
+}
+
+func (s *failStore) Commit(tx sandboxmanager.Tx) error {
+	if s.failNext {
+		s.failNext = false
+		return errors.New("injected store failure")
+	}
+	return s.MemoryStore.Commit(tx)
+}
+
+// Never-routable bindings are rejected at creation (review M3): invalid
+// ports and negative TTL fail before any data-plane actuation.
+func TestEndpointBindingValidation(t *testing.T) {
+	mgr, rt, _ := newPublishSystem(t)
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-val"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+	for _, req := range []api.CreateEndpointBindingRequest{
+		{Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1", TargetPort: 0, LogicalName: "a"},
+		{Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1", TargetPort: -1, LogicalName: "b"},
+		{Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1", TargetPort: 70000, LogicalName: "c"},
+		{Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1", TargetPort: 8080, LogicalName: "d", TTL: -time.Second},
+	} {
+		if _, err := mgr.CreateEndpointBinding(req); err == nil {
+			t.Fatalf("binding %+v accepted", req)
+		}
+	}
+	if got := mgr.ListEndpointBindings(sb.SandboxID); len(got) != 0 {
+		t.Fatalf("invalid bindings created state: %+v", got)
+	}
+	if len(rt.published) != 0 {
+		t.Fatalf("invalid binding actuated the data plane: %v", rt.published)
+	}
+}
+
+// Publish-before-persist leak (review M6): if the store commit fails after
+// the DNAT was installed, the publish is compensated and the binding
+// dropped — no rule without an owning binding.
+func TestEndpointPublishCompensatedOnCommitFailure(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC))
+	ids := domain.NewIDGen()
+	ws := workspace.NewMemory(clock, ids)
+	outbox := eventservice.NewOutbox()
+	store := &failStore{MemoryStore: sandboxmanager.NewMemoryStore()}
+	rt := &recordPublisher{Backend: fakebackend.New()}
+	mgr := sandboxmanager.New(clock, ids, ws, rt, outbox, store, "host-1")
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-m6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+
+	store.failNext = true
+	_, err = mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 8080, LogicalName: "web", TTL: time.Hour,
+	})
+	if err == nil {
+		t.Fatal("binding creation succeeded despite store failure")
+	}
+	if rt.isPublished(8080) {
+		t.Fatal("publish leaked after commit failure (no compensating unpublish)")
+	}
+	if got := mgr.ListEndpointBindings(sb.SandboxID); len(got) != 0 {
+		t.Fatalf("binding persisted after commit failure: %+v", got)
+	}
+	// The port is free for a fresh attempt.
+	if _, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 8080, LogicalName: "web", TTL: time.Hour,
+	}); err != nil {
+		t.Fatalf("re-create after compensation: %v", err)
+	}
+	if !rt.isPublished(8080) {
+		t.Fatal("port not published on retry")
+	}
+}
+
+// EndpointPublishFailed is reconciled on Tick (review L4): an ACTIVE but
+// unpublished binding is retried once per Tick and recovers when the
+// transient failure clears; a persistently failing binding is retried
+// bounded (maxPublishRetries) and then left alone.
+func TestEndpointPublishRetriedOnTick(t *testing.T) {
+	clock := domain.NewManualClock(time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC))
+	ids := domain.NewIDGen()
+	ws := workspace.NewMemory(clock, ids)
+	outbox := eventservice.NewOutbox()
+	rt := &recordPublisher{Backend: fakebackend.New()}
+	mgr := sandboxmanager.New(clock, ids, ws, rt, outbox, sandboxmanager.NewMemoryStore(), "host-1")
+
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-l4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+	if err := mgr.Suspend(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	b1, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 8080, LogicalName: "web", TTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := eventservice.NewConsumer()
+	// Resume republish hits a transient failure; the next Tick recovers.
+	rt.failNext = errors.New("transient host failure")
+	if _, err := mgr.Resume(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if rt.isPublished(8080) {
+		t.Fatal("published despite injected failure")
+	}
+	if err := mgr.Tick(time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if !rt.isPublished(8080) {
+		t.Fatal("binding not republished by Tick reconcile")
+	}
+
+	// Bounded give-up: every publish fails; failure events stop after the
+	// retry budget (1 at resume + maxPublishRetries on ticks).
+	rt.failAll = errors.New("permanent host failure")
+	if err := mgr.Suspend(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	b2, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+		Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+		TargetPort: 9090, LogicalName: "api", TTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = b1
+	if _, err := mgr.Resume(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	for i := 0; i < 7; i++ {
+		if err := mgr.Tick(time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count := 0
+	for _, ev := range eventsOfType(consumer.Poll(outbox), domain.EventEndpointPublishFailed) {
+		if ev.Payload["binding_id"] == b2.BindingID {
+			count++
+		}
+	}
+	if count != 6 {
+		t.Fatalf("publish failure events for b2 = %d, want 6 (bounded)", count)
+	}
+	if rt.isPublished(9090) {
+		t.Fatal("permanently failing publish eventually succeeded?")
+	}
+}
+
+// Logical-name validation (review L10): names the resume proxy's resolver
+// can never produce are rejected at creation with a clear error.
+func TestEndpointLogicalNameValidation(t *testing.T) {
+	mgr, _, _ := newPublishSystem(t)
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-l10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+	mk := func(name string) error {
+		_, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+			Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+			TargetPort: 8080, LogicalName: name, TTL: time.Hour,
+		})
+		return err
+	}
+	for _, bad := range []string{"", "Ep1", "ep.1", "ep_1", "-ep1", "ep1-", "ep 1", strings.Repeat("a", 64)} {
+		if err := mk(bad); err == nil {
+			t.Fatalf("logical name %q accepted", bad)
+		}
+	}
+	for _, good := range []string{"ep1", "ep-1", "a", strings.Repeat("a", 63), "0"} {
+		if err := mk(good); err != nil {
+			t.Fatalf("logical name %q rejected: %v", good, err)
+		}
+	}
+}
+
+// Name index (review H3): BindingByName stays correct as bindings are
+// unbound, expire, and are recreated under the same name.
+func TestBindingByNameIndexAcrossLifecycle(t *testing.T) {
+	mgr, _, clock := newPublishSystem(t)
+	sb, err := mgr.CreateSandbox(api.CreateSandboxRequest{Version: api.SchemaVersionV1, TenantID: "t1", TaskRef: "task-h3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterializeMgr(t, mgr, sb.SandboxID)
+	mk := func(name string, ttl time.Duration) *domain.EndpointBinding {
+		b, err := mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+			Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+			TargetPort: 8080, LogicalName: name, TTL: ttl,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	b1 := mk("web", time.Hour)
+	got, ok := mgr.BindingByName("web")
+	if !ok || got.BindingID != b1.BindingID {
+		t.Fatalf("fresh binding not resolved by name: %+v ok=%v", got, ok)
+	}
+	// Unbind: terminal bindings are invisible to the index.
+	if err := mgr.UnbindEndpoint(b1.BindingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mgr.BindingByName("web"); ok {
+		t.Fatal("unbound binding still resolved by name")
+	}
+	// Recreate under the same name resolves the NEW binding.
+	b2 := mk("web", time.Second)
+	got, ok = mgr.BindingByName("web")
+	if !ok || got.BindingID != b2.BindingID {
+		t.Fatalf("recreated name resolved wrong binding: %+v ok=%v", got, ok)
+	}
+	// TTL expiry removes it from resolution too.
+	clock.Advance(2 * time.Second)
+	if err := mgr.Tick(time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mgr.BindingByName("web"); ok {
+		t.Fatal("expired binding still resolved by name")
+	}
+	// Unknown names miss cleanly.
+	if _, ok := mgr.BindingByName("never-created"); ok {
+		t.Fatal("unknown name resolved")
 	}
 }

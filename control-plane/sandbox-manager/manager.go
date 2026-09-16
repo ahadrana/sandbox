@@ -51,30 +51,59 @@ type PortPublisher interface {
 	UnpublishPort(h backendinterface.Handle, hostPort int) error
 }
 
-// publishBinding actuates one binding on the data plane when the sandbox
-// is Running with a live handle and the runtime can publish. The host
-// port IS the binding's target port (no remapping: the address clients
-// hold never lies), so a host-port conflict fails the binding's creation
-// outright.
-func (m *Manager) publishBinding(b *domain.EndpointBinding) error {
+// publishTargetLocked resolves the data-plane publish target for one
+// binding: the runtime capability, a live sandbox state, and the live
+// handle. Callers must release m.mu before issuing the RPC (review M4:
+// blocking fleet calls never run under the manager lock) and revalidate
+// state after re-acquiring.
+func (m *Manager) publishTargetLocked(b *domain.EndpointBinding) (PortPublisher, backendinterface.Handle, bool) {
 	pp, ok := m.rt.(PortPublisher)
 	if !ok {
-		return nil
+		return nil, backendinterface.Handle{}, false
 	}
 	sb, ok := m.sandboxes[b.SandboxID]
 	if !ok {
-		return nil
+		return nil, backendinterface.Handle{}, false
 	}
-	switch sb.ObservedState {
-	case domain.SandboxRunning, domain.SandboxQuiescent, domain.SandboxBackgroundActive:
-	default:
-		return nil // not live: actuated by materialize/resume
+	if !publishableState(sb.ObservedState) {
+		return nil, backendinterface.Handle{}, false
 	}
 	h, live := m.handles[b.SandboxID]
 	if !live {
-		return nil
+		return nil, backendinterface.Handle{}, false
 	}
-	return pp.PublishPort(h, b.TargetPort, b.TargetPort)
+	return pp, h, true
+}
+
+// publishableState reports whether a sandbox state carries a live
+// incarnation whose networking can host a port publish.
+func publishableState(s domain.SandboxState) bool {
+	switch s {
+	case domain.SandboxRunning, domain.SandboxQuiescent, domain.SandboxBackgroundActive:
+		return true
+	}
+	return false
+}
+
+// indexBindingLocked adds a binding to the logical-name index (review H3).
+func (m *Manager) indexBindingLocked(b *domain.EndpointBinding) {
+	set := m.bindingsByName[b.LogicalName]
+	if set == nil {
+		set = map[string]struct{}{}
+		m.bindingsByName[b.LogicalName] = set
+	}
+	set[b.BindingID] = struct{}{}
+}
+
+// deindexBindingLocked drops a binding from the logical-name index (used by
+// the create-compensation path where the binding itself is deleted).
+func (m *Manager) deindexBindingLocked(b *domain.EndpointBinding) {
+	if set := m.bindingsByName[b.LogicalName]; set != nil {
+		delete(set, b.BindingID)
+		if len(set) == 0 {
+			delete(m.bindingsByName, b.LogicalName)
+		}
+	}
 }
 
 // unpublishBinding removes one binding from the data plane, best-effort:
@@ -128,6 +157,11 @@ type Manager struct {
 	enforceFlags   map[string]map[string]bool
 	checkpoints    map[string]checkpointRecord // checkpointID -> record
 	bindings       map[string]*domain.EndpointBinding
+	// bindingsByName indexes binding IDs by logical name (review H3) so
+	// BindingByName is O(1) instead of a full scan under m.mu. Entries are
+	// added at creation and store load; stale IDs are filtered by state at
+	// lookup (bindings are never deleted, only transitioned terminal).
+	bindingsByName map[string]map[string]struct{}
 	// publishRetries tracks ACTIVE bindings whose data-plane publish failed
 	// (review L4): bindingID -> attempts so far; retried once per Tick up to
 	// maxPublishRetries, then given up (the EndpointPublishFailed events
@@ -231,6 +265,7 @@ func New(clock *domain.ManualClock, ids *domain.IDGen, ws workspace.Store, rt Ru
 		leases:         map[string]*domain.Lease{},
 		checkpoints:    map[string]checkpointRecord{},
 		bindings:       map[string]*domain.EndpointBinding{},
+		bindingsByName: map[string]map[string]struct{}{},
 		publishRetries: map[string]int{},
 		quotas:         map[string]domain.Quota{},
 		metrics:        managerMetrics{eventsByType: map[domain.EventType]int64{}},
@@ -311,6 +346,7 @@ func NewFromStore(clock *domain.ManualClock, ids *domain.IDGen, store Store, ws 
 	for k, v := range snap.Bindings {
 		v := v
 		m.bindings[k] = &v
+		m.indexBindingLocked(&v)
 	}
 	if outbox.Len() == 0 {
 		for _, ev := range snap.Events {
@@ -699,18 +735,51 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 // publishActiveBindingsLocked actuates every ACTIVE binding of a running
 // sandbox on the data plane (materialize, resume); failures never fail the
 // lifecycle transition — they surface as endpoint 502s and an audit event.
+// Called with m.mu held; the fleet RPCs run with m.mu DROPPED (review M4:
+// N bindings must not serialize N blocking RPCs under the manager lock)
+// and outcomes are recorded after re-acquiring and revalidating.
 func (m *Manager) publishActiveBindingsLocked(sb *domain.Sandbox) {
+	type target struct {
+		bindingID string
+		pp        PortPublisher
+		h         backendinterface.Handle
+		port      int
+	}
+	var targets []target
 	for _, b := range m.bindings {
 		if b.SandboxID != sb.SandboxID || b.State != domain.EndpointActive {
 			continue
 		}
-		if err := m.publishBinding(b); err != nil {
-			m.publishRetries[b.BindingID] = 0
-			m.emit(sb, sb.SandboxID, domain.EventEndpointPublishFailed, map[string]any{
-				"binding_id": b.BindingID,
-				"error":      err.Error(),
-			})
+		if pp, h, ok := m.publishTargetLocked(b); ok {
+			targets = append(targets, target{b.BindingID, pp, h, b.TargetPort})
 		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+	m.mu.Unlock()
+	type outcome struct {
+		bindingID string
+		err       error
+	}
+	outcomes := make([]outcome, 0, len(targets))
+	for _, tg := range targets {
+		outcomes = append(outcomes, outcome{tg.bindingID, tg.pp.PublishPort(tg.h, tg.port, tg.port)})
+	}
+	m.mu.Lock()
+	for _, oc := range outcomes {
+		if oc.err == nil {
+			continue
+		}
+		b, ok := m.bindings[oc.bindingID]
+		if !ok || b.State != domain.EndpointActive {
+			continue // binding moved on while the RPC was in flight
+		}
+		m.publishRetries[b.BindingID] = 0
+		m.emit(sb, sb.SandboxID, domain.EventEndpointPublishFailed, map[string]any{
+			"binding_id": b.BindingID,
+			"error":      oc.err.Error(),
+		})
 	}
 }
 
@@ -1723,25 +1792,35 @@ func (m *Manager) resumeWithContinuityLocked(sb *domain.Sandbox, record checkpoi
 
 // CreateEndpointBinding binds a logical name to a sandbox target port,
 // fenced to the current execution epoch (PLAN §12). Bindings are durable
-// via the store tx and expire at TTL on Tick.
+// via the store tx and expire at TTL on Tick. The data-plane publish runs
+// with m.mu DROPPED (review M4) and state is revalidated after re-acquire;
+// the compensating unpublish (review M6) is preserved.
 func (m *Manager) CreateEndpointBinding(req api.CreateEndpointBindingRequest) (*domain.EndpointBinding, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	sb, ok := m.sandboxes[req.SandboxID]
 	if !ok {
+		m.mu.Unlock()
 		return nil, domain.ErrNotFound
 	}
 	if err := authorizeTenant(sb, req.TenantID); err != nil {
+		m.mu.Unlock()
 		return nil, err
 	}
 	// Reject never-routable bindings at creation (review M3): an invalid
 	// port or negative TTL would sit ACTIVE forever with the gateway
 	// denying every route.
 	if req.TargetPort < 1 || req.TargetPort > 65535 {
+		m.mu.Unlock()
 		return nil, fmt.Errorf("invalid target port %d", req.TargetPort)
 	}
 	if req.TTL < 0 {
+		m.mu.Unlock()
 		return nil, fmt.Errorf("invalid negative TTL %s", req.TTL)
+	}
+	// Reject names the resolver can never produce (review L10).
+	if err := validateLogicalName(req.LogicalName); err != nil {
+		m.mu.Unlock()
+		return nil, err
 	}
 	b := &domain.EndpointBinding{
 		BindingID:      m.ids.Next("bind"),
@@ -1758,10 +1837,34 @@ func (m *Manager) CreateEndpointBinding(req api.CreateEndpointBindingRequest) (*
 	}
 	// Actuate the data plane before the binding exists: a publish failure
 	// (e.g. host-port conflict) fails the creation, no half-bound state.
-	if err := m.publishBinding(b); err != nil {
-		return nil, err
+	// The host port IS the binding's target port (no remapping: the address
+	// clients hold never lies). The RPC runs outside m.mu (review M4).
+	pp, h, canPublish := m.publishTargetLocked(b)
+	epoch := sb.ExecutionEpoch
+	m.mu.Unlock()
+	var perr error
+	if canPublish {
+		perr = pp.PublishPort(h, b.TargetPort, b.TargetPort)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if perr != nil {
+		return nil, perr
+	}
+	if canPublish {
+		// Revalidate after the unlocked RPC: if the sandbox moved on (epoch
+		// bump or no longer live) the publish targeted a stale incarnation —
+		// compensate and fail rather than leak a DNAT with no valid owner.
+		cur, ok := m.sandboxes[req.SandboxID]
+		if !ok || cur.ExecutionEpoch != epoch || !publishableState(cur.ObservedState) {
+			m.mu.Unlock()
+			_ = pp.UnpublishPort(h, b.TargetPort)
+			m.mu.Lock()
+			return nil, fmt.Errorf("sandbox %s changed state during publish", req.SandboxID)
+		}
 	}
 	m.bindings[b.BindingID] = b
+	m.indexBindingLocked(b)
 	m.tx.Bindings = append(m.tx.Bindings, b)
 	m.emit(sb, sb.SandboxID, domain.EventEndpointBound, map[string]any{
 		"binding_id":      b.BindingID,
@@ -1774,11 +1877,36 @@ func (m *Manager) CreateEndpointBinding(req api.CreateEndpointBindingRequest) (*
 		// binding did not persist — remove the DNAT and drop the in-memory
 		// binding so the port is not leaked without an owner.
 		delete(m.bindings, b.BindingID)
-		m.unpublishBinding(b)
+		m.deindexBindingLocked(b)
+		m.mu.Unlock()
+		if canPublish {
+			_ = pp.UnpublishPort(h, b.TargetPort)
+		}
+		m.mu.Lock()
 		return nil, err
 	}
 	cp := *b
 	return &cp, nil
+}
+
+// validateLogicalName enforces the resolver's name shape (review L10): one
+// lowercase DNS label, 1-63 chars from [a-z0-9-], no leading/trailing
+// hyphen. The resume proxy lowercases and single-labels hostnames before
+// lookup, so anything else is a binding no client can ever address.
+func validateLogicalName(name string) error {
+	if len(name) == 0 || len(name) > 63 {
+		return fmt.Errorf("invalid logical name %q: must be 1-63 characters", name)
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+			return fmt.Errorf("invalid logical name %q: character %q outside [a-z0-9-]", name, string(c))
+		}
+	}
+	if name[0] == '-' || name[len(name)-1] == '-' {
+		return fmt.Errorf("invalid logical name %q: leading/trailing hyphen", name)
+	}
+	return nil
 }
 
 // ListEndpointBindings returns copies of a sandbox's bindings.
@@ -1840,13 +1968,15 @@ func (m *Manager) reactivateBindingsLocked(sb *domain.Sandbox) {
 // BindingByName resolves a logical endpoint name to its binding in a
 // routable-or-resumable state (ACTIVE preferred, else SUSPENDED); terminal
 // bindings are invisible. This is the name-resolution hook behind the
-// resume proxy's hostname scheme (ADR-007).
+// resume proxy's hostname scheme (ADR-007). Indexed by name (review H3):
+// O(number of bindings sharing the name), not O(total bindings).
 func (m *Manager) BindingByName(logicalName string) (*domain.EndpointBinding, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var suspended *domain.EndpointBinding
-	for _, b := range m.bindings {
-		if b.LogicalName != logicalName {
+	for id := range m.bindingsByName[logicalName] {
+		b, ok := m.bindings[id]
+		if !ok {
 			continue
 		}
 		switch b.State {
@@ -2054,31 +2184,65 @@ func (m *Manager) Tick(d time.Duration) error {
 	}
 	// Reconcile (review L4): retry ACTIVE bindings whose publish failed —
 	// one attempt per Tick, bounded; a binding that left ACTIVE (unbound,
-	// suspended) drops out of the retry set.
+	// suspended) drops out of the retry set. The RPCs run with m.mu dropped
+	// (review M4); outcomes are recorded after re-acquiring.
+	type retryTarget struct {
+		id       string
+		attempts int
+		pp       PortPublisher
+		h        backendinterface.Handle
+		port     int
+	}
+	var retries []retryTarget
 	for id, attempts := range m.publishRetries {
 		b, ok := m.bindings[id]
 		if !ok || b.State != domain.EndpointActive || attempts >= maxPublishRetries {
 			delete(m.publishRetries, id)
 			continue
 		}
-		if err := m.publishBinding(b); err != nil {
-			m.publishRetries[id] = attempts + 1
+		pp, h, ok := m.publishTargetLocked(b)
+		if !ok {
+			continue // no live target right now; try again next Tick
+		}
+		retries = append(retries, retryTarget{id, attempts, pp, h, b.TargetPort})
+	}
+	if len(retries) > 0 {
+		m.mu.Unlock()
+		type retryOutcome struct {
+			id       string
+			attempts int
+			err      error
+		}
+		outcomes := make([]retryOutcome, 0, len(retries))
+		for _, rt := range retries {
+			outcomes = append(outcomes, retryOutcome{rt.id, rt.attempts, rt.pp.PublishPort(rt.h, rt.port, rt.port)})
+		}
+		m.mu.Lock()
+		for _, oc := range outcomes {
+			b, ok := m.bindings[oc.id]
+			if !ok || b.State != domain.EndpointActive {
+				delete(m.publishRetries, oc.id)
+				continue
+			}
+			if oc.err != nil {
+				m.publishRetries[oc.id] = oc.attempts + 1
+				if sb := m.sandboxes[b.SandboxID]; sb != nil {
+					m.emit(sb, sb.SandboxID, domain.EventEndpointPublishFailed, map[string]any{
+						"binding_id": b.BindingID,
+						"error":      oc.err.Error(),
+						"attempt":    oc.attempts + 1,
+					})
+				}
+				continue
+			}
+			delete(m.publishRetries, oc.id)
 			if sb := m.sandboxes[b.SandboxID]; sb != nil {
-				m.emit(sb, sb.SandboxID, domain.EventEndpointPublishFailed, map[string]any{
-					"binding_id": b.BindingID,
-					"error":      err.Error(),
-					"attempt":    attempts + 1,
+				m.emit(sb, sb.SandboxID, domain.EventEndpointBound, map[string]any{
+					"binding_id":  b.BindingID,
+					"target_port": b.TargetPort,
+					"republished": true,
 				})
 			}
-			continue
-		}
-		delete(m.publishRetries, id)
-		if sb := m.sandboxes[b.SandboxID]; sb != nil {
-			m.emit(sb, sb.SandboxID, domain.EventEndpointBound, map[string]any{
-				"binding_id":  b.BindingID,
-				"target_port": b.TargetPort,
-				"republished": true,
-			})
 		}
 	}
 	return m.flushTx()

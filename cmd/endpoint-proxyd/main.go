@@ -66,8 +66,9 @@ func (c *cpClient) get(path string, out interface{}) (int, error) {
 func (c *cpClient) Route(bindingID string) network.RouteDecision {
 	var dec network.RouteDecision
 	if _, err := c.get("/v1/route/"+url.PathEscape(bindingID), &dec); err != nil {
-		// Transport failure fails closed, like any gateway doubt.
-		return network.RouteDecision{Reason: "route lookup: " + err.Error()}
+		// A transport/server failure is not a deny verdict (review M2):
+		// mark it so the proxy answers 502 and never triggers a resume.
+		return network.RouteDecision{Reason: "route lookup: " + err.Error(), LookupError: true}
 	}
 	return dec
 }
@@ -89,9 +90,13 @@ func (c *cpClient) lookupBinding(logicalName string) (string, bool) {
 }
 
 // resume implements resumeproxy.Resumer against
-// POST /v1/sandboxes/{id}/resume.
+// POST /v1/sandboxes/{id}/resume. The transport timeout exceeds the proxy's
+// default 60s ResumeTimeout (review M1): a slow-but-healthy restore must
+// not burn the attempt budget against a client-side deadline.
+const resumeTransportTimeout = 75 * time.Second
+
 func (c *cpClient) resume(sandboxID string) error {
-	return rpc.PostJSON(c.base+"/v1/sandboxes/"+url.PathEscape(sandboxID)+"/resume", c.token, nil, nil)
+	return rpc.PostJSONWithTimeout(c.base+"/v1/sandboxes/"+url.PathEscape(sandboxID)+"/resume", c.token, resumeTransportTimeout, nil, nil)
 }
 
 // upstream implements resumeproxy.Upstream against

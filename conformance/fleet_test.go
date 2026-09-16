@@ -699,14 +699,39 @@ func TestRestorePlacementGuard(t *testing.T) {
 
 // The host agent refuses to publish its own RPC port to a guest: the DNAT
 // would hijack heartbeats/RPC into the guest (observed on k3s: host
-// declared lost, teardown suppressed, VMM + rules leaked).
+// declared lost, teardown suppressed, VMM + rules leaked). Publish also
+// enforces route+fence (review H2): unknown handles get ErrNotFound, a
+// stale fence gets ErrStaleFence.
 func TestPublishProtectsRPCPort(t *testing.T) {
 	fs := newFleetSystem(t, 1, 2)
 	agent := fs.hosts["host-1"]
 	agent.ProtectPorts(8080)
-	err := agent.PublishPort(backendinterface.Handle{IncarnationID: "inc-x"}, 9000, 8080)
+	wsID, wsGen := commitEmptyWS(t, fs.ws)
+	h, err := fs.fleet.Create(backendinterface.Spec{
+		SandboxID: "sb-p", IncarnationID: "inc-p", Epoch: 1, MemoryBytes: 64,
+		WorkspaceID: wsID, WorkspaceGeneration: wsGen,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fence, ok := fs.fleet.PlacementOf(h.IncarnationID)
+	if !ok {
+		t.Fatal("no placement")
+	}
+	err = agent.PublishPort(h, 9000, 8080, fence)
 	if err == nil || !errors.Is(err, backendinterface.ErrPortConflict) {
-		t.Fatalf("err = %v, want ErrPortConflict", err)
+		t.Fatalf("protected port: err = %v, want ErrPortConflict", err)
+	}
+	// H2: stale fence and unknown handle are typed errors.
+	if err := agent.PublishPort(h, 9000, 18000, fence+1); !errors.Is(err, hostagent.ErrStaleFence) {
+		t.Fatalf("stale fence publish: err = %v", err)
+	}
+	if err := agent.UnpublishPort(h, 18000, fence+1); !errors.Is(err, hostagent.ErrStaleFence) {
+		t.Fatalf("stale fence unpublish: err = %v", err)
+	}
+	unknown := backendinterface.Handle{IncarnationID: "inc-nope"}
+	if err := agent.PublishPort(unknown, 9000, 18000, fence); !errors.Is(err, backendinterface.ErrNotFound) {
+		t.Fatalf("unknown handle publish: err = %v", err)
 	}
 }
 

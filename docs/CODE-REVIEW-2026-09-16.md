@@ -52,6 +52,10 @@ claims to close. Plus one remote-DoS path in the resume proxy.
   `BindingByName` → O(n) scan under the manager's global `m.mu`
   (`manager.go:1722`), which serializes the whole control plane. Client-reachable
   proxy → remote DoS. Fix: short-TTL negative cache + name index in manager.
+  **FIXED** — proxy negative-caches unknown names (`NameNegativeTTL`, new
+  `NegativeNameHits` metric); manager indexes bindings by logical name
+  (`bindingsByName`, maintained on create/store-load); 404 stays fail-closed;
+  `TestUnknownNameSprayNegativeCached`, `TestBindingByNameIndexAcrossLifecycle`.
 - **H4. Restored incarnation can be orphan-scrubbed → false continuity
   (INV-008/009).** `fleet.go:388-397` registers placement only *after*
   `host.Restore` returns; `RegisterHost` (`fleet.go:134-147`) kills unregistered
@@ -70,16 +74,29 @@ claims to close. Plus one remote-DoS path in the resume proxy.
   client with 15s timeout; a real restore exceeds it → attempt budget (2)
   burned against a healthy-but-slow resume → 503 + negative cache. Contradicts
   ADR-007 §4. Fix: transport timeout ≥ ResumeTimeout.
+  **FIXED** — `rpc.PostJSONWithTimeout` added; endpoint-proxyd's resume call
+  uses 75s (≥ the proxy's 60s ResumeTimeout); lookups keep the sharp 15s
+  client; `TestPostJSONTimeoutPlumbing`.
 - **M2. Transient control-plane errors surface as 403.** `endpoint-proxyd
   main.go:70` maps transport/5xx to deny → client sees 403 (indistinguishable
   from real deny); resume trigger is reason-string matching — fragile for a
   security-relevant branch. Should be 502/503 + typed verdicts.
+  **FIXED** — `RouteDecision` gains typed additive fields: `Resumable` (set
+  server-side by the gateway for binding-SUSPENDED / sandbox-not-live denies;
+  replaces reason-string matching) and `LookupError` (set client-side on
+  transport/5xx → proxy answers 502, never resumes, `RouteErrors` metric);
+  `TestRouteLookupErrorIsBadGatewayNotDeny`.
 - **M3. `createBinding` accepts never-routable bindings.** control-planed: TTL 0
   or huge (Duration overflow → negative), target_port unvalidated — creation
   succeeds, gateway denies forever. Silent trap.
 - **M4. Blocking host RPC under manager lock.** `CreateEndpointBinding` and
   `publishActiveBindingsLocked` hold `m.mu` across Fleet RPCs; a hung host
   stalls all manager operations; N bindings = N serialized RPCs under lock.
+  **FIXED** — publish targets are resolved under `m.mu`
+  (`publishTargetLocked`), the RPCs run with `m.mu` dropped, and outcomes
+  are recorded after re-acquiring with revalidation (epoch/state for
+  create, still-ACTIVE for republish/Tick-retry); publish-before-persist +
+  M6 compensation preserved.
 - **M5. Host-side restore validation fail-open for metadata-poor checkpoints.**
   `hostagent.go:481-499`: missing `sandbox_id` → fence check skipped + outside
   bySandbox (no orphan protection); unparseable `memory_bytes` → capacity
@@ -97,6 +114,9 @@ claims to close. Plus one remote-DoS path in the resume proxy.
   `toolsMu` (Create then fails ENOENT); scan-under-`b.mu` then delete-unlocked
   races Create's stat→register (live incarnation with deleted tools drive).
   Fix: hold toolsMu/b.mu across scan+delete.
+  **FIXED** — `gcToolsImages` holds `b.mu` (then `toolsMu`, Create's lock
+  order) across the whole reference scan + delete pass;
+  `TestToolsImageGCSkipsInFlightTmp`.
 - **M9. `capacityFailures` asymmetry.** `Fleet.Restore` increments on failed
   Place, never resets on success (Create does); restore is pinned to one host
   so a full origin ratchets the fleet-wide scale-out signal permanently.
@@ -133,6 +153,10 @@ claims to close. Plus one remote-DoS path in the resume proxy.
 - L10. Hostname/case: `BindingByName` is case-sensitive, creation does no
   name validation/normalization → bindings creatable that the resolver can
   never produce (`Ep1`, `ep.1`).
+  **FIXED** — `CreateEndpointBinding` validates the logical name (single
+  lowercase DNS label, 1-63 chars, `[a-z0-9-]`, no leading/trailing
+  hyphen) at the manager, so every edge rejects unresolvable names;
+  `TestEndpointLogicalNameValidation`.
 - L11. SSRF-flavored trust: `/v1/sandboxes/{id}/address` returns
   heartbeat-self-reported URL; proxy dials it. Consistent with dev shared-token
   posture; note INV-018 surface expansion (one token → data path + actuation
@@ -166,10 +190,13 @@ claims to close. Plus one remote-DoS path in the resume proxy.
 1. ~~C1 addrtype/dst-type LOCAL match on publish hooks.~~ FIXED (Batch A).
 2. ~~H1 protected port floor + deny-list.~~ FIXED (Batch A).
 3. H4+H5 atomic pending-placement registration + idempotent restore.
-4. H3 negative name cache + manager name index.
+4. ~~H3 negative name cache + manager name index.~~ FIXED (Batch B).
 5. ~~H2 fence/route enforcement on publish RPCs.~~ FIXED (Batch A).
-6. M1 transport timeout alignment; M2 typed route verdicts; ~~M3 binding
-   validation (TTL, port)~~ (M3 FIXED, Batch A); M4 drop m.mu across fleet RPCs.
+6. ~~M1 transport timeout alignment; M2 typed route verdicts~~ (M1/M2 FIXED,
+   Batch B); ~~M3 binding validation (TTL, port)~~ (M3 FIXED, Batch A);
+   ~~M4 drop m.mu across fleet RPCs~~ FIXED (Batch B).
 7. M5 reject unparseable restore metadata; ~~M6 compensating unpublish;
-   M7 installMu in cleanup~~ (M6/M7 FIXED, Batch A); M8 GC locking; M9 capacity-failure reset.
-8. L-items as a batch (L1–L4 FIXED, Batch A; L5–L14 open).
+   M7 installMu in cleanup~~ (M6/M7 FIXED, Batch A); ~~M8 GC locking~~
+   FIXED (Batch B); M9 capacity-failure reset.
+8. L-items as a batch (L1–L4 FIXED, Batch A; L10 FIXED, Batch B; L5–L9,
+   L11–L14 open).

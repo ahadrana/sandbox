@@ -910,23 +910,31 @@ func (b *Backend) gcSnapshots(incarnationID string) {
 // image path, so deleting a referenced image would break restore (typed
 // tools_image error at validation); only fully unreferenced images are
 // collected. Orphaned .tmp build artifacts are always removed.
+//
+// Locking (review M8): b.mu is held across the entire reference scan and
+// delete pass — Create holds b.mu across ensureToolsImage + incarnation
+// registration, so a concurrent build can neither have a .tmp in flight
+// nor register a reference after the scan. toolsMu is taken second (the
+// Create path's b.mu -> toolsMu order) for the documented build exclusion.
 func (b *Backend) gcToolsImages() {
 	if b.cfg.GuestSupervisorBin == "" {
 		return
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.toolsMu.Lock()
+	defer b.toolsMu.Unlock()
 	toolsDir := filepath.Join(b.cfg.Root, "tools")
 	entries, err := os.ReadDir(toolsDir)
 	if err != nil {
 		return
 	}
 	referenced := map[string]bool{}
-	b.mu.Lock()
 	for _, inc := range b.incs {
 		if !inc.dead && inc.toolsSHA != "" {
 			referenced[inc.toolsSHA] = true
 		}
 	}
-	b.mu.Unlock()
 	snapsRoot := filepath.Join(b.cfg.Root, "snapshots")
 	incDirs, err := os.ReadDir(snapsRoot)
 	if err == nil {

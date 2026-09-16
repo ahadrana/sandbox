@@ -59,6 +59,10 @@ type Config struct {
 	// NegativeTTL is how long a binding whose resume just failed fails
 	// fast with 503 (default 5s).
 	NegativeTTL time.Duration
+	// NameNegativeTTL is how long an unknown hostname resolution fails
+	// fast with 404 without re-hitting LookupBinding (default 5s) — the
+	// spray guard against unknown-hostname floods (review H3).
+	NameNegativeTTL time.Duration
 	// ResumeTimeout bounds one waiter's patience (default 60s); the
 	// shared flight continues past it.
 	ResumeTimeout time.Duration
@@ -80,6 +84,9 @@ func (c Config) withDefaults() Config {
 	if c.NegativeTTL == 0 {
 		c.NegativeTTL = 5 * time.Second
 	}
+	if c.NameNegativeTTL == 0 {
+		c.NameNegativeTTL = 5 * time.Second
+	}
 	if c.ResumeTimeout == 0 {
 		c.ResumeTimeout = 60 * time.Second
 	}
@@ -94,18 +101,20 @@ func (c Config) withDefaults() Config {
 
 // Metrics is a point-in-time snapshot of proxy counters.
 type Metrics struct {
-	Requests        int
-	PassThrough     int // forwarded via the live cache, no control-plane call
-	RouteLookups    int
-	ResumeTriggered int // flights started
-	ResumeShared    int // waiters attached to an in-flight resume
-	ResumeSucceeded int
-	ResumeFailed    int
-	ResumeTimeouts  int
-	NegativeHits    int
-	UpstreamErrors  int
-	NameResolutions int // LookupBinding calls (hostname resolutions)
-	UnknownNames    int // hostname lookups that resolved to no binding (404)
+	Requests         int
+	PassThrough      int // forwarded via the live cache, no control-plane call
+	RouteLookups     int
+	ResumeTriggered  int // flights started
+	ResumeShared     int // waiters attached to an in-flight resume
+	ResumeSucceeded  int
+	ResumeFailed     int
+	ResumeTimeouts   int
+	NegativeHits     int
+	UpstreamErrors   int
+	NameResolutions  int // LookupBinding calls (hostname resolutions)
+	UnknownNames     int // hostname lookups that resolved to no binding (404)
+	NegativeNameHits int // unknown-name requests served from the negative cache
+	RouteErrors      int // route lookups that failed transport/server-side (502)
 }
 
 // flight is one in-flight resume shared by every waiter on that sandbox.
@@ -128,7 +137,11 @@ type Proxy struct {
 	// resolved caches logicalName -> bindingID for CacheTTL (same TTL
 	// discipline as the live cache: positive entries only).
 	resolved map[string]resolvedName
-	metrics  Metrics
+	// unknownNames caches logicalName -> fail-fast-until for names that
+	// resolved to no binding (review H3): a hostname spray replays against
+	// this map instead of the control plane.
+	unknownNames map[string]time.Time
+	metrics      Metrics
 }
 
 type resolvedName struct {
@@ -151,6 +164,7 @@ func New(cfg Config) *Proxy {
 		flights:      map[string]*flight{},
 		cachedTarget: map[string]target{},
 		resolved:     map[string]resolvedName{},
+		unknownNames: map[string]time.Time{},
 	}
 }
 
@@ -196,8 +210,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.Unlock()
 
 	dec := p.route(bindingID)
+	if dec.LookupError {
+		// Transport/5xx against the control plane is not a verdict (review
+		// M2): 502, never the resume path, never a 403 the client cannot
+		// distinguish from a real deny.
+		p.mu.Lock()
+		p.metrics.RouteErrors++
+		p.mu.Unlock()
+		http.Error(w, "route lookup failed: "+dec.Reason, http.StatusBadGateway)
+		return
+	}
 	if !dec.Allowed {
-		if !resumable(dec) {
+		if !dec.Resumable {
 			http.Error(w, "route denied: "+dec.Reason, http.StatusForbidden)
 			return
 		}
@@ -240,12 +264,18 @@ func (p *Proxy) bindingFor(r *http.Request) (string, int) {
 		p.mu.Unlock()
 		return e.bindingID, 0
 	}
+	if until, neg := p.unknownNames[name]; neg && now.Before(until) {
+		p.metrics.NegativeNameHits++
+		p.mu.Unlock()
+		return "", http.StatusNotFound
+	}
 	p.metrics.NameResolutions++
 	p.mu.Unlock()
 	id, found := p.cfg.LookupBinding(name)
 	if !found {
 		p.mu.Lock()
 		p.metrics.UnknownNames++
+		p.unknownNames[name] = now.Add(p.cfg.NameNegativeTTL)
 		p.mu.Unlock()
 		return "", http.StatusNotFound
 	}
@@ -284,14 +314,6 @@ func (p *Proxy) route(bindingID string) network.RouteDecision {
 	p.metrics.RouteLookups++
 	p.mu.Unlock()
 	return p.cfg.Router.Route(bindingID)
-}
-
-// resumable reports whether a deny verdict means "suspended, worth a
-// resume" as opposed to a hard fail-closed deny (ADR-007: only traffic to
-// a not-live sandbox may trigger materialization).
-func resumable(dec network.RouteDecision) bool {
-	return strings.Contains(dec.Reason, "sandbox not live") ||
-		strings.Contains(dec.Reason, "SUSPENDED")
 }
 
 var errResumeTimeout = fmt.Errorf("resume wait timed out")

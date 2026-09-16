@@ -224,6 +224,14 @@ type RouteDecision struct {
 	SandboxID string
 	Epoch     int64
 	Port      int
+	// Resumable marks a deny that a resume can cure (binding SUSPENDED or
+	// sandbox not live) — the typed replacement for reason-string matching
+	// at the proxy (review M2).
+	Resumable bool
+	// LookupError marks a verdict manufactured client-side after a transport
+	// or server failure talking to the control plane — never a routing
+	// decision, never resumable; the proxy surfaces 502 (review M2).
+	LookupError bool
 }
 
 // Gateway resolves bindings to (sandbox, epoch, port). It fails CLOSED on
@@ -245,7 +253,10 @@ func (g *Gateway) Route(bindingID string) RouteDecision {
 		return RouteDecision{Reason: reason, SandboxID: b.SandboxID, Epoch: b.ExecutionEpoch, Port: b.TargetPort}
 	}
 	if b.State != domain.EndpointActive {
-		return deny(fmt.Sprintf("binding %s", b.State))
+		d := deny(fmt.Sprintf("binding %s", b.State))
+		// A SUSPENDED binding becomes routable again via resume (ADR-007).
+		d.Resumable = b.State == domain.EndpointSuspended
+		return d
 	}
 	// Fail closed whenever expiry cannot be evaluated, and at the exact
 	// expiry instant (routable strictly before ExpiresAt only).
@@ -262,7 +273,9 @@ func (g *Gateway) Route(bindingID string) RouteDecision {
 		return deny(fmt.Sprintf("stale epoch fence: binding epoch %d, sandbox epoch %d", b.ExecutionEpoch, view.CurrentEpoch))
 	}
 	if !view.SandboxActive {
-		return deny("sandbox not live")
+		d := deny("sandbox not live")
+		d.Resumable = true
+		return d
 	}
 	return RouteDecision{Allowed: true, Reason: "bound", SandboxID: b.SandboxID, Epoch: b.ExecutionEpoch, Port: b.TargetPort}
 }

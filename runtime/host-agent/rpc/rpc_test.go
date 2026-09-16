@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -290,5 +291,33 @@ func TestPublishFenceAndConflictRoundTrip(t *testing.T) {
 	// Right fence: unpublish is a no-op (local backend cannot publish).
 	if err := c.UnpublishPort(handle, 18081, 1); err != nil {
 		t.Fatalf("unpublish with current fence: %v", err)
+	}
+}
+
+// Transport timeout plumbing (review M1): PostJSON keeps the sharp 15s
+// default; PostJSONWithTimeout carries the caller's deadline, so the resume
+// path can wait longer than a slow-but-healthy restore needs while lookups
+// stay sharp.
+func TestPostJSONTimeoutPlumbing(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+	// A short caller timeout cuts the slow call off...
+	if err := PostJSONWithTimeout(slow.URL, "", 50*time.Millisecond, nil, nil); err == nil {
+		t.Fatal("short-timeout call against slow server succeeded")
+	}
+	// ...and a long one (the resume path's) lets it complete.
+	if err := PostJSONWithTimeout(slow.URL, "", 5*time.Second, nil, nil); err != nil {
+		t.Fatalf("long-timeout call against slow server: %v", err)
+	}
+	// The default wrapper still works against a fast server.
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fast.Close()
+	if err := PostJSON(fast.URL, "", nil, nil); err != nil {
+		t.Fatalf("default PostJSON: %v", err)
 	}
 }

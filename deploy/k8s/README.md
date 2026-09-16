@@ -27,10 +27,20 @@ request identifies its binding either by the `X-Endpoint-Binding` header
 
 1. Routes the binding via `GET /v1/route/{bindingID}` — the control plane
    evaluates the fail-closed gateway verdict server-side (unknown binding,
-   non-ACTIVE state, TTL expiry, stale epoch fence all deny).
-2. On a "sandbox not live" deny, single-flights
+   non-ACTIVE state, TTL expiry, stale epoch fence all deny). The verdict
+   carries typed flags: `Resumable` marks denies a resume can cure (binding
+   SUSPENDED / sandbox not live); a client-side `LookupError` mark
+   (transport/5xx talking to the control plane) surfaces as 502, never a
+   403 and never a resume trigger. Unknown hostnames fail closed with 404
+   and are negatively cached (NameNegativeTTL) so a name spray never
+   reaches the control plane; the manager resolves names via an O(1)
+   index, not a scan.
+2. On a `Resumable` deny, single-flights
    `POST /v1/sandboxes/{id}/resume` (one resume shared by all waiters on
-   that sandbox; bounded attempts; per-binding negative cache).
+   that sandbox; bounded attempts; per-binding negative cache). The resume
+   call's transport timeout (75s) exceeds the proxy's 60s ResumeTimeout so
+   a slow-but-healthy restore never burns attempt budget on a client-side
+   deadline.
 3. Resolves the upstream via `GET /v1/sandboxes/{id}/address` (the live
    incarnation's host, from its placement) and reverse-proxies to
    `host:<target-port>` — the published endpoint (below). Verified-live
