@@ -1,0 +1,22 @@
+{
+  "name": "guard-mismatch",
+  "seed": 5,
+  "hosts": [
+    {"id": "host-a", "slots": 1, "memory": 1048576,
+     "facts": {"arch": "arm64", "kernel_release": "6.8.0-a", "cpu_part": "0xd0b"}},
+    {"id": "host-b", "slots": 4, "memory": 1048576,
+     "facts": {"arch": "arm64", "kernel_release": "6.9.0-b", "cpu_part": "0xd0c"}}
+  ],
+  "steps": [
+    {"op": "create_sandbox", "save_as": "victim", "materialize": true},
+    {"op": "suspend", "sandbox": "victim"},
+    {"op": "create_sandbox", "save_as": "filler", "materialize": true},
+    {"op": "resume", "sandbox": "victim"}
+  ],
+  "assert": [
+    {"check": "sandbox_state", "sandbox": "victim", "eq": "RUNNING"},
+    {"check": "epoch", "sandbox": "victim", "eq": 2},
+    {"check": "restore_rpcs", "sandbox": "victim", "eq": 0},
+    {"check": "violations", "eq": 0}
+  ]
+}

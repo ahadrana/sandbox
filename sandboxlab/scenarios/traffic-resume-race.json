@@ -1,0 +1,22 @@
+{
+  "name": "traffic-resume-race",
+  "seed": 23,
+  "hosts": [
+    {"id": "host-1", "slots": 8, "memory": 1048576, "latencies": {"restore_ms": 40}},
+    {"id": "host-2", "slots": 8, "memory": 1048576, "latencies": {"restore_ms": 40}}
+  ],
+  "steps": [
+    {"op": "create_sandbox", "save_as": "web", "materialize": true},
+    {"op": "bind_endpoint", "sandbox": "web", "port": 8080, "name": "web"},
+    {"op": "suspend", "sandbox": "web"},
+    {"op": "traffic", "sandbox": "web", "requests": 100}
+  ],
+  "assert": [
+    {"check": "resume_operations", "eq": 1},
+    {"check": "restore_rpcs", "sandbox": "web", "eq": 1},
+    {"check": "live_incarnations", "sandbox": "web", "eq": 1},
+    {"check": "epoch", "sandbox": "web", "eq": 1},
+    {"check": "traffic_all_status", "eq": 200},
+    {"check": "violations", "eq": 0}
+  ]
+}

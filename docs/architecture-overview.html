@@ -310,7 +310,11 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
   20 of the 30 architectural invariants are continuously checked from the event stream + state snapshots
   (2 more scenario-asserted, 8 documented not-sim-checkable), violations are typed trace events that fail
   the test, and planted-violation meta-tests (double-registered incarnation, dropped reset event,
-  oversubscribed host) prove the checkers fire.</li>
+  oversubscribed host) prove the checkers fire. Phase 4 adds declarative JSON scenarios
+  (<code>sandboxlab/scenarios/</code>: cold-start-storm, resume-storm, host-loss-mid-restore,
+  guard-mismatch, checkpoint-gc-churn, traffic-resume-race) and the <code>sandbox-lab</code>
+  CI runner (<code>run</code>/<code>run-all</code>/<code>list</code>, exit 0/1, verdict block,
+  deterministic trace artifact).</li>
 </ul></div>
 <div class="panel"><h3 style="margin-top:0" class="missing">Not yet proven</h3>
 <ul>

@@ -210,3 +210,56 @@ host create behind the fleet's back), a doctored event stream with
 `ExecutionStateReset` events filtered out, and a crash-recovered host that
 adopted 3 incarnations into 1 slot are each caught by the correct checker
 (INV-013/016, INV-008, INV-013/016 respectively).
+
+## Amendment (2026-09-17): phase 4 — declarative scenarios + CI runner
+
+Scenarios are **JSON, not YAML** (deviation from the original sketch): Go
+1.18 stdlib-only means no YAML parser exists, and `encoding/json` with
+`DisallowUnknownFields` gives loud, specific parse errors for free. The DSL
+(`sandboxlab/scenario.go`) declares: `name`, `seed`, `tick_cadence_ms`,
+`hosts[]` (id, slots, memory, arch/kernel/cpu-part facts, per-op latency
+overrides), ordered `steps[]`, and `assert[]`.
+
+Step vocabulary: `create_sandbox` (count/save_as/materialize/allow_fail),
+`materialize`, `exec` (idempotency `key`, `command`, `writes`),
+`commit_workspace`, `bind_endpoint`, `suspend`, `resume`, `sleep` (advances
+virtual time in cadence chunks, driving manager/fleet ticks), `parallel`
+(sub-steps in one virtual instant), `repeat` (times + do[]), `kill_host` /
+`stall_heartbeats` (aliases — the control plane cannot distinguish them) /
+`revive_host` (by `host` or `host_of` a sandbox's last-known placement),
+`terminate`, and `traffic` (N endpoint requests through the resume path,
+modeling proxy single-flight semantics; statuses 200/502/503 recorded).
+Sandbox selectors: a create label, `"*"`, or `"$last"`.
+
+Assertions are a fixed set of named predicates with `eq`/`le`/`ge`
+arguments — deliberately no expression language: `sandbox_state`,
+`sandbox_live`, `epoch`, `restore_rpcs`, `live_incarnations`,
+`resume_operations`, `materialize_failures`, `traffic_all_status`,
+`violations` (the invariant-engine report), `max_live_vms`,
+`hosts_capacity_within_limits`.
+
+The runner is `cmd/sandbox-lab`: `run <file|builtin> [-trace out]`,
+`run-all <dir|builtins>`, `list`. Exit 0/1; verdict block prints PASS/FAIL,
+virtual duration, events fired, max live VMs, resume attempts, and the
+invariant counts. The repo has no Makefile or CI script (tests are run
+directly); `run-all` is the CI entry point, documented in docs/README.md.
+
+Trace artifact format (stable; phase 5 renders it):
+
+```
+# sandboxlab-trace v1
+# scenario: <name>
+# seed: <seed>
+<seq> <ns-since-start> fire|note <label>
+```
+
+`fire` lines are fired kernel events, `note` lines are outcomes and
+`INVARIANT_VIOLATION` records; the header makes replays self-describing, and
+the whole artifact is byte-identical for a given scenario+seed (asserted by
+TestScenarioTraceDeterminism).
+
+Built-in library (`sandboxlab/scenarios/`, embedded): cold-start-storm,
+resume-storm, host-loss-mid-restore, guard-mismatch, checkpoint-gc-churn,
+traffic-resume-race (100 parallel requests at a suspended sandbox → exactly
+1 resume operation, 1 live incarnation, epoch preserved, all 200). Every
+built-in runs under `go test ./...` via TestBuiltinScenariosPass.

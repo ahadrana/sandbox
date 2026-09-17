@@ -1,0 +1,22 @@
+{
+  "name": "host-loss-mid-restore",
+  "seed": 3,
+  "tick_cadence_ms": 100,
+  "hosts": [
+    {"id": "host-1", "slots": 10, "memory": 1048576},
+    {"id": "host-2", "slots": 10, "memory": 1048576}
+  ],
+  "steps": [
+    {"op": "create_sandbox", "save_as": "victim", "materialize": true},
+    {"op": "suspend", "sandbox": "victim"},
+    {"op": "kill_host", "host_of": "victim"},
+    {"op": "sleep", "ms": 500},
+    {"op": "resume", "sandbox": "victim"}
+  ],
+  "assert": [
+    {"check": "sandbox_state", "sandbox": "victim", "eq": "RUNNING"},
+    {"check": "epoch", "sandbox": "victim", "eq": 2},
+    {"check": "restore_rpcs", "sandbox": "victim", "eq": 0},
+    {"check": "violations", "eq": 0}
+  ]
+}

@@ -136,6 +136,22 @@ milestone to code:
 
 Run everything with `go test ./...` from the repository root.
 
+## SandboxLab — deterministic simulation + scenario runner
+
+`sandboxlab/` (ADR-010) runs the real control plane in-process on a virtual
+clock: same seed ⇒ byte-identical trace. Declarative scenarios live in
+`sandboxlab/scenarios/*.json` (embedded; the `go test` suite runs them all)
+and are executable standalone via `cmd/sandbox-lab`:
+
+```
+go run ./cmd/sandbox-lab list
+go run ./cmd/sandbox-lab run resume-storm -trace /tmp/resume.simtrace
+go run ./cmd/sandbox-lab run-all builtins   # CI entry point
+```
+
+The repo has no Makefile/CI script (tests are run directly); `run-all` with
+exit 0/1 is the CI integration point.
+
 ## Required reference harness
 
 The repository must contain a deterministic `agent-driver` capable of simulating modern agent behavior without an LLM. It must support scenarios such as:

@@ -1,0 +1,21 @@
+{
+  "name": "cold-start-storm",
+  "seed": 7,
+  "hosts": [
+    {"id": "host-1", "slots": 40, "memory": 1048576, "latencies": {"create_ms": 10}},
+    {"id": "host-2", "slots": 40, "memory": 1048576, "latencies": {"create_ms": 10}},
+    {"id": "host-3", "slots": 40, "memory": 1048576, "latencies": {"create_ms": 10}},
+    {"id": "host-4", "slots": 40, "memory": 1048576, "latencies": {"create_ms": 10}},
+    {"id": "host-5", "slots": 40, "memory": 1048576, "latencies": {"create_ms": 10}}
+  ],
+  "steps": [
+    {"op": "create_sandbox", "count": 251, "materialize": true, "allow_fail": true}
+  ],
+  "assert": [
+    {"check": "live_incarnations", "eq": 200},
+    {"check": "materialize_failures", "eq": 51},
+    {"check": "max_live_vms", "le": 200},
+    {"check": "hosts_capacity_within_limits", "eq": true},
+    {"check": "violations", "eq": 0}
+  ]
+}

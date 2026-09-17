@@ -1,0 +1,23 @@
+{
+  "name": "checkpoint-gc-churn",
+  "seed": 13,
+  "hosts": [
+    {"id": "host-1", "slots": 10, "memory": 1048576},
+    {"id": "host-2", "slots": 10, "memory": 1048576},
+    {"id": "host-3", "slots": 10, "memory": 1048576}
+  ],
+  "steps": [
+    {"op": "repeat", "times": 60, "do": [
+      {"op": "create_sandbox", "save_as": "churn", "materialize": true},
+      {"op": "exec", "sandbox": "$last", "command": "true", "writes": {"/log": "x"}},
+      {"op": "suspend", "sandbox": "$last"},
+      {"op": "resume", "sandbox": "$last"},
+      {"op": "terminate", "sandbox": "$last"}
+    ]}
+  ],
+  "assert": [
+    {"check": "live_incarnations", "eq": 0},
+    {"check": "hosts_capacity_within_limits", "eq": true},
+    {"check": "violations", "eq": 0}
+  ]
+}

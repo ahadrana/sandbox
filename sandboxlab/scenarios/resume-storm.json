@@ -1,0 +1,25 @@
+{
+  "name": "resume-storm",
+  "seed": 11,
+  "hosts": [
+    {"id": "host-1", "slots": 30, "memory": 1048576, "latencies": {"create_ms": 5, "restore_ms": 40}},
+    {"id": "host-2", "slots": 30, "memory": 1048576, "latencies": {"create_ms": 5, "restore_ms": 40}},
+    {"id": "host-3", "slots": 30, "memory": 1048576, "latencies": {"create_ms": 5, "restore_ms": 40}},
+    {"id": "host-4", "slots": 30, "memory": 1048576, "latencies": {"create_ms": 5, "restore_ms": 40}}
+  ],
+  "steps": [
+    {"op": "create_sandbox", "count": 100, "materialize": true},
+    {"op": "suspend", "sandbox": "*"},
+    {"op": "parallel", "do": [
+      {"op": "resume", "sandbox": "*"},
+      {"op": "resume", "sandbox": "*"}
+    ]}
+  ],
+  "assert": [
+    {"check": "sandbox_live", "sandbox": "*", "eq": true},
+    {"check": "epoch", "sandbox": "*", "eq": 1},
+    {"check": "restore_rpcs", "sandbox": "*", "eq": 1},
+    {"check": "resume_operations", "eq": 100},
+    {"check": "violations", "eq": 0}
+  ]
+}

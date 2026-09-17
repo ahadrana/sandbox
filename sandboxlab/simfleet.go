@@ -15,6 +15,7 @@ import (
 
 // HostSpec describes one simulated host at fleet-build time.
 type HostSpec struct {
+	ID          string // empty: auto-named host-N
 	MemCapacity int64
 	Slots       int
 	Facts       hostfacts.Facts
@@ -64,7 +65,10 @@ func New(cfg Config) *SimFleet {
 		tickCadence: cfg.TickCadence,
 	}
 	for i, spec := range cfg.Hosts {
-		hostID := fmt.Sprintf("host-%d", i+1)
+		hostID := spec.ID
+		if hostID == "" {
+			hostID = fmt.Sprintf("host-%d", i+1)
+		}
 		h := NewSimHost(k, hostID, ws, spec.MemCapacity, spec.Slots, spec.Facts, spec.Latencies)
 		sf.Hosts[hostID] = h
 		fleet.RegisterHost(h)
