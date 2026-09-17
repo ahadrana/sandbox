@@ -160,6 +160,33 @@ func (k *Kernel) RunUntil(limit time.Duration) {
 	}
 }
 
+// Pending reports whether any event is queued (the scenario driver uses it
+// to keep the flat-latency sleep path byte-identical when no contention
+// wake events exist).
+func (k *Kernel) Pending() bool { return len(k.q) > 0 }
+
+// RunUntilCond fires queued events in total order until cond holds or the
+// queue empties (ADR-010 phase 6): contention-mode op completions are
+// kernel wake events, and the scenario driver joins in-flight host work by
+// draining them here. Never called from inside a manager operation —
+// completion processing must not re-enter the control plane mid-call.
+func (k *Kernel) RunUntilCond(cond func() bool) {
+	for !cond() && len(k.q) > 0 {
+		ev := heap.Pop(&k.q).(event)
+		if ev.at > k.elapsed {
+			k.Advance(ev.at - k.elapsed)
+		}
+		k.record(TraceEntry{Seq: ev.seq, At: k.elapsed, Kind: "fire", Label: ev.label, Parent: ev.parent})
+		k.fired++
+		k.curSeq = ev.seq
+		ev.fn()
+		if k.AfterEach != nil {
+			k.AfterEach()
+		}
+		k.curSeq = 0
+	}
+}
+
 // Trace returns the recorded event trace, one entry per fired event or
 // outcome note, in total order (v1 text rendering).
 func (k *Kernel) Trace() []string {

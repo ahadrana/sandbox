@@ -3,6 +3,7 @@ package sandboxlab
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -62,12 +63,18 @@ type Scenario struct {
 	Assert        []Assertion    `json:"assert"`
 }
 
-// ScenarioHost declares one host.
+// ScenarioHost declares one host. vcpu/io_mbps/net_mbps/vm_idle_vcpu
+// configure the phase-6 contention model; unset (vcpu 0) the host runs the
+// legacy flat-latency model.
 type ScenarioHost struct {
-	ID     string `json:"id"`
-	Slots  int    `json:"slots"`
-	Memory int64  `json:"memory"`
-	Facts  struct {
+	ID         string  `json:"id"`
+	Slots      int     `json:"slots"`
+	Memory     int64   `json:"memory"`
+	VCPU       float64 `json:"vcpu"`
+	IOMBps     float64 `json:"io_mbps"`
+	NetMBps    float64 `json:"net_mbps"`
+	VMIdleVCPU float64 `json:"vm_idle_vcpu"`
+	Facts      struct {
 		Arch          string `json:"arch"`
 		KernelRelease string `json:"kernel_release"`
 		CPUPart       string `json:"cpu_part"`
@@ -125,15 +132,18 @@ type Assertion struct {
 
 // Result is the outcome of a scenario run.
 type Result struct {
-	Scenario      *Scenario
-	Fleet         *SimFleet
-	Report        Report
-	Trace         []byte // self-describing trace artifact (see TraceFormat)
-	TraceV2       []byte // enriched JSONL artifact (phase 5, see recorder.go)
-	VirtualTime   time.Duration
-	EventsFired   uint64
-	MaxLiveVMs    int
-	ResumeOps     int
+	Scenario    *Scenario
+	Fleet       *SimFleet
+	Report      Report
+	Trace       []byte // self-describing trace artifact (see TraceFormat)
+	TraceV2     []byte // enriched JSONL artifact (phase 5, see recorder.go)
+	VirtualTime time.Duration
+	EventsFired uint64
+	MaxLiveVMs  int
+	ResumeOps   int
+	// OpStats holds p50/p99 op durations per kind when the contention
+	// model recorded any (phase 6); empty in flat-latency runs.
+	OpStats       map[string][2]time.Duration
 	AssertFailure []string
 }
 
@@ -154,6 +164,11 @@ func (r *Result) Verdict() string {
 	fmt.Fprintf(&b, "scenario: %s (seed %d)\n%s\n", r.Scenario.Name, r.Scenario.Seed, status)
 	fmt.Fprintf(&b, "virtual duration: %v   events fired: %d   max live VMs: %d   resume attempts: %d\n",
 		r.VirtualTime, r.EventsFired, r.MaxLiveVMs, r.ResumeOps)
+	for _, kind := range []string{"create", "restore", "snapshot", "terminate"} {
+		if p, ok := r.OpStats[kind]; ok {
+			fmt.Fprintf(&b, "%s latency p50: %v  p99: %v\n", kind, p[0], p[1])
+		}
+	}
 	fmt.Fprintf(&b, "invariants checked: %d, violations: %d (not-exercised: %d, not-checkable: %d)",
 		checked, viol, notEx, notCheck)
 	for _, f := range r.AssertFailure {
@@ -289,6 +304,24 @@ type runner struct {
 	lastHost map[string]string          // label -> last known placement host
 	matFails int
 	traffic  []int // statuses from the last traffic step
+
+	opDurations []opDuration // contention-mode op durations, aggregated at end
+}
+
+type opDuration struct {
+	kind string
+	d    time.Duration
+}
+
+// percentile returns the p-th percentile (nearest-rank) of ds.
+func percentile(ds []time.Duration, p int) time.Duration {
+	sorted := append([]time.Duration{}, ds...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	idx := (len(sorted)*p + 99) / 100 // nearest-rank, 1-based
+	if idx > len(sorted) {
+		idx = len(sorted)
+	}
+	return sorted[idx-1]
 }
 
 // RunScenario executes a scenario end to end and evaluates its assertions.
@@ -297,6 +330,7 @@ func RunScenario(sc *Scenario) (*Result, error) {
 	for _, h := range sc.Hosts {
 		cfg.Hosts = append(cfg.Hosts, HostSpec{
 			ID: h.ID, MemCapacity: h.Memory, Slots: h.Slots,
+			Pools: Pools{VCPU: h.VCPU, IOMBps: h.IOMBps, NetMBps: h.NetMBps, VMIdleVCPU: h.VMIdleVCPU},
 			Facts: hostfacts.Facts{
 				Arch:          orDefault(h.Facts.Arch, "arm64"),
 				KernelRelease: orDefault(h.Facts.KernelRelease, "6.8.0-sim"),
@@ -335,6 +369,10 @@ func RunScenario(sc *Scenario) (*Result, error) {
 		if err := r.step(st, fmt.Sprintf("steps[%d]", i)); err != nil {
 			return nil, err
 		}
+		// Phase 6: join contention-mode ops started by the step — their
+		// completions are kernel wake events. No-op in flat mode (no wakes
+		// queued), so flat traces stay byte-identical.
+		sf.JoinOps()
 		// The driver is synchronous — no kernel queue — so the engine's
 		// observation point is invoked explicitly after each step.
 		if sf.Kernel.AfterEach != nil {
@@ -351,6 +389,27 @@ func RunScenario(sc *Scenario) (*Result, error) {
 	for _, h := range sf.Hosts {
 		for _, n := range h.Restores {
 			r.res.ResumeOps += n
+		}
+	}
+	// Phase 6: when any host ran the contention model, op durations are
+	// meaningful — surface p50/p99 in the verdict.
+	r.res.OpStats = map[string][2]time.Duration{}
+	for _, h := range sf.Hosts {
+		for kind, ds := range h.OpDur {
+			for _, d := range ds {
+				r.opDurations = append(r.opDurations, opDuration{kind: kind, d: d})
+			}
+		}
+	}
+	for _, kind := range []string{"create", "restore", "snapshot", "terminate"} {
+		var ds []time.Duration
+		for _, od := range r.opDurations {
+			if od.kind == kind {
+				ds = append(ds, od.d)
+			}
+		}
+		if len(ds) > 0 {
+			r.res.OpStats[kind] = [2]time.Duration{percentile(ds, 50), percentile(ds, 99)}
 		}
 	}
 	for i, a := range sc.Assert {
@@ -576,7 +635,10 @@ func (r *runner) step(st Step, where string) error {
 			k.Note("terminate " + r.labelOf(id))
 		}
 	case "sleep":
-		// Advance virtual time in cadence chunks, driving ticks.
+		// Advance virtual time in cadence chunks, driving ticks. Drain the
+		// kernel queue per chunk first (contention wake events due inside
+		// the chunk), then advance the remainder — in flat mode the queue
+		// is empty and this reduces to the legacy bare Advance.
 		remaining := time.Duration(st.MS) * time.Millisecond
 		cad := r.tickCadence()
 		for remaining > 0 {
@@ -584,7 +646,13 @@ func (r *runner) step(st Step, where string) error {
 			if d > remaining {
 				d = remaining
 			}
-			k.Advance(d)
+			end := k.Now() + d
+			if k.Pending() {
+				k.RunUntil(end)
+			}
+			if k.Now() < end {
+				k.Advance(end - k.Now())
+			}
 			_ = r.sf.Mgr.Tick(0)
 			k.Note(fmt.Sprintf("tick t=%dms", k.Now().Milliseconds()))
 			remaining -= d

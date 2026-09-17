@@ -20,6 +20,9 @@ type HostSpec struct {
 	Slots       int
 	Facts       hostfacts.Facts
 	Latencies   Latencies
+	// Pools, when VCPU > 0, enables the phase-6 resource-contention model
+	// (fluid fair-sharing of vCPU / I/O / network among in-flight ops).
+	Pools Pools
 }
 
 // Config describes a simulated world.
@@ -70,6 +73,7 @@ func New(cfg Config) *SimFleet {
 			hostID = fmt.Sprintf("host-%d", i+1)
 		}
 		h := NewSimHost(k, hostID, ws, spec.MemCapacity, spec.Slots, spec.Facts, spec.Latencies)
+		h.SetPools(spec.Pools)
 		sf.Hosts[hostID] = h
 		fleet.RegisterHost(h)
 	}
@@ -84,6 +88,22 @@ func New(cfg Config) *SimFleet {
 // InvariantReport finalizes the invariant engine over the completed run.
 // Scenario tests call this and assert zero violations.
 func (sf *SimFleet) InvariantReport() Report { return sf.Engine.Report() }
+
+// JoinOps advances the kernel until every host's contention model is idle
+// (ADR-010 phase 6): op completions are kernel wake events, so the scenario
+// driver joins here after each top-level step. Flat-mode fleets have no
+// queued wakes, making this a no-op. Never call from inside a manager
+// operation — wake processing must not re-enter the control plane.
+func (sf *SimFleet) JoinOps() {
+	sf.Kernel.RunUntilCond(func() bool {
+		for _, h := range sf.Hosts {
+			if !h.OpsIdle() {
+				return false
+			}
+		}
+		return true
+	})
+}
 
 // scheduleTick installs the recurring virtual-heartbeat event.
 func (sf *SimFleet) scheduleTick() {

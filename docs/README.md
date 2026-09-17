@@ -174,6 +174,14 @@ sandbox cards colored by state, an inspector with causal-parent jump and
 what-changed diffs, and the phase-3 invariant report (violations click
 through to the offending seq).
 
+### Resource contention (phase 6)
+
+Hosts may declare `vcpu`, `io_mbps`, `net_mbps`, `vm_idle_vcpu`; ops then
+compete for those pools under a fluid fair-sharing model — concurrent
+restores on a saturated host stretch (~N× for N identical ops), idle VMs
+tax boots, and the verdict prints p50/p99 op latencies. Hosts without
+`vcpu` keep the legacy flat latencies byte-identically.
+
 ## Required reference harness
 
 The repository must contain a deterministic `agent-driver` capable of simulating modern agent behavior without an LLM. It must support scenarios such as:

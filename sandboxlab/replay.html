@@ -97,6 +97,7 @@ main{display:grid;grid-template-columns:1fr 340px;grid-template-rows:1fr 120px;g
     <option value="8">8&times;</option>
   </select>
   <span class="spacer"></span>
+  <span class="meta">space = play/pause · ←/→ = step · click timeline, cards, hosts, violations</span>
   <span class="meta" id="seqread"></span>
   <span id="badge">0 violations</span>
 </header>
@@ -148,14 +149,15 @@ badge.textContent=violations.length+" violation"+(violations.length===1?"":"s");
 if(violations.length)badge.classList.add("bad");
 
 // ---- state ----
-let cur=0;          // index into EVENTS of the current position
+let cur=EVENTS.length?EVENTS.length-1:0; // open at the final state
 let playing=false;
 let pinned=null;    // {kind:"sandbox"|"host", id}
 
-function snapAt(seq){ // latest snapshot with .seq <= seq (binary search)
+function snapAt(seq){ // latest snapshot with .seq <= seq (binary search); null if none yet
+  if(!SNAPS.length||SNAPS[0].seq>seq)return null;
   let lo=0,hi=SNAPS.length-1,ans=0;
   while(lo<=hi){const m=(lo+hi)>>1;if(SNAPS[m].seq<=seq){ans=m;lo=m+1;}else hi=m-1;}
-  return SNAPS.length?SNAPS[ans]:{seq:0,world:{hosts:[],sandboxes:[]}};
+  return SNAPS[ans];
 }
 function evAtSeq(seq){ // greatest event index with seq<=s
   let lo=0,hi=EVENTS.length-1,ans=0;
@@ -172,9 +174,21 @@ function fmtT(ns){
 const MAXCARDS=500;
 const incState={}; // incarnation -> sandbox state, rebuilt per render
 function renderWorld(){
-  const snap=snapAt(EVENTS.length?EVENTS[cur].seq:0);
-  const w=snap.world;
+  const curSeq=EVENTS.length?EVENTS[cur].seq:0;
+  const snap=snapAt(curSeq);
   const hostsEl=document.getElementById("hosts");
+  const cardsEl=document.getElementById("cards");
+  if(!snap){
+    hostsEl.innerHTML="";
+    cardsEl.innerHTML="";
+    document.getElementById("capnote").textContent=
+      "no world snapshot recorded yet at this point — snapshots begin at seq "+(SNAPS.length?SNAPS[0].seq:"-")+"; scrub forward";
+    document.getElementById("vt").textContent="t="+fmtT(EVENTS.length?EVENTS[cur].t-T0:0);
+    document.getElementById("seqread").textContent="seq "+curSeq+" / "+LASTSEQ;
+    drawTimeline();
+    return;
+  }
+  const w=snap.world;
   hostsEl.innerHTML="";
   for(const k in incState)delete incState[k];
   for(const sb of w.sandboxes)if(sb.incarnation)incState[sb.incarnation]=sb.state;
@@ -194,8 +208,7 @@ function renderWorld(){
     d.addEventListener("click",()=>{pinned={kind:"host",id:h.id};renderInspector();});
     hostsEl.appendChild(d);
   }
-  const cards=document.getElementById("cards");
-  cards.innerHTML="";
+  cardsEl.innerHTML="";
   const n=Math.min(w.sandboxes.length,MAXCARDS);
   document.getElementById("capnote").textContent=w.sandboxes.length>MAXCARDS?
     "showing first "+MAXCARDS+" of "+w.sandboxes.length+" sandboxes (rendering cap)":"";
@@ -210,7 +223,7 @@ function renderWorld(){
            :'<div class="row">host: '+(sb.host||"-")+(sb.fence?' f'+sb.fence:'')+'</div>')+
       (sb.bindings&&sb.bindings.length?'<div class="row">bind: '+sb.bindings.map(b=>b.name+":"+b.port+"("+b.state+")").join(", ")+'</div>':'');
     c.addEventListener("click",()=>{pinned={kind:"sandbox",id:sb.id};renderInspector();renderWorld();});
-    cards.appendChild(c);
+    cardsEl.appendChild(c);
   }
   document.getElementById("vt").textContent="t="+fmtT(EVENTS.length?EVENTS[cur].t-T0:0);
   document.getElementById("seqread").textContent="seq "+(EVENTS.length?EVENTS[cur].seq:0)+" / "+LASTSEQ+(snap.seq!==(EVENTS.length?EVENTS[cur].seq:0)?" · world as of seq "+snap.seq:"");
@@ -247,7 +260,9 @@ function diffWorlds(a,b){ // what changed between snapshot a and b (sandbox rows
 function renderInspector(){
   const el=document.getElementById("insp");
   if(pinned){
-    const snap=snapAt(EVENTS.length?EVENTS[cur].seq:0).world;
+    const sn=snapAt(EVENTS.length?EVENTS[cur].seq:0);
+    if(!sn){el.innerHTML='<div class="empty">no world snapshot yet at this time</div>';return;}
+    const snap=sn.world;
     if(pinned.kind==="sandbox"){
       const sb=snap.sandboxes.find(s=>s.id===pinned.id);
       if(!sb){el.innerHTML='<div class="empty">sandbox not present at this time</div>';return;}
@@ -279,8 +294,8 @@ function renderInspector(){
     '<div><b>caused by</b>'+(e.parent?('seq '+e.parent+' <button id="jmpParent">jump</button>'):'driver / script')+'</div></div>';
   if(e.violation)html+='<div class="kv" style="color:var(--red)">'+e.violation.invariant+': '+esc(e.violation.detail)+'</div>';
   const si=snapAt(e.seq);
-  const idx=SNAPS.indexOf(si);
-  if(si.seq===e.seq&&idx>0){
+  const idx=si?SNAPS.indexOf(si):-1;
+  if(si&&si.seq===e.seq&&idx>0){
     const changes=diffWorlds(SNAPS[idx-1].world,si.world);
     if(changes.length)html+='<div class="diff"><b style="color:var(--muted)">what changed:</b><br>'+changes.slice(0,30).map(c=>'<span class="ch">'+esc(c)+'</span>').join("<br>")+(changes.length>30?"<br>…":"")+'</div>';
   }
@@ -316,29 +331,32 @@ function renderInvs(){
 // ---- timeline ----
 const cv=document.getElementById("tlcanvas");
 const ctx=cv.getContext("2d");
+// Zero-span traces (every event at the same virtual instant) map by event
+// index instead of time, so the timeline and playback still work.
+const SPAN0=TEND===T0;
+const fracOf=i=>EVENTS.length<=1?0:(SPAN0?i/(EVENTS.length-1):(EVENTS[i].t-T0)/(TEND-T0));
 function drawTimeline(){
   const W=cv.width=cv.clientWidth*devicePixelRatio, H=cv.height=cv.clientHeight*devicePixelRatio;
   ctx.clearRect(0,0,W,H);
   if(!EVENTS.length)return;
-  const x=t=>8+(W-16)*((t-T0)/Math.max(1,TEND-T0));
+  const x=i=>8+(W-16)*fracOf(i);
   // event ticks: sample if too dense
   const maxTicks=2000, strideEv=Math.max(1,Math.ceil(EVENTS.length/maxTicks));
   ctx.strokeStyle="#2a3344";ctx.lineWidth=1;
   ctx.beginPath();
   for(let i=0;i<EVENTS.length;i+=strideEv){
-    const px=x(EVENTS[i].t);
+    const px=x(i);
     ctx.moveTo(px,H*0.55);ctx.lineTo(px,H*0.9);
   }
   ctx.stroke();
   // violation markers
   ctx.fillStyle="#ff8d8d";
   for(const v of violations){
-    const e=EVENTS[evAtSeq(v.seq)];
-    const px=x(e.t);
+    const px=x(evAtSeq(v.seq));
     ctx.beginPath();ctx.moveTo(px,H*0.08);ctx.lineTo(px-4*devicePixelRatio,H*0.28);ctx.lineTo(px+4*devicePixelRatio,H*0.28);ctx.fill();
   }
   // playhead
-  const px=x(EVENTS[cur].t);
+  const px=x(cur);
   ctx.strokeStyle="#5aa9ff";ctx.lineWidth=2*devicePixelRatio;
   ctx.beginPath();ctx.moveTo(px,0);ctx.lineTo(px,H);ctx.stroke();
   document.getElementById("tllabel").textContent=
@@ -347,6 +365,7 @@ function drawTimeline(){
 function scrub(evt){
   const r=cv.getBoundingClientRect();
   const frac=Math.min(1,Math.max(0,(evt.clientX-r.left)/r.width));
+  if(SPAN0){cur=Math.round(frac*(EVENTS.length-1));renderAll();return;}
   const t=T0+frac*(TEND-T0);
   let lo=0,hi=EVENTS.length-1,ans=0;
   while(lo<=hi){const m=(lo+hi)>>1;if(EVENTS[m].t<=t){ans=m;lo=m+1;}else hi=m-1;}
@@ -364,16 +383,28 @@ function seekSeq(s){cur=evAtSeq(s);renderAll();}
 document.getElementById("btnFwd").addEventListener("click",()=>{pause();if(cur<EVENTS.length-1){cur++;renderAll();}});
 document.getElementById("btnBack").addEventListener("click",()=>{pause();if(cur>0){cur--;renderAll();}});
 const btnPlay=document.getElementById("btnPlay");
-function pause(){playing=false;btnPlay.innerHTML="&#9654; play";}
+function pause(){playing=false;btnPlay.textContent="▶ play";}
 btnPlay.addEventListener("click",()=>{
-  playing=!playing;
-  btnPlay.textContent=playing?"⏸ pause":"▶ play";
-  if(playing){lastReal=performance.now();lastVirt=EVENTS[cur].t;requestAnimationFrame(tick);}
+  if(playing){pause();return;}
+  if(cur>=EVENTS.length-1){cur=0;} // at the end: replay from the start
+  playing=true;
+  btnPlay.textContent="⏸ pause";
+  lastReal=performance.now();lastVirt=EVENTS[cur].t;requestAnimationFrame(tick);
 });
-let lastReal=0,lastVirt=0;
+let lastReal=0,lastVirt=0,stepAcc=0;
 function tick(now){
   if(!playing)return;
   const speed=parseFloat(document.getElementById("speed").value);
+  if(SPAN0){
+    // No virtual-time span: step through events at 25 events/sec at 1x.
+    stepAcc+=(now-lastReal)*speed*25/1000;
+    lastReal=now;
+    const n=Math.floor(stepAcc);
+    if(n>0){stepAcc-=n;cur=Math.min(EVENTS.length-1,cur+n);renderAll();}
+    if(cur>=EVENTS.length-1){pause();return;}
+    requestAnimationFrame(tick);
+    return;
+  }
   const dv=(now-lastReal)*1e6*speed; // real ms -> virtual ns at speed
   lastReal=now;lastVirt+=dv;
   if(lastVirt>=TEND){cur=EVENTS.length-1;renderAll();pause();return;}
@@ -383,6 +414,7 @@ function tick(now){
   requestAnimationFrame(tick);
 }
 window.addEventListener("keydown",e=>{
+  if(e.target&&/^(SELECT|INPUT|TEXTAREA|BUTTON)$/.test(e.target.tagName))return;
   if(e.key===" "){e.preventDefault();btnPlay.click();}
   else if(e.key==="ArrowRight")document.getElementById("btnFwd").click();
   else if(e.key==="ArrowLeft")document.getElementById("btnBack").click();

@@ -322,3 +322,59 @@ plus pinned sandbox/host detail at the current time; and the invariant
 panel with violations clicking through to the offending seq. Time travel is
 binary search over the snapshot index: the world rendered at seq S is the
 latest snapshot ≤ S (exact in the ≤512-sandbox regime).
+
+## Amendment (2026-09-17): phase 6 — resource-contention model
+
+Flat per-op latencies made timing fiction-by-construction: 100 concurrent
+restores on one host each took exactly the configured 40ms. SimHosts now
+optionally carry **resource pools** — `vcpu` (cores), `io_mbps`,
+`net_mbps`, plus `vm_idle_vcpu` background load per live VM — and ops
+compete for them under a fluid fair-sharing model.
+
+**Why completion is deferred to kernel events (the core design decision).**
+The obvious implementation — an op blocks in virtual time until its
+fluid-model completion, firing other queued events meanwhile — is
+impossible without changing production locking: `Manager.Resume` (and
+friends) hold `m.mu` across `m.rt.Restore`, so a SimHost op that ran the
+kernel to its own completion would re-enter the manager and deadlock.
+Instead, in contention mode a SimHost op:
+
+1. executes synchronously as today (the manager's state transitions happen
+   atomically at op start — control-plane atomicity is preserved, this is
+   the documented approximation: state is visible at t0, work completes
+   virtually later),
+2. registers an in-flight op on the host with a work vector derived from
+   its flat latency (below) and schedules a versioned host wake event,
+3. does NOT advance the clock — the clock moves only when kernel events
+   fire.
+
+The **scenario driver joins**: after each step (and after draining each
+sleep chunk through the kernel queue instead of a bare `Advance`), it runs
+the kernel until every host is idle (`Kernel.RunUntilCond`). Sequential
+steps therefore observe the op's stretched duration exactly as before in
+shape; `parallel` blocks execute all sub-steps at the same virtual instant
+— all their ops in flight simultaneously — and then join, which is where
+contention stretches. This requires no re-entrancy, no manager changes,
+and the causal trace records op completions as children of the wake events.
+
+**Fluid fair sharing.** Each op's work vector is derived from its
+configured flat latency L so the uncontended duration is exactly L
+(backward-compatible by construction): cpu work = L at 1 core demand
+(create/restore), 0.5 (snapshot), 0.25 (terminate); io/net work is FIXED
+bytes = L × reference bandwidths (250 / 500 MB/s) — independent of the
+host's pools, so bigger pools genuinely help and smaller pools honestly
+slow even single ops. Rates: cpu share = demand × min(1, vcpu /
+(activeDemand + idleVMs × vm_idle_vcpu)); io/net share = pool / active
+ops. An op completes when all dimensions finish; on every start/finish the
+host settles (remaining -= rate × Δt) and reprograms the next wake at the
+earliest projected completion. Stale wakes no-op via a version counter.
+N identical simultaneous ops on one saturated pool each stretch ~N×;
+staggered or imbalanced arrivals produce a completion spread (p99 ≫ p50).
+Pool defaults when `vcpu` is set: io 500 MB/s, net 1000 MB/s;
+`vm_idle_vcpu` is explicit (0 = idle VMs consume nothing).
+
+**Backward compat.** Pools unset ⇒ the flat `burn` path runs byte-
+identically (all six built-in scenarios unchanged, determinism test
+untouched). Contention-mode traces gain `op:<kind> host:<id> done <dur>`
+completion notes. The verdict prints p50/p99 restore durations when
+contention data exists.
