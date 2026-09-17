@@ -211,6 +211,11 @@ type HostAgent struct {
 	// agent's own RPC port would DNAT-hijack heartbeats and RPC traffic
 	// into a guest (observed: host declared lost, teardown suppressed).
 	protectedPorts map[int]bool
+
+	// factsOverride, when set, replaces hostfacts.Current() in View —
+	// the seam SandboxLab (ADR-010) uses to simulate a heterogeneous
+	// fleet (mixed kernels/CPU parts) on one machine.
+	factsOverride *hostfacts.Facts
 }
 
 // ProtectPorts forbids publishing the given host ports (the daemon calls
@@ -224,6 +229,15 @@ func (h *HostAgent) ProtectPorts(ports ...int) {
 	for _, p := range ports {
 		h.protectedPorts[p] = true
 	}
+}
+
+// SetFacts overrides the host facts View reports (ADR-010): simulation
+// scenarios need heterogeneous fleets (mixed kernel releases / CPU parts)
+// on one machine. Unset, View reports hostfacts.Current() as before.
+func (h *HostAgent) SetFacts(f hostfacts.Facts) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.factsOverride = &f
 }
 
 func New(hostID string, backend RuntimeBackend, envs EnvironmentSource, ws WorkspaceStore, memCapacity int64, slots int, cacheSize int) *HostAgent {
@@ -700,6 +714,9 @@ func (h *HostAgent) View() scheduler.HostView {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	facts := hostfacts.Current()
+	if h.factsOverride != nil {
+		facts = *h.factsOverride
+	}
 	v := scheduler.HostView{
 		HostID:             h.hostID,
 		Healthy:            true,

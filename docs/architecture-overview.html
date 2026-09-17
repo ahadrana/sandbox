@@ -299,6 +299,14 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
 <li class="yes"><b>Deployed proof</b> — a k3s cluster on the bare-metal host ran live smoke tests:
   create → bind → <code>curl</code> via DNAT → guest response; suspend (RAM reclaimed) → hostname request →
   single-flight routed restore → <b>200 with the epoch preserved</b> and a tmpfs marker alive; denied ports refused.</li>
+<li class="yes"><b>Deterministic simulation (SandboxLab, ADR-010)</b> — the real control plane (manager, fleet,
+  scheduler) driven in-process by a virtual clock and seeded event queue; same seed ⇒ byte-identical trace
+  (a gate test). Scenario suites prove: a 200-sandbox cold-start storm respects capacity exactly (arrivals
+  beyond fleet capacity fail honestly), a 100-sandbox resume burst routes exactly one restore RPC per
+  incarnation (single-flight) with continuity preserved, origin-host loss mid-restore falls back honestly
+  (workspace-only, epoch bump, ExecutionStateReset), a kernel-mismatched fleet claims no checkpoint-locality
+  bonus, and suspend/resume churn under capacity pressure leaks nothing. Scale smoke: 10k logical / 200 live
+  sandboxes in ~4s wall.</li>
 </ul></div>
 <div class="panel"><h3 style="margin-top:0" class="missing">Not yet proven</h3>
 <ul>
@@ -306,7 +314,9 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
   implemented (ADR-009, host-to-host pull streaming) and proven in the two-agent single-node topology
   (two host agents, separate roots, real microVM pulled + restored across them); true multi-node operation
   is untested.</li>
-<li class="no"><b>Scale/load</b> — no density, contention, or load testing beyond the conformance suites.</li>
+<li class="no"><b>Scale/load</b> — logic-level scale is covered by SandboxLab (ADR-010: storms, bursts, 10k
+  logical sandboxes, byte-identical traces), but real-time density and contention on actual hosts is
+  untested; virtual latency models work, not contention.</li>
 <li class="no"><b>Production hardening</b> — dev shared-token auth everywhere; the endpoint proxy dials
   heartbeat-self-reported host URLs (L11 SSRF posture, accepted for dev).</li>
 <li class="no"><b>Portability</b> — arm64 (aarch64) only so far.</li>
@@ -520,7 +530,8 @@ var ADRS = [
  ["ADR-006","2026-09-15","Incremental (diff) memory snapshots","Sparse diff checkpoints chained to a full base (depth-capped), validated link-by-link on restore."],
  ["ADR-007","2026-09-15","Traffic-triggered resume","An ingress resume-proxy makes suspended sandboxes transparently addressable: single-flight resume, then forward."],
  ["ADR-008","2026-09-16","Routed checkpoint restore, origin-host-only","Restore routes to the checkpoint's origin host under a fresh fence; pending placement + rollback keep it atomic (Batch C amendment)."],
- ["ADR-009","2026-09-16","Cross-host checkpoint restore (pull streaming)","Destination host pulls the snapshot package from the origin over the host-agent RPC (manifest + blob endpoints, per-file sha256, staged atomic install, GC pinning); origin preferred, guard-matching peers as failover."]
+ ["ADR-009","2026-09-16","Cross-host checkpoint restore (pull streaming)","Destination host pulls the snapshot package from the origin over the host-agent RPC (manifest + blob endpoints, per-file sha256, staged atomic install, GC pinning); origin preferred, guard-matching peers as failover."],
+ ["ADR-010","2026-09-17","SandboxLab deterministic simulation","Discrete-event kernel (virtual clock, seeded priority queue) running the real control plane in-process; same seed gives a byte-identical trace. Hosts report per-host facts via a HostAgent.SetFacts seam."]
 ];
 var adrHtml = '';
 ADRS.forEach(function(a){
