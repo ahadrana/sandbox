@@ -306,7 +306,11 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
   incarnation (single-flight) with continuity preserved, origin-host loss mid-restore falls back honestly
   (workspace-only, epoch bump, ExecutionStateReset), a kernel-mismatched fleet claims no checkpoint-locality
   bonus, and suspend/resume churn under capacity pressure leaks nothing. Scale smoke: 10k logical / 200 live
-  sandboxes in ~4s wall.</li>
+  sandboxes in ~4s wall. Every scenario runs under the <b>executable invariant engine</b> (phase 3):
+  20 of the 30 architectural invariants are continuously checked from the event stream + state snapshots
+  (2 more scenario-asserted, 8 documented not-sim-checkable), violations are typed trace events that fail
+  the test, and planted-violation meta-tests (double-registered incarnation, dropped reset event,
+  oversubscribed host) prove the checkers fire.</li>
 </ul></div>
 <div class="panel"><h3 style="margin-top:0" class="missing">Not yet proven</h3>
 <ul>

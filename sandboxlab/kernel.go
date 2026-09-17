@@ -58,6 +58,11 @@ type Kernel struct {
 	seq     uint64
 	trace   []string
 	fired   uint64
+
+	// AfterEach, when set, runs after every fired event — the invariant
+	// engine's observation point (ADR-010 phase 3): every scenario event is
+	// followed by an event-stream drain and a state snapshot.
+	AfterEach func()
 }
 
 // NewKernel starts a simulation at virtual time start with the given seed.
@@ -123,6 +128,9 @@ func (k *Kernel) RunUntil(limit time.Duration) {
 		k.trace = append(k.trace, fmt.Sprintf("%06d %d fire %s", ev.seq, k.elapsed.Nanoseconds(), ev.label))
 		k.fired++
 		ev.fn()
+		if k.AfterEach != nil {
+			k.AfterEach()
+		}
 	}
 }
 

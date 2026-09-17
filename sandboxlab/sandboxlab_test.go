@@ -17,6 +17,18 @@ import (
 var factsA = hostfacts.Facts{Arch: "arm64", KernelRelease: "6.8.0-a", CPUPart: "0xd0b"}
 var factsB = hostfacts.Facts{Arch: "arm64", KernelRelease: "6.9.0-b", CPUPart: "0xd0c"}
 
+// assertClean finalizes the invariant engine over the run, logs the report
+// (phase 4's verdict line), and fails the scenario on any violation.
+func assertClean(t *testing.T, sf *SimFleet) Report {
+	t.Helper()
+	rep := sf.InvariantReport()
+	t.Logf("%s", rep)
+	if _, v, _, _ := rep.Counts(); v != 0 {
+		t.Fatalf("invariant violations:\n%s", rep)
+	}
+	return rep
+}
+
 func hostSpecs(n, slots int, mem int64, facts hostfacts.Facts, lat Latencies) []HostSpec {
 	specs := make([]HostSpec, n)
 	for i := range specs {
@@ -70,6 +82,7 @@ func TestDeterministicTrace(t *testing.T) {
 	if bytes.Equal(a.Kernel.TraceBytes(), c.Kernel.TraceBytes()) {
 		t.Fatal("different seed produced identical trace — RNG is not in the loop")
 	}
+	assertClean(t, a)
 }
 
 // TestColdStartStorm: 200 sandboxes storm 5 hosts offering exactly 200
@@ -128,6 +141,7 @@ func TestColdStartStorm(t *testing.T) {
 			t.Fatalf("host %s accounting oversubscribed: %+v", id, v)
 		}
 	}
+	assertClean(t, sf)
 }
 
 // TestResumeStorm: 100 suspended sandboxes, all resumed in one virtual
@@ -212,6 +226,7 @@ func TestResumeStorm(t *testing.T) {
 	p99 := durs[len(durs)*99/100]
 	t.Logf("resume storm: n=%d p50=%v p99=%v max=%v (virtual wake latency)",
 		n, durs[len(durs)/2], p99, durs[len(durs)-1])
+	assertClean(t, sf)
 }
 
 // TestHostLossMidRestore: the origin host is killed while a sandbox is
@@ -280,6 +295,7 @@ func TestHostLossMidRestore(t *testing.T) {
 	if !sawReset {
 		t.Fatal("no ExecutionStateReset event for the fallback resume")
 	}
+	assertClean(t, sf)
 }
 
 // TestGuardMismatch: a checkpoint captured on kernel-A whose origin cannot
@@ -351,6 +367,7 @@ func TestGuardMismatch(t *testing.T) {
 	if host != "host-2" {
 		t.Fatalf("workspace-only fallback should place on the surviving host-2, got %q", host)
 	}
+	assertClean(t, sf)
 }
 
 // TestCheckpointGCUnderPressure: suspend/resume churn under tight capacity —
@@ -377,6 +394,30 @@ func TestCheckpointGCUnderPressure(t *testing.T) {
 			}
 			info, _ := sf.Mgr.GetSandbox(sb.SandboxID)
 			incID := *info.RuntimeIncarnationID
+			// Exercise the execution and binding surfaces so the engine's
+			// INV-010/011/012/017 checkers see real activity under churn.
+			ex, err := sf.Mgr.StartExecution(api.StartExecutionRequest{
+				Version: api.SchemaVersionV1, SandboxID: sb.SandboxID, TenantID: "t1",
+				PrincipalID: "p-sim", IdempotencyKey: fmt.Sprintf("exec-%d", i),
+				Operation: domain.Operation{Command: "true", Writes: map[string]string{"/log": fmt.Sprintf("cycle %d", i)}},
+			})
+			if err != nil {
+				t.Errorf("cycle %d exec: %v", i, err)
+				return
+			}
+			if _, err := sf.Mgr.CompleteExecution(ex.ExecutionID); err != nil {
+				t.Errorf("cycle %d complete: %v", i, err)
+				return
+			}
+			if i == 0 {
+				if _, err := sf.Mgr.CreateEndpointBinding(api.CreateEndpointBindingRequest{
+					SandboxID: sb.SandboxID, TenantID: "t1",
+					TargetPort: 8080, LogicalName: "web", TTL: time.Hour,
+				}); err != nil {
+					t.Errorf("cycle 0 bind: %v", err)
+					return
+				}
+			}
 			if err := sf.Mgr.Suspend(sb.SandboxID); err != nil {
 				t.Errorf("suspend: %v", err)
 				return
@@ -407,6 +448,7 @@ func TestCheckpointGCUnderPressure(t *testing.T) {
 			t.Fatalf("host %s leaked capacity after churn: %+v", id, v)
 		}
 	}
+	assertClean(t, sf)
 }
 
 // TestScaleSmoke: 10k logical sandboxes with 200 concurrently live,
@@ -465,4 +507,5 @@ func TestScaleSmoke(t *testing.T) {
 			t.Fatalf("host %s oversubscribed at scale: %+v", id, v)
 		}
 	}
+	assertClean(t, sf)
 }

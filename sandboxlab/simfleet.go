@@ -42,6 +42,7 @@ type SimFleet struct {
 	Outbox *eventservice.Outbox
 	WS     *workspace.Memory
 	Hosts  map[string]*SimHost // hostID -> host, keyed map; never iterated for decisions
+	Engine *Engine             // invariant engine, observing after every kernel event
 
 	tickCadence time.Duration
 }
@@ -69,11 +70,16 @@ func New(cfg Config) *SimFleet {
 		fleet.RegisterHost(h)
 	}
 	sf.Mgr = sandboxmanager.New(k.Clock(), ids, ws, fleet, outbox, sandboxmanager.NewMemoryStore(), "cp-sim")
+	sf.Engine = NewEngine(sf)
 	if cfg.TickCadence > 0 {
 		sf.scheduleTick()
 	}
 	return sf
 }
+
+// InvariantReport finalizes the invariant engine over the completed run.
+// Scenario tests call this and assert zero violations.
+func (sf *SimFleet) InvariantReport() Report { return sf.Engine.Report() }
 
 // scheduleTick installs the recurring virtual-heartbeat event.
 func (sf *SimFleet) scheduleTick() {

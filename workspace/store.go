@@ -150,6 +150,24 @@ func (m *Memory) ReadManifest(workspaceID string, generation int64) (map[string]
 	return m.Materialize(workspaceID, generation)
 }
 
+// GenerationDigests returns the integrity digest of every committed
+// generation of every workspace — a read-only inspector seam for the
+// SandboxLab invariant engine (INV-005: a committed generation's content
+// must never change).
+func (m *Memory) GenerationDigests() map[string]map[int64]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]map[int64]string, len(m.ws))
+	for id, data := range m.ws {
+		gens := make(map[int64]string, len(data.generations))
+		for n, g := range data.generations {
+			gens[n] = g.gen.IntegrityDigest
+		}
+		out[id] = gens
+	}
+	return out
+}
+
 func (m *Memory) Pin(workspaceID string, generation int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

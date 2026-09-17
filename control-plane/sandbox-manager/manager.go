@@ -571,6 +571,7 @@ func (m *Manager) CreateSandbox(req api.CreateSandboxRequest) (*domain.Sandbox, 
 	return &cp, nil
 }
 
+// GetSandbox returns a copy of the sandbox record.
 func (m *Manager) GetSandbox(sandboxID string) (*domain.Sandbox, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -580,6 +581,32 @@ func (m *Manager) GetSandbox(sandboxID string) (*domain.Sandbox, error) {
 	}
 	cp := *sb
 	return &cp, nil
+}
+
+// SnapshotSandboxes returns a copy of every sandbox record — a read-only
+// inspector seam for the SandboxLab invariant engine (ADR-010).
+func (m *Manager) SnapshotSandboxes() []*domain.Sandbox {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*domain.Sandbox, 0, len(m.sandboxes))
+	for _, sb := range m.sandboxes {
+		cp := *sb
+		out = append(out, &cp)
+	}
+	return out
+}
+
+// LeaseOf returns a copy of the sandbox's work lease (read-only inspector
+// seam for the SandboxLab invariant engine).
+func (m *Manager) LeaseOf(sandboxID string) (*domain.Lease, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.leases[sandboxID]
+	if !ok {
+		return nil, false
+	}
+	cp := *l
+	return &cp, true
 }
 
 // materializeLocked creates the incarnation. checkpointFacts, when

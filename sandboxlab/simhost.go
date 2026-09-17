@@ -24,12 +24,21 @@ type Latencies struct {
 // capsBackend is the conformance-suite capability wrapper: the fake backend
 // with an overridden Capabilities surface (e.g. CheckpointReclaimsMemory so
 // checkpoint suspends reclaim the incarnation and resume routes a restore).
+// It also implements the optional PortPublisher seam as a no-op: the sim's
+// data plane is honest (publish succeeds, nothing is DNATed — there is no
+// network in-process), so endpoint bindings exercise their full lifecycle.
 type capsBackend struct {
 	*fakebackend.Backend
 	caps backendinterface.Capabilities
 }
 
 func (b capsBackend) Capabilities() backendinterface.Capabilities { return b.caps }
+
+func (b capsBackend) PublishPort(h backendinterface.Handle, guestPort, hostPort int) error {
+	return nil
+}
+
+func (b capsBackend) UnpublishPort(h backendinterface.Handle, hostPort int) error { return nil }
 
 // SimHost is one simulated runtime host: a REAL *hostagent.HostAgent over
 // the fake backend, with per-op virtual latencies and per-host facts. It
@@ -51,6 +60,7 @@ type SimHost struct {
 func NewSimHost(k *Kernel, hostID string, ws *workspace.Memory, memCapacity int64, slots int, facts hostfacts.Facts, lat Latencies) *SimHost {
 	caps := fakebackend.New().Capabilities()
 	caps.CheckpointReclaimsMemory = true
+	caps.SupportsPortPublish = true
 	agent := hostagent.New(hostID, capsBackend{fakebackend.New(), caps}, nil, ws, memCapacity, slots, 64)
 	agent.SetFacts(facts)
 	return &SimHost{HostAgent: agent, k: k, lat: lat, facts: facts, Restores: map[string]int{}}

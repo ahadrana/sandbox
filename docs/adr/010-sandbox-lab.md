@@ -156,3 +156,57 @@ event queue instead of wall-clock goroutines.
   smoke.
 - [x] No vendor-specific concepts leak into the API: `sandboxlab/` is a Go
   test-side package; nothing it touches appears in the external API.
+
+## Amendment (2026-09-17): phase 3 — the executable invariant engine
+
+`sandboxlab/invariants.go` turns docs/INVARIANTS.md into code. An `Engine`
+is wired into every `SimFleet` via the kernel's `AfterEach` hook: after each
+fired event the engine drains the manager's outbox through event-stream
+checkers and samples read-only state snapshots (manager getters, fleet
+placement, host accounting, workspace generation digests) — snapshots every
+32 events plus a mandatory final one at `Report()` time, which keeps the
+10k-sandbox scale smoke fast while remaining exact on a total-order trace.
+Violations are recorded twice: as `INVARIANT_VIOLATION` entries in the
+kernel trace (the phase-5 UI rendering seam) carrying invariant ID, detail,
+kernel seq, and virtual time — and in a `Report` whose verdict line
+("invariants checked: N, violations: V") scenario tests assert on. Three
+minimal read-only accessors were added to production code:
+`Manager.SnapshotSandboxes`, `Manager.LeaseOf`, `Memory.GenerationDigests`.
+
+Coverage of the 30 invariants — every one has a named checker or an
+explicit documented reason:
+
+- **Continuous (20)** — evaluated on every run: INV-001 (identity fields
+  never mutate; rematerialize-under-same-ID), INV-002 (dormant/suspended
+  sandboxes hold no fleet placement), INV-005 (committed generation digests
+  immutable), INV-006 (workspace generation never regresses; commits
+  ordered), INV-007 (epoch monotonic; reset is +1), INV-008
+  (reset-before-continuation ordering), INV-010 (execution identity
+  unique/addressable), INV-011 (one execution per idempotency key), INV-012
+  (QUIESCENT ⇒ no live descendants, no non-terminal executions), INV-013+016
+  (host accounting non-negative, never oversubscribed, backend incarnations
+  == accounted slots, no fleet-invisible or double-registered incarnations,
+  every live incarnation traces to a lease-holding sandbox), INV-015 (live ⇒
+  lease with wall deadline), INV-017 (binding lifecycle states valid, no
+  double-bind, no unbound-before-bind), INV-019 (no k8s concepts in event
+  payloads), INV-022 (one workspace per sandbox, never shared), INV-024
+  (states contract-valid; failures carry reasons), INV-025 (event payloads ≤
+  4 KiB), INV-028 (every event tenant-tagged), INV-029 (live never exceeds
+  logical; exercised when dormant ≥ 10× live), INV-030 (no model concepts in
+  event payloads).
+- **Scenario-asserted (2)** — INV-009 (workspace-only resume must carry a
+  `restore_error` — fallback never silent), INV-023 (resume paths observed;
+  cold-locality recovery exercised by the host-loss and guard-mismatch
+  scenarios).
+- **Not sim-checkable (8)** — registered with reasons: INV-003/004 (no LLM
+  in sim by construction), INV-014 (metering equivalence needs real
+  processes), INV-018 (dataplane denial), INV-020 (no k8s exists here),
+  INV-021 (no environment builder in sim), INV-026 (sim fixes the fake
+  backend), INV-027 (breakout resistance is a real-isolation property).
+
+The engine proves it has teeth with planted-violation meta-tests
+(`sandboxlab/invariants_test.go`): a double-registered incarnation (direct
+host create behind the fleet's back), a doctored event stream with
+`ExecutionStateReset` events filtered out, and a crash-recovered host that
+adopted 3 incarnations into 1 slot are each caught by the correct checker
+(INV-013/016, INV-008, INV-013/016 respectively).
