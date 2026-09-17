@@ -263,3 +263,62 @@ resume-storm, host-loss-mid-restore, guard-mismatch, checkpoint-gc-churn,
 traffic-resume-race (100 parallel requests at a suspended sandbox → exactly
 1 resume operation, 1 live incarnation, epoch preserved, all 200). Every
 built-in runs under `go test ./...` via TestBuiltinScenariosPass.
+
+## Amendment (2026-09-17): phase 5 — enriched trace + time-travel replay
+
+The v1 text simtrace is unchanged and still byte-identical per
+scenario+seed (CI diffs depend on it; TestDeterministicTrace guards it).
+Alongside it, runs now produce a **v2 JSONL artifact**
+(`sandboxlab/recorder.go`, written by `-trace2`):
+
+```
+{"type":"header","format":"sandboxlab-trace-jsonl v2","scenario":..,"seed":..}
+{"type":"event","seq":..,"t_ns":..,"kind":"fire|note","label":"..","parent":..,
+  "world":{...},                          — present per snapshot policy
+  "violation":{"invariant":"INV-xxx","detail":".."}}   — INVARIANT_VIOLATION notes only
+{"type":"report","world":{...},"entries":[...]}        — final record
+```
+
+`parent` is the causal parent: the seq of the event whose execution
+scheduled/produced this entry (the kernel tags `At()`/`Note()` calls with
+the currently-executing event's seq); `0` means driver/script context.
+`world` is a consistent snapshot: per-host slots/memory/up-down/incarnation
+ids, per-sandbox state/epoch/workspace generation/placement host/fence/
+incarnation/checkpoint-ref/lease/bindings. The report record embeds the
+phase-3 invariant report verbatim so the UI needs no recompute, plus an
+unconditional end-of-run world snapshot.
+
+**Snapshot policy.** A world snapshot is O(sandboxes), and the phase-3
+engine already demonstrated the trap (per-event snapshots blew the 10k
+scale smoke from 3.6s to 3m26s). The recorder therefore snapshots only at
+kernel `AfterEach` points — never synchronously in the trace-entry hook:
+`Kernel.Note` is called from inside manager operations, so a synchronous
+snapshot would deadlock on the manager mutex (and would capture
+mid-transition state). At each AfterEach the snapshot attaches to the
+batch's last entry. While the population is ≤512 sandboxes every batch
+carries a snapshot (exact replay); beyond that the gap widens to
+⌈S/32⌉ batches, bounding the artifact to ≈32 world rows per trace entry
+regardless of population. The sizing signal is a new O(1)
+`Manager.SandboxCount()` inspector — `SnapshotSandboxes` per event would
+itself be the O(S) trap. Measured: scale smoke (10k logical/200 live,
+10,600 events) 9.9s without recorder vs 11.2s with, producing a 51MB
+artifact (~340k world rows); all built-in scenarios are fully in the exact
+regime.
+
+**Replay UI** (`sandboxlab/replay.html`, embedded; `render.go` injects the
+trace as one JSON string literal — encoding/json escapes `<>&`, so the
+injection is script-safe). One self-contained HTML file: inline CSS/JS,
+zero external resources (grep-tested), vanilla JS, works from `file://`.
+`sandbox-lab render <trace> -o out.html` bakes it; `sandbox-lab replay
+<trace> [-addr :8080]` serves it. Features: play/pause/step/step-back with
+speed selector over virtual time; a canvas timeline (2k-tick cap) with red
+violation markers and click/drag scrubbing; host boxes with slots/memory
+capacity bars, incarnation chips colored by sandbox state, DOWN hosts
+visually dead; sandbox cards with state color, epoch badge, workspace
+generation, placement/fence, checkpoint ref when suspended (rendering
+capped at 500 cards); an inspector showing seq/time/label, causal parent
+with jump button, and a what-changed diff against the previous snapshot,
+plus pinned sandbox/host detail at the current time; and the invariant
+panel with violations clicking through to the offending seq. Time travel is
+binary search over the snapshot index: the world rendered at seq S is the
+latest snapshot ≤ S (exact in the ≤512-sandbox regime).

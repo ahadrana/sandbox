@@ -596,6 +596,15 @@ func (m *Manager) SnapshotSandboxes() []*domain.Sandbox {
 	return out
 }
 
+// SandboxCount returns the number of sandbox records — an O(1) sizing
+// signal for the SandboxLab trace recorder's snapshot policy (phase 5),
+// which cannot afford SnapshotSandboxes' per-record copies on every event.
+func (m *Manager) SandboxCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sandboxes)
+}
+
 // LeaseOf returns a copy of the sandbox's work lease (read-only inspector
 // seam for the SandboxLab invariant engine).
 func (m *Manager) LeaseOf(sandboxID string) (*domain.Lease, bool) {

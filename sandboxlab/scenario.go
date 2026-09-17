@@ -129,6 +129,7 @@ type Result struct {
 	Fleet         *SimFleet
 	Report        Report
 	Trace         []byte // self-describing trace artifact (see TraceFormat)
+	TraceV2       []byte // enriched JSONL artifact (phase 5, see recorder.go)
 	VirtualTime   time.Duration
 	EventsFired   uint64
 	MaxLiveVMs    int
@@ -317,6 +318,10 @@ func RunScenario(sc *Scenario) (*Result, error) {
 	}
 	r.res = &Result{Scenario: sc, Fleet: sf}
 
+	// Phase-5 enriched trace: records every kernel trace entry as it is
+	// written, with world snapshots under the adaptive-stride policy.
+	rec := AttachRecorder(sf, r.labelOf)
+
 	// Track the live-VM high-water mark alongside the engine's AfterEach.
 	prev := sf.Kernel.AfterEach
 	sf.Kernel.AfterEach = func() {
@@ -342,6 +347,7 @@ func RunScenario(sc *Scenario) (*Result, error) {
 	r.res.EventsFired = uint64(len(sf.Kernel.Trace()))
 	r.res.Report = sf.InvariantReport()
 	r.res.Trace = traceArtifact(sc, sf)
+	r.res.TraceV2 = rec.Artifact(sc.Name, sc.Seed, r.res.Report)
 	for _, h := range sf.Hosts {
 		for _, n := range h.Restores {
 			r.res.ResumeOps += n

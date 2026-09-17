@@ -21,10 +21,11 @@ import (
 // time, then FIFO sequence number — equal timestamps fire in schedule
 // order, so a given seed and script produce exactly one interleaving.
 type event struct {
-	at    time.Duration // offset from simulation start
-	seq   uint64
-	label string
-	fn    func()
+	at     time.Duration // offset from simulation start
+	seq    uint64
+	parent uint64 // seq of the event whose execution scheduled this (0: driver)
+	label  string
+	fn     func()
 }
 
 type eventQueue []event
@@ -56,8 +57,13 @@ type Kernel struct {
 	rng     *rand.Rand
 	q       eventQueue
 	seq     uint64
-	trace   []string
+	curSeq  uint64 // seq of the event currently executing (0: driver context)
+	entries []TraceEntry
 	fired   uint64
+
+	// OnTraceEntry, when set, observes every trace entry as it is recorded —
+	// the flight recorder's seam (ADR-010 phase 5). Synchronous; keep it cheap.
+	OnTraceEntry func(TraceEntry)
 
 	// AfterEach, when set, runs after every fired event — the invariant
 	// engine's observation point (ADR-010 phase 3): every scenario event is
@@ -97,7 +103,7 @@ func (k *Kernel) After(d time.Duration, label string, fn func()) {
 // At schedules fn to fire at the given offset from simulation start.
 func (k *Kernel) At(at time.Duration, label string, fn func()) {
 	k.seq++
-	heap.Push(&k.q, event{at: at, seq: k.seq, label: label, fn: fn})
+	heap.Push(&k.q, event{at: at, seq: k.seq, parent: k.curSeq, label: label, fn: fn})
 }
 
 // Note appends an outcome marker to the trace at the current virtual time
@@ -105,7 +111,25 @@ func (k *Kernel) At(at time.Duration, label string, fn func()) {
 // part of the determinism artifact.
 func (k *Kernel) Note(label string) {
 	k.seq++
-	k.trace = append(k.trace, fmt.Sprintf("%06d %d note %s", k.seq, k.elapsed.Nanoseconds(), label))
+	k.record(TraceEntry{Seq: k.seq, At: k.elapsed, Kind: "note", Label: label, Parent: k.curSeq})
+}
+
+// TraceEntry is one recorded trace line in structured form (phase 5): the
+// v1 text trace renders from these; the v2 flight-recorder artifact
+// serializes them with world snapshots.
+type TraceEntry struct {
+	Seq    uint64
+	At     time.Duration
+	Kind   string // "fire" (scheduled event) or "note" (outcome/violation)
+	Label  string
+	Parent uint64 // causal parent: the event whose execution caused this entry
+}
+
+func (k *Kernel) record(e TraceEntry) {
+	k.entries = append(k.entries, e)
+	if k.OnTraceEntry != nil {
+		k.OnTraceEntry(e)
+	}
 }
 
 // Run drains the queue; see RunUntil.
@@ -125,21 +149,36 @@ func (k *Kernel) RunUntil(limit time.Duration) {
 		if ev.at > k.elapsed {
 			k.Advance(ev.at - k.elapsed)
 		}
-		k.trace = append(k.trace, fmt.Sprintf("%06d %d fire %s", ev.seq, k.elapsed.Nanoseconds(), ev.label))
+		k.record(TraceEntry{Seq: ev.seq, At: k.elapsed, Kind: "fire", Label: ev.label, Parent: ev.parent})
 		k.fired++
+		k.curSeq = ev.seq
 		ev.fn()
 		if k.AfterEach != nil {
 			k.AfterEach()
 		}
+		k.curSeq = 0
 	}
 }
 
 // Trace returns the recorded event trace, one entry per fired event or
-// outcome note, in total order.
-func (k *Kernel) Trace() []string { return append([]string{}, k.trace...) }
+// outcome note, in total order (v1 text rendering).
+func (k *Kernel) Trace() []string {
+	out := make([]string, len(k.entries))
+	for i, e := range k.entries {
+		out[i] = e.text()
+	}
+	return out
+}
+
+// Entries returns the structured trace (phase 5).
+func (k *Kernel) Entries() []TraceEntry { return append([]TraceEntry{}, k.entries...) }
+
+func (e TraceEntry) text() string {
+	return fmt.Sprintf("%06d %d %s %s", e.Seq, e.At.Nanoseconds(), e.Kind, e.Label)
+}
 
 // TraceBytes renders the trace as a single deterministic byte string.
-func (k *Kernel) TraceBytes() []byte { return []byte(strings.Join(k.trace, "\n") + "\n") }
+func (k *Kernel) TraceBytes() []byte { return []byte(strings.Join(k.Trace(), "\n") + "\n") }
 
 // Fired reports how many scheduled events have executed.
 func (k *Kernel) Fired() uint64 { return k.fired }

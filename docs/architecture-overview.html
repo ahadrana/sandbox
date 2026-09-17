@@ -314,7 +314,10 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
   (<code>sandboxlab/scenarios/</code>: cold-start-storm, resume-storm, host-loss-mid-restore,
   guard-mismatch, checkpoint-gc-churn, traffic-resume-race) and the <code>sandbox-lab</code>
   CI runner (<code>run</code>/<code>run-all</code>/<code>list</code>, exit 0/1, verdict block,
-  deterministic trace artifact).</li>
+  deterministic trace artifact). Phase 5 adds an enriched JSONL trace (causal parent links, inline
+  world snapshots, embedded invariant report) and a self-contained time-travel replay UI
+  (<code>sandbox-lab render</code>/<code>replay</code>): scrub virtual time, inspect hosts/sandboxes/
+  events with causal-parent jumps, and click violations to jump to the offending seq.</li>
 </ul></div>
 <div class="panel"><h3 style="margin-top:0" class="missing">Not yet proven</h3>
 <ul>

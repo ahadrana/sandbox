@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SandboxLab replay</title>
+<style>
+:root{
+  --bg:#06101f; --bg2:#0d1526; --bg3:#1c2330; --line:#2a3344;
+  --fg:#dbe2ee; --muted:#8b96a9;
+  --blue:#5aa9ff; --green:#7ee0b8; --yellow:#ffcf6e; --red:#ff8d8d; --purple:#c39bff;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#121826,var(--bg))}
+header .title{font-weight:600}
+header .meta{color:var(--muted);font-family:var(--mono);font-size:12px}
+header .spacer{flex:1}
+button,select{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;font:inherit;cursor:pointer}
+button:hover,select:hover{border-color:var(--blue)}
+button:disabled{opacity:.4;cursor:default}
+#vt{font-family:var(--mono);color:var(--blue);min-width:150px}
+#badge{background:var(--green);color:#06231a;border-radius:10px;padding:1px 9px;font-weight:600;font-size:12px}
+#badge.bad{background:var(--red);color:#3d0a0a}
+main{display:grid;grid-template-columns:1fr 340px;grid-template-rows:1fr 120px;gap:1px;background:var(--line);height:calc(100vh - 49px)}
+.panel{background:var(--bg);overflow:auto;padding:10px 14px}
+.panel h2{margin:2px 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+#world{grid-row:1}
+#side{grid-row:1;display:flex;flex-direction:column;gap:1px;background:var(--line);padding:0;overflow:hidden}
+#side>.panel{flex:1}
+#timeline{grid-column:1/3;padding:6px 14px}
+#tlcanvas{width:100%;height:78px;display:block;cursor:crosshair}
+.tl-label{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.host{border:1px solid var(--line);border-radius:8px;background:var(--bg2);padding:8px 10px;margin-bottom:10px}
+.host.down{border-color:var(--red);opacity:.55;background:repeating-linear-gradient(45deg,var(--bg2),var(--bg2) 10px,#141021 10px,#141021 20px)}
+.host h3{margin:0 0 6px;font-size:13px;font-family:var(--mono)}
+.host h3 .down-tag{color:var(--red);font-size:11px;margin-left:8px}
+.bar{height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;margin:3px 0}
+.bar>i{display:block;height:100%;background:var(--blue)}
+.bar.mem>i{background:var(--purple)}
+.bar-label{font-family:var(--mono);font-size:10px;color:var(--muted)}
+.incs{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.inc{font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:4px;border:1px solid var(--line);background:var(--bg3)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px}
+.card{border:1px solid var(--line);border-left-width:4px;border-radius:6px;background:var(--bg2);padding:6px 9px;cursor:pointer}
+.card:hover{border-color:var(--blue)}
+.card .nm{font-family:var(--mono);font-weight:600;font-size:12px}
+.card .row{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.card .epoch{background:var(--bg3);border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:10px;color:var(--yellow)}
+.card.sel{outline:2px solid var(--blue)}
+.st-RUNNING,.st-QUIESCENT,.st-BACKGROUND_ACTIVE{border-left-color:var(--green)}
+.st-STARTING,.st-RESUMING{border-left-color:var(--yellow)}
+.st-SUSPENDING,.st-SUSPENDED{border-left-color:var(--blue)}
+.st-FAILED{border-left-color:var(--red)}
+.st-TERMINATED{border-left-color:var(--muted)}
+.st-UNMATERIALIZED{border-left-color:var(--purple)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:-1px}
+.d-RUNNING,.d-QUIESCENT,.d-BACKGROUND_ACTIVE{background:var(--green)}
+.d-STARTING,.d-RESUMING{background:var(--yellow)}
+.d-SUSPENDING,.d-SUSPENDED{background:var(--blue)}
+.d-FAILED{background:var(--red)}
+.d-TERMINATED{background:var(--muted)}
+.d-UNMATERIALIZED{background:var(--purple)}
+.kv{font-family:var(--mono);font-size:12px}
+.kv b{color:var(--muted);font-weight:normal;display:inline-block;min-width:90px}
+.diff{font-family:var(--mono);font-size:11px;margin-top:6px}
+.diff .ch{color:var(--yellow)}
+.inv-row{display:flex;gap:8px;align-items:baseline;padding:3px 4px;border-radius:4px;font-size:12px}
+.inv-row .id{font-family:var(--mono);min-width:64px}
+.inv-row.pass .st{color:var(--green)}
+.inv-row.violation{cursor:pointer}
+.inv-row.violation:hover{background:var(--bg3)}
+.inv-row.violation .st{color:var(--red);font-weight:600}
+.inv-row.not-exercised .st{color:var(--muted)}
+.inv-row.not-checkable .st{color:var(--muted)}
+.viol-item{cursor:pointer;color:var(--red);font-family:var(--mono);font-size:11px;padding:2px 4px;border-radius:4px}
+.viol-item:hover{background:var(--bg3)}
+.cap-note{color:var(--muted);font-size:11px;margin:4px 0}
+.empty{color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <span class="title" id="scenario">replay</span>
+  <span class="meta" id="seed"></span>
+  <span id="vt">t=0</span>
+  <button id="btnBack" title="step back one event">&#9198; step</button>
+  <button id="btnPlay">&#9654; play</button>
+  <button id="btnFwd" title="step forward one event">step &#9197;</button>
+  <select id="speed">
+    <option value="0.25">0.25&times;</option>
+    <option value="0.5">0.5&times;</option>
+    <option value="1" selected>1&times;</option>
+    <option value="2">2&times;</option>
+    <option value="4">4&times;</option>
+    <option value="8">8&times;</option>
+  </select>
+  <span class="spacer"></span>
+  <span class="meta" id="seqread"></span>
+  <span id="badge">0 violations</span>
+</header>
+<main>
+  <div class="panel" id="world">
+    <h2>Hosts</h2>
+    <div id="hosts"></div>
+    <h2>Sandboxes</h2>
+    <div class="cap-note" id="capnote"></div>
+    <div class="cards" id="cards"></div>
+  </div>
+  <div id="side">
+    <div class="panel" id="inspector"><h2>Inspector</h2><div id="insp" class="empty">click an event tick, sandbox card, or host</div></div>
+    <div class="panel"><h2>Invariants</h2><div id="invs"></div></div>
+  </div>
+  <div class="panel" id="timeline">
+    <canvas id="tlcanvas"></canvas>
+    <div class="tl-label" id="tllabel"></div>
+  </div>
+</main>
+<script>
+"use strict";
+const TRACE_JSONL = /*__TRACE_JSONL__*/"";
+// ---- parse ----
+const META={scenario:"",seed:0};
+const EVENTS=[];            // {seq,t,kind,label,parent,violation?}
+const SNAPS=[];             // {seq,world} sorted by seq
+let REPORT=[];
+const violations=[];        // {seq,invariant,detail}
+for(const line of TRACE_JSONL.split("\n")){
+  if(!line)continue;
+  const r=JSON.parse(line);
+  if(r.type==="header"){META.scenario=r.scenario;META.seed=r.seed;}
+  else if(r.type==="event"){
+    const e={seq:r.seq,t:r.t_ns,kind:r.kind,label:r.label,parent:r.parent,violation:r.violation||null};
+    EVENTS.push(e);
+    if(r.world)SNAPS.push({seq:r.seq,world:r.world});
+    if(e.violation)violations.push({seq:r.seq,invariant:e.violation.invariant,detail:e.violation.detail});
+  }
+  else if(r.type==="report"){REPORT=r.entries||[];if(r.world&&EVENTS.length)SNAPS.push({seq:EVENTS[EVENTS.length-1].seq,world:r.world});}
+}
+const LASTSEQ=EVENTS.length?EVENTS[EVENTS.length-1].seq:0;
+const T0=EVENTS.length?EVENTS[0].t:0;
+const TEND=EVENTS.length?EVENTS[EVENTS.length-1].t:1;
+document.getElementById("scenario").textContent=META.scenario;
+document.getElementById("seed").textContent="seed "+META.seed+" · "+EVENTS.length+" events · "+SNAPS.length+" snapshots";
+const badge=document.getElementById("badge");
+badge.textContent=violations.length+" violation"+(violations.length===1?"":"s");
+if(violations.length)badge.classList.add("bad");
+
+// ---- state ----
+let cur=0;          // index into EVENTS of the current position
+let playing=false;
+let pinned=null;    // {kind:"sandbox"|"host", id}
+
+function snapAt(seq){ // latest snapshot with .seq <= seq (binary search)
+  let lo=0,hi=SNAPS.length-1,ans=0;
+  while(lo<=hi){const m=(lo+hi)>>1;if(SNAPS[m].seq<=seq){ans=m;lo=m+1;}else hi=m-1;}
+  return SNAPS.length?SNAPS[ans]:{seq:0,world:{hosts:[],sandboxes:[]}};
+}
+function evAtSeq(seq){ // greatest event index with seq<=s
+  let lo=0,hi=EVENTS.length-1,ans=0;
+  while(lo<=hi){const m=(lo+hi)>>1;if(EVENTS[m].seq<=seq){ans=m;lo=m+1;}else hi=m-1;}
+  return ans;
+}
+function fmtT(ns){
+  const ms=ns/1e6;
+  if(ms<1000)return ms.toFixed(0)+"ms";
+  return (ms/1000).toFixed(2)+"s";
+}
+
+// ---- world view ----
+const MAXCARDS=500;
+const incState={}; // incarnation -> sandbox state, rebuilt per render
+function renderWorld(){
+  const snap=snapAt(EVENTS.length?EVENTS[cur].seq:0);
+  const w=snap.world;
+  const hostsEl=document.getElementById("hosts");
+  hostsEl.innerHTML="";
+  for(const k in incState)delete incState[k];
+  for(const sb of w.sandboxes)if(sb.incarnation)incState[sb.incarnation]=sb.state;
+  for(const h of w.hosts){
+    const d=document.createElement("div");
+    d.className="host"+(h.down?" down":"");
+    const sp=h.cap_slots?h.used_slots/h.cap_slots:0, mp=h.cap_mem?h.used_mem/h.cap_mem:0;
+    let incs="";
+    for(const inc of h.incarnations||[]){
+      const st=incState[inc]||"";
+      incs+='<span class="inc"><span class="dot d-'+st+'"></span>'+inc.slice(0,14)+'</span>';
+    }
+    d.innerHTML='<h3>'+h.id+(h.down?'<span class="down-tag">DOWN</span>':'')+'</h3>'+
+      '<div class="bar-label">slots '+h.used_slots+'/'+h.cap_slots+'</div><div class="bar"><i style="width:'+(sp*100)+'%"></i></div>'+
+      '<div class="bar-label">mem '+(h.used_mem/1048576).toFixed(0)+'/'+(h.cap_mem/1048576).toFixed(0)+' MiB</div><div class="bar mem"><i style="width:'+(mp*100)+'%"></i></div>'+
+      (incs?'<div class="incs">'+incs+'</div>':'');
+    d.addEventListener("click",()=>{pinned={kind:"host",id:h.id};renderInspector();});
+    hostsEl.appendChild(d);
+  }
+  const cards=document.getElementById("cards");
+  cards.innerHTML="";
+  const n=Math.min(w.sandboxes.length,MAXCARDS);
+  document.getElementById("capnote").textContent=w.sandboxes.length>MAXCARDS?
+    "showing first "+MAXCARDS+" of "+w.sandboxes.length+" sandboxes (rendering cap)":"";
+  for(let i=0;i<n;i++){
+    const sb=w.sandboxes[i];
+    const c=document.createElement("div");
+    c.className="card st-"+sb.state+(pinned&&pinned.kind==="sandbox"&&pinned.id===sb.id?" sel":"");
+    const susp=sb.state==="SUSPENDED";
+    c.innerHTML='<div class="nm"><span class="dot d-'+sb.state+'"></span>'+sb.label+' <span class="epoch">E'+sb.epoch+'</span></div>'+
+      '<div class="row">'+sb.state+' · ws gen '+sb.ws_gen+'</div>'+
+      (susp?'<div class="row">checkpoint: '+(sb.checkpoint?sb.checkpoint.slice(0,22):"-")+'</div>'
+           :'<div class="row">host: '+(sb.host||"-")+(sb.fence?' f'+sb.fence:'')+'</div>')+
+      (sb.bindings&&sb.bindings.length?'<div class="row">bind: '+sb.bindings.map(b=>b.name+":"+b.port+"("+b.state+")").join(", ")+'</div>':'');
+    c.addEventListener("click",()=>{pinned={kind:"sandbox",id:sb.id};renderInspector();renderWorld();});
+    cards.appendChild(c);
+  }
+  document.getElementById("vt").textContent="t="+fmtT(EVENTS.length?EVENTS[cur].t-T0:0);
+  document.getElementById("seqread").textContent="seq "+(EVENTS.length?EVENTS[cur].seq:0)+" / "+LASTSEQ+(snap.seq!==(EVENTS.length?EVENTS[cur].seq:0)?" · world as of seq "+snap.seq:"");
+  drawTimeline();
+}
+
+// ---- inspector ----
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;")}
+function diffWorlds(a,b){ // what changed between snapshot a and b (sandbox rows)
+  const out=[];
+  if(!a||!b)return out;
+  const pa={};for(const s of a.sandboxes)pa[s.id]=s;
+  for(const s of b.sandboxes){
+    const p=pa[s.id];
+    if(!p){out.push(s.label+": appeared ("+s.state+")");continue;}
+    const ch=[];
+    if(p.state!==s.state)ch.push("state "+p.state+"→"+s.state);
+    if(p.epoch!==s.epoch)ch.push("epoch "+p.epoch+"→"+s.epoch);
+    if(p.ws_gen!==s.ws_gen)ch.push("ws gen "+p.ws_gen+"→"+s.ws_gen);
+    if((p.host||"")!==(s.host||""))ch.push("host "+(p.host||"-")+"→"+(s.host||"-"));
+    if(ch.length)out.push(s.label+": "+ch.join(", "));
+  }
+  const ph={};for(const h of a.hosts)ph[h.id]=h;
+  for(const h of b.hosts){
+    const p=ph[h.id];
+    if(!p){out.push("host "+h.id+": appeared");continue;}
+    const ch=[];
+    if(p.down!==h.down)ch.push(h.down?"went DOWN":"revived");
+    if(p.used_slots!==h.used_slots)ch.push("slots "+p.used_slots+"→"+h.used_slots);
+    if(ch.length)out.push("host "+h.id+": "+ch.join(", "));
+  }
+  return out;
+}
+function renderInspector(){
+  const el=document.getElementById("insp");
+  if(pinned){
+    const snap=snapAt(EVENTS.length?EVENTS[cur].seq:0).world;
+    if(pinned.kind==="sandbox"){
+      const sb=snap.sandboxes.find(s=>s.id===pinned.id);
+      if(!sb){el.innerHTML='<div class="empty">sandbox not present at this time</div>';return;}
+      el.innerHTML='<h2>Sandbox</h2><div class="kv">'+
+        '<div><b>id</b>'+esc(sb.id)+'</div><div><b>label</b>'+esc(sb.label)+'</div>'+
+        '<div><b>state</b><span class="dot d-'+sb.state+'"></span>'+sb.state+'</div>'+
+        '<div><b>epoch</b>'+sb.epoch+'</div><div><b>ws gen</b>'+sb.ws_gen+'</div>'+
+        '<div><b>workspace</b>'+esc(sb.ws)+'</div>'+
+        '<div><b>host</b>'+(sb.host||"-")+(sb.fence?" (fence "+sb.fence+")":"")+'</div>'+
+        '<div><b>incarnation</b>'+esc(sb.incarnation||"-")+'</div>'+
+        '<div><b>checkpoint</b>'+esc(sb.checkpoint||"-")+'</div>'+
+        '<div><b>lease</b>'+(sb.lease?"yes":"no")+'</div></div>';
+      return;
+    }
+    const h=snap.hosts.find(x=>x.id===pinned.id);
+    if(!h){el.innerHTML='<div class="empty">host not present</div>';return;}
+    el.innerHTML='<h2>Host</h2><div class="kv">'+
+      '<div><b>id</b>'+esc(h.id)+'</div><div><b>status</b>'+(h.down?'<span style="color:var(--red)">DOWN</span>':"up")+'</div>'+
+      '<div><b>slots</b>'+h.used_slots+'/'+h.cap_slots+'</div>'+
+      '<div><b>memory</b>'+(h.used_mem/1048576).toFixed(0)+'/'+(h.cap_mem/1048576).toFixed(0)+' MiB</div>'+
+      '<div><b>incarnations</b>'+((h.incarnations||[]).length)+'</div></div>';
+    return;
+  }
+  const e=EVENTS[cur];
+  if(!e){el.innerHTML='<div class="empty">no events</div>';return;}
+  let html='<h2>Event</h2><div class="kv">'+
+    '<div><b>seq</b>'+e.seq+'</div><div><b>time</b>'+fmtT(e.t-T0)+' ('+e.t+' ns)</div>'+
+    '<div><b>kind</b>'+e.kind+'</div><div><b>label</b>'+esc(e.label)+'</div>'+
+    '<div><b>caused by</b>'+(e.parent?('seq '+e.parent+' <button id="jmpParent">jump</button>'):'driver / script')+'</div></div>';
+  if(e.violation)html+='<div class="kv" style="color:var(--red)">'+e.violation.invariant+': '+esc(e.violation.detail)+'</div>';
+  const si=snapAt(e.seq);
+  const idx=SNAPS.indexOf(si);
+  if(si.seq===e.seq&&idx>0){
+    const changes=diffWorlds(SNAPS[idx-1].world,si.world);
+    if(changes.length)html+='<div class="diff"><b style="color:var(--muted)">what changed:</b><br>'+changes.slice(0,30).map(c=>'<span class="ch">'+esc(c)+'</span>').join("<br>")+(changes.length>30?"<br>…":"")+'</div>';
+  }
+  el.innerHTML=html;
+  const jb=document.getElementById("jmpParent");
+  if(jb)jb.addEventListener("click",()=>{seekSeq(e.parent);});
+}
+
+// ---- invariants panel ----
+function renderInvs(){
+  const el=document.getElementById("invs");
+  el.innerHTML="";
+  for(const r of REPORT){
+    const d=document.createElement("div");
+    d.className="inv-row "+r.status;
+    d.innerHTML='<span class="id">'+r.id+'</span><span class="st">'+r.status+'</span><span>'+esc(r.title)+'</span>';
+    if(r.status==="violation"&&r.failures&&r.failures.length){
+      d.title=r.failures[0].detail;
+      d.addEventListener("click",()=>{seekSeq(r.failures[0].seq);});
+    }
+    el.appendChild(d);
+  }
+  for(const v of violations){
+    const d=document.createElement("div");
+    d.className="viol-item";
+    d.textContent="▸ seq "+v.seq+" "+v.invariant+" "+v.detail;
+    d.addEventListener("click",()=>{seekSeq(v.seq);});
+    el.appendChild(d);
+  }
+  if(!REPORT.length&&!violations.length)el.innerHTML='<div class="empty">no report record</div>';
+}
+
+// ---- timeline ----
+const cv=document.getElementById("tlcanvas");
+const ctx=cv.getContext("2d");
+function drawTimeline(){
+  const W=cv.width=cv.clientWidth*devicePixelRatio, H=cv.height=cv.clientHeight*devicePixelRatio;
+  ctx.clearRect(0,0,W,H);
+  if(!EVENTS.length)return;
+  const x=t=>8+(W-16)*((t-T0)/Math.max(1,TEND-T0));
+  // event ticks: sample if too dense
+  const maxTicks=2000, strideEv=Math.max(1,Math.ceil(EVENTS.length/maxTicks));
+  ctx.strokeStyle="#2a3344";ctx.lineWidth=1;
+  ctx.beginPath();
+  for(let i=0;i<EVENTS.length;i+=strideEv){
+    const px=x(EVENTS[i].t);
+    ctx.moveTo(px,H*0.55);ctx.lineTo(px,H*0.9);
+  }
+  ctx.stroke();
+  // violation markers
+  ctx.fillStyle="#ff8d8d";
+  for(const v of violations){
+    const e=EVENTS[evAtSeq(v.seq)];
+    const px=x(e.t);
+    ctx.beginPath();ctx.moveTo(px,H*0.08);ctx.lineTo(px-4*devicePixelRatio,H*0.28);ctx.lineTo(px+4*devicePixelRatio,H*0.28);ctx.fill();
+  }
+  // playhead
+  const px=x(EVENTS[cur].t);
+  ctx.strokeStyle="#5aa9ff";ctx.lineWidth=2*devicePixelRatio;
+  ctx.beginPath();ctx.moveTo(px,0);ctx.lineTo(px,H);ctx.stroke();
+  document.getElementById("tllabel").textContent=
+    fmtT(EVENTS[cur].t-T0)+" / "+fmtT(TEND-T0)+" · "+violations.length+" violations marked red · click to scrub";
+}
+function scrub(evt){
+  const r=cv.getBoundingClientRect();
+  const frac=Math.min(1,Math.max(0,(evt.clientX-r.left)/r.width));
+  const t=T0+frac*(TEND-T0);
+  let lo=0,hi=EVENTS.length-1,ans=0;
+  while(lo<=hi){const m=(lo+hi)>>1;if(EVENTS[m].t<=t){ans=m;lo=m+1;}else hi=m-1;}
+  cur=ans;renderAll();
+}
+cv.addEventListener("click",scrub);
+let scrubbing=false;
+cv.addEventListener("mousedown",e=>{scrubbing=true;scrub(e);});
+window.addEventListener("mousemove",e=>{if(scrubbing)scrub(e);});
+window.addEventListener("mouseup",()=>{scrubbing=false;});
+
+// ---- controls ----
+function renderAll(){renderWorld();renderInspector();}
+function seekSeq(s){cur=evAtSeq(s);renderAll();}
+document.getElementById("btnFwd").addEventListener("click",()=>{pause();if(cur<EVENTS.length-1){cur++;renderAll();}});
+document.getElementById("btnBack").addEventListener("click",()=>{pause();if(cur>0){cur--;renderAll();}});
+const btnPlay=document.getElementById("btnPlay");
+function pause(){playing=false;btnPlay.innerHTML="&#9654; play";}
+btnPlay.addEventListener("click",()=>{
+  playing=!playing;
+  btnPlay.textContent=playing?"⏸ pause":"▶ play";
+  if(playing){lastReal=performance.now();lastVirt=EVENTS[cur].t;requestAnimationFrame(tick);}
+});
+let lastReal=0,lastVirt=0;
+function tick(now){
+  if(!playing)return;
+  const speed=parseFloat(document.getElementById("speed").value);
+  const dv=(now-lastReal)*1e6*speed; // real ms -> virtual ns at speed
+  lastReal=now;lastVirt+=dv;
+  if(lastVirt>=TEND){cur=EVENTS.length-1;renderAll();pause();return;}
+  // advance cur while next event time <= lastVirt
+  while(cur<EVENTS.length-1&&EVENTS[cur+1].t<=lastVirt)cur++;
+  renderAll();
+  requestAnimationFrame(tick);
+}
+window.addEventListener("keydown",e=>{
+  if(e.key===" "){e.preventDefault();btnPlay.click();}
+  else if(e.key==="ArrowRight")document.getElementById("btnFwd").click();
+  else if(e.key==="ArrowLeft")document.getElementById("btnBack").click();
+});
+window.addEventListener("resize",drawTimeline);
+
+renderInvs();
+renderAll();
+</script>
+</body>
+</html>

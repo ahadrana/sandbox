@@ -152,6 +152,28 @@ go run ./cmd/sandbox-lab run-all builtins   # CI entry point
 The repo has no Makefile/CI script (tests are run directly); `run-all` with
 exit 0/1 is the CI integration point.
 
+### Enriched trace + time-travel replay (phase 5)
+
+`-trace` writes the v1 text simtrace (byte-identical per scenario+seed, for
+CI diffs). `-trace2` writes the v2 JSONL artifact (`.simtrace.jsonl`):
+every trace entry with seq, virtual time, causal parent seq, inline
+invariant-violation records, world snapshots (hosts, sandboxes, placements,
+fences, bindings) under an adaptive-stride policy, and the final invariant
+report. The replay UI renders it as a time-travel view:
+
+```
+go run ./cmd/sandbox-lab run traffic-resume-race -trace2 /tmp/trr.simtrace.jsonl
+go run ./cmd/sandbox-lab render /tmp/trr.simtrace.jsonl -o /tmp/trr.html  # self-contained, open from file://
+go run ./cmd/sandbox-lab replay /tmp/trr.simtrace.jsonl -addr :8080       # serve over HTTP
+```
+
+The rendered page is a single HTML file with inline CSS/JS and zero
+external resources: play/pause/step controls over virtual time, a timeline
+scrubber with red INVARIANT_VIOLATION markers, host capacity bars and
+sandbox cards colored by state, an inspector with causal-parent jump and
+what-changed diffs, and the phase-3 invariant report (violations click
+through to the offending seq).
+
 ## Required reference harness
 
 The repository must contain a deterministic `agent-driver` capable of simulating modern agent behavior without an LLM. It must support scenarios such as:
