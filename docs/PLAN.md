@@ -372,6 +372,8 @@ For representative coding-agent workloads measure:
 
 Checkpointing is enabled by policy only where measured benefit exceeds reconstruction cost; correctness never depends on it.
 
+The automatic driver landed with ADR-011 step 3: `PolicyConfig.IdleReclaimAfter` (default 30m) checkpoint-suspends sandboxes continuously QUIESCENT past the threshold — never sandboxes with live work; capacity pressure sheds new placements, not active sandboxes.
+
 ---
 
 # 12. Milestone 9 — Network policy, temporary endpoint bridge, credentials

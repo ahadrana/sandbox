@@ -599,3 +599,63 @@ func TestFirecrackerStartupHooksReconstructServices(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Idle-reclaim against the firecracker backend (ADR-011 step 3): a
+// quiescent VM past the idle threshold is checkpoint-suspended by the
+// manager's automatic driver with REAL RAM reclamation, and resume
+// restores continuity from the checkpoint (epoch retained, no hooks).
+func TestFirecrackerIdleReclaimReclaimsRAM(t *testing.T) {
+	s := newSystem(t, "firecracker")
+	fcb := fcBackend(t, s)
+	p := permissivePolicy()
+	p.IdleReclaimAfter = time.Minute
+	s.mgr.SetPolicy(p)
+	d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 93)
+	sb, _ := d.CreateSandbox("task-fc-idle")
+	mustMaterialize(t, d, sb.SandboxID)
+	incID := *mustGetSandbox(t, s, sb.SandboxID).RuntimeIncarnationID
+	h := backendinterface.Handle{IncarnationID: incID}
+
+	// First tick starts the idle clock; below threshold nothing happens.
+	if err := s.mgr.Tick(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustGetSandbox(t, s, sb.SandboxID).ObservedState; got == domain.SandboxSuspended {
+		t.Fatal("reclaimed before the idle threshold")
+	}
+	if err := s.mgr.Tick(time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	cur := mustGetSandbox(t, s, sb.SandboxID)
+	if cur.ObservedState != domain.SandboxSuspended {
+		t.Fatalf("state = %s, want SUSPENDED", cur.ObservedState)
+	}
+	consumer := eventservice.NewConsumer()
+	suspended := eventsOfType(consumer.Poll(s.outbox), domain.EventSandboxSuspended)
+	if len(suspended) != 1 || suspended[0].Payload["reason"] != "idle_reclaim" || suspended[0].Payload["mode"] != "execution_state" {
+		t.Fatalf("want execution_state idle_reclaim suspend: %v", suspended)
+	}
+	if reclaimed, ok := suspended[0].Payload["ram_reclaimed_bytes"].(int64); !ok || reclaimed <= 0 {
+		t.Fatalf("idle reclaim must really reclaim RAM: %v", suspended[0].Payload)
+	}
+	if fcb.Alive(h) {
+		t.Fatal("VMM still running after idle reclaim")
+	}
+	if got := s.mgr.Metrics().IdleReclaims; got != 1 {
+		t.Fatalf("idle reclaims = %d, want 1", got)
+	}
+
+	report, err := s.mgr.Resume(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.NewEpoch != report.PriorEpoch {
+		t.Fatalf("continuity resume changed epoch %d -> %d", report.PriorEpoch, report.NewEpoch)
+	}
+	if got := eventsOfType(consumer.Poll(s.outbox), domain.EventEnvironmentHooksStarted); len(got) != 0 {
+		t.Fatalf("hooks ran on continuity resume: %v", got)
+	}
+	if err := s.mgr.KillRuntime(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -35,6 +35,23 @@ func hookFixture(t *testing.T, start, terminals []string) (*system, *domain.Envi
 	return s, env
 }
 
+// httpGet fetches url, returning the body and true only on a 200 OK.
+func httpGet(url string) (string, bool) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
 // hookSeq extracts the ordered hook labels of ExecutionStarted events.
 func hookSeq(events []domain.Event) []string {
 	var out []string
@@ -193,19 +210,7 @@ func TestStartupHooksReconstructServicesOnWorkspaceOnlyResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	get := func(path string) (string, bool) {
-		resp, err := http.Get("http://127.0.0.1:" + port + "/" + path)
-		if err != nil {
-			return "", false
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return "", false
-		}
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", false
-		}
-		return string(data), true
+		return httpGet("http://127.0.0.1:" + port + "/" + path)
 	}
 	pollUntil(t, 10*time.Second, "hook-launched HTTP service", func() bool {
 		body, ok := get("committed.txt")

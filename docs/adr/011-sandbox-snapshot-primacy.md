@@ -82,6 +82,55 @@ paths:
   ensure the Sandbox Snapshot is durable, then reclaim the VM. The order is
   mandated: snapshot durable first, checkpoint second, reclaim last.
 
+## Amendment 2026-09-18: step 3 implemented (ACTIVE/IDLE reclaim policy)
+
+The lifecycle policy above is now executable, as an automatic idle-reclaim
+driver in the manager's `Tick`:
+
+- **Predicates.** A sandbox is a reclaim candidate iff it has a live
+  incarnation AND observed state RUNNING or QUIESCENT (BACKGROUND_ACTIVE is
+  explicitly excluded) AND it is quiescent under THE quiescence policy
+  (`quiescentLocked`, INV-012: no active API executions, no live
+  non-baseline processes) AND has been continuously so for at least
+  `PolicyConfig.IdleReclaimAfter` (default 30m; zero disables the driver).
+  Baseline services never block quiescence, as before — and any live
+  non-baseline work, including terminal-hook services, keeps the sandbox
+  ACTIVE and unreclaimable. Reclaim-after-deadline-quiesce is legal by
+  construction: INV-015 background deadlines (MaxBackgroundWall) kill
+  runaway work first, the sandbox quiesces, and only then does the idle
+  clock start.
+- **Reclaim action.** The driver routes through the shared suspend path
+  (`suspendWithReasonLocked(sb, "idle_reclaim", allowCheckpoint=true)`), so
+  the mandated order holds: workspace committed (Sandbox Snapshot durable)
+  before the checkpoint attempt, checkpoint before RAM release. On
+  snapshot-class backends RAM is really reclaimed with continuity restore
+  available; on STOP/CONT-class backends the suspend honestly reports no
+  reclamation; with checkpoint unavailable/failed it degrades to the
+  workspace-only path, making the subsequent resume epoch-creating (hooks
+  re-run per step 2).
+- **Capacity pressure.** Unchanged and verified: placement pressure never
+  reclaims ACTIVE work. Preemption remains priority/class-based,
+  workspace-only, BACKGROUND-class victims of strictly lower priority for
+  INTERACTIVE requesters; with no legal victim the create fails honestly
+  (quota/placement error + event). The idle driver is the only
+  checkpoint-reclaim trigger, and it selects idle sandboxes only.
+- **Observability.** The suspend event carries `reason: idle_reclaim` (plus
+  the usual mode/ram_reclaimed detail). Skipped active sandboxes emit no
+  events; they increment the `IdleReclaimSkipsActive` metrics counter, and
+  reclaims increment `IdleReclaims` (Manager.Metrics snapshot).
+- **Evidence.** Local: active sandboxes never reclaimed 10x past threshold;
+  quiescent reclaimed exactly at threshold with checkpoint taken; reclaim
+  legal only after background-deadline quiesce; all-active capacity
+  pressure fails the new create honestly without disturbing work;
+  idle-reclaimed sandbox on the workspace-only path resumes via step-2
+  hooks (HTTP service reconstructed). Remote (firecracker, node1):
+  `TestFirecrackerIdleReclaimReclaimsRAM` — automatic driver suspends a
+  quiescent VM with `ram_reclaimed_bytes > 0`, VMM gone, continuity resume
+  restores it with the epoch retained.
+- **Deferred.** No IDLE→ACTIVE traffic-driven wake policy changes (resume
+  proxy already wakes on demand); no idle reaper for the lease-expired
+  case beyond the existing wall-deadline enforcement.
+
 ### Startup hooks rule (spec here; implementation is step 2)
 
 Startup hooks run on every epoch-creating resume (snapshot resume), and
@@ -141,9 +190,9 @@ Step 2 landed as specified:
   against real VMs (workspace-only suspend → new VM → `sleep` service
   reconstructed, epoch 1→2, hooks completed before reset). Full FC
   conformance + firecracker-backend suites green.
-- **Deferred.** Step 3 (ACTIVE/IDLE lifecycle driver) remains open; the
-  meta.json primary-section reshaping beyond the additive Spec fields stays
-  as it was (the package remains chain-shaped, primacy contractual).
+- **Deferred.** Step 3 landed in the amendment above; the meta.json
+  primary-section reshaping beyond the additive Spec fields stays as it was
+  (the package remains chain-shaped, primacy contractual).
 
 ### What does not change
 
@@ -172,9 +221,9 @@ Step 2 landed as specified:
   workspace bits inside the checkpoint chain; the conceptual remapping is
   documented in code; step 2 (amendment above) physically added the
   restart-recipe fields to meta.json via `Spec.HookStart`/`HookTerminals`.
-- Follow-ups: step 3 — ACTIVE/IDLE
-  lifecycle driver (checkpoint-reclaim on idle); soak-coverage of the
-  snapshot-resume path at the same depth as continuity resume.
+- Follow-ups: soak-coverage of the
+  snapshot-resume path at the same depth as continuity resume, now including
+  idle-reclaim-driven churn.
 
 ## Alternatives considered
 

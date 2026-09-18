@@ -156,9 +156,13 @@ type Manager struct {
 	policy         PolicyConfig
 	materializedAt map[string]time.Time
 	bgSince        map[string]time.Time
-	enforceFlags   map[string]map[string]bool
-	checkpoints    map[string]checkpointRecord // checkpointID -> record
-	bindings       map[string]*domain.EndpointBinding
+	// idleSince records when a live sandbox was first observed quiescent by
+	// the idle-reclaim pass (ADR-011 step 3); deleted as soon as the sandbox
+	// shows work again or loses its handle.
+	idleSince    map[string]time.Time
+	enforceFlags map[string]map[string]bool
+	checkpoints  map[string]checkpointRecord // checkpointID -> record
+	bindings     map[string]*domain.EndpointBinding
 	// bindingsByName indexes binding IDs by logical name (review H3) so
 	// BindingByName is O(1) instead of a full scan under m.mu. Entries are
 	// added at creation and store load; stale IDs are filtered by state at
@@ -184,15 +188,22 @@ type managerMetrics struct {
 	eventsByType      map[domain.EventType]int64
 	placementFailures int64
 	reconcilerActions int64
+	// idleReclaims counts automatic idle-reclaim suspensions;
+	// idleReclaimSkipsActive counts ticks where a live sandbox was skipped
+	// because it had work (debug-level observability, no event spam).
+	idleReclaims           int64
+	idleReclaimSkipsActive int64
 }
 
 // MetricsSnapshot is a point-in-time operational view.
 type MetricsSnapshot struct {
-	SandboxesByState  map[string]int
-	ExecutionsByState map[string]int
-	EventsByType      map[string]int64
-	PlacementFailures int64
-	ReconcilerActions int64
+	SandboxesByState       map[string]int
+	ExecutionsByState      map[string]int
+	EventsByType           map[string]int64
+	PlacementFailures      int64
+	ReconcilerActions      int64
+	IdleReclaims           int64
+	IdleReclaimSkipsActive int64
 }
 
 // Metrics returns a consistent snapshot of operational counters.
@@ -200,11 +211,13 @@ func (m *Manager) Metrics() MetricsSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	snap := MetricsSnapshot{
-		SandboxesByState:  map[string]int{},
-		ExecutionsByState: map[string]int{},
-		EventsByType:      map[string]int64{},
-		PlacementFailures: m.metrics.placementFailures,
-		ReconcilerActions: m.metrics.reconcilerActions,
+		SandboxesByState:       map[string]int{},
+		ExecutionsByState:      map[string]int{},
+		EventsByType:           map[string]int64{},
+		PlacementFailures:      m.metrics.placementFailures,
+		ReconcilerActions:      m.metrics.reconcilerActions,
+		IdleReclaims:           m.metrics.idleReclaims,
+		IdleReclaimSkipsActive: m.metrics.idleReclaimSkipsActive,
 	}
 	for _, sb := range m.sandboxes {
 		snap.SandboxesByState[string(sb.ObservedState)]++
@@ -231,6 +244,15 @@ type PolicyConfig struct {
 	MemoryLimitBytes  int64
 	WallDeadline      time.Duration
 	MaxBackgroundWall time.Duration
+	// IdleReclaimAfter is the automatic idle-reclaim driver (ADR-011 step
+	// 3): a live sandbox that has been continuously QUIESCENT (no active
+	// executions, no live non-baseline processes) for at least this long is
+	// checkpoint-suspended so its RAM is reclaimed. Sandboxes with live work
+	// (RUNNING with processes, BACKGROUND_ACTIVE) are NEVER reclaimed —
+	// capacity pressure sheds new placements instead (preemption/placement
+	// failure), and INV-015 background deadlines remain the bound on how
+	// long "active" can persist. Zero disables the driver.
+	IdleReclaimAfter time.Duration
 }
 
 // DefaultPolicy is permissive enough to never fire in the base suite.
@@ -239,6 +261,7 @@ var DefaultPolicy = PolicyConfig{
 	MemoryLimitBytes:  1 << 30,
 	WallDeadline:      24 * time.Hour,
 	MaxBackgroundWall: time.Hour,
+	IdleReclaimAfter:  30 * time.Minute,
 }
 
 // SetQuota installs a tenant admission quota (PLAN §13).
@@ -276,6 +299,7 @@ func New(clock *domain.ManualClock, ids *domain.IDGen, ws workspace.Store, rt Ru
 		policy:         DefaultPolicy,
 		materializedAt: map[string]time.Time{},
 		bgSince:        map[string]time.Time{},
+		idleSince:      map[string]time.Time{},
 		enforceFlags:   map[string]map[string]bool{},
 	}
 }
@@ -2330,7 +2354,8 @@ func (m *Manager) LiveDescendants(sandboxID string) int {
 }
 
 // Tick advances the deterministic clock and runtime; sandboxes whose
-// background descendants have exited become QUIESCENT.
+// background descendants have exited become QUIESCENT, and sandboxes idle
+// past IdleReclaimAfter are checkpoint-suspended (ADR-011 step 3).
 func (m *Manager) Tick(d time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2359,6 +2384,13 @@ func (m *Manager) Tick(d time.Duration) error {
 		}
 		if m.quiescentLocked(sb) {
 			if err := m.transition(sb, domain.SandboxQuiescent); err != nil {
+				return err
+			}
+		}
+	}
+	if m.policy.IdleReclaimAfter > 0 {
+		for _, sb := range m.sandboxes {
+			if err := m.idleReclaimLocked(sb); err != nil {
 				return err
 			}
 		}
@@ -2441,6 +2473,50 @@ func (m *Manager) Tick(d time.Duration) error {
 		}
 	}
 	return m.flushTx()
+}
+
+// idleReclaimLocked is the automatic idle-reclaim driver (ADR-011 step 3).
+// Selection predicate: live handle AND observed state RUNNING or QUIESCENT
+// (BACKGROUND_ACTIVE is explicitly excluded) AND quiescent under THE
+// quiescence policy (no active executions, no live non-baseline processes)
+// AND continuously so for at least IdleReclaimAfter. The reclaim routes
+// through the shared suspend path with checkpoint preferred, so on
+// snapshot-class backends RAM is really reclaimed while continuity restore
+// stays available; on STOP/CONT-class backends the suspend is honest about
+// reclaiming nothing. A sandbox with live work is never reclaimed — it is
+// merely counted — because capacity pressure must shed NEW placements
+// (honest create failure / preemption of lower-priority BACKGROUND-class
+// sandboxes), never interrupt work. INV-015 background deadlines remain the
+// bound on how long "active" can persist: deadline-killed background work
+// quiesces the sandbox, after which reclaim is legal.
+func (m *Manager) idleReclaimLocked(sb *domain.Sandbox) error {
+	if sb.ObservedState != domain.SandboxRunning && sb.ObservedState != domain.SandboxQuiescent {
+		delete(m.idleSince, sb.SandboxID)
+		if sb.ObservedState == domain.SandboxBackgroundActive {
+			if _, live := m.handles[sb.SandboxID]; live {
+				m.metrics.idleReclaimSkipsActive++
+			}
+		}
+		return nil
+	}
+	if !m.quiescentLocked(sb) {
+		delete(m.idleSince, sb.SandboxID)
+		m.metrics.idleReclaimSkipsActive++
+		return nil
+	}
+	now := m.clock.Now()
+	since, ok := m.idleSince[sb.SandboxID]
+	if !ok {
+		// First tick observed idle: start the clock, reclaim on a later tick.
+		m.idleSince[sb.SandboxID] = now
+		return nil
+	}
+	if now.Sub(since) < m.policy.IdleReclaimAfter {
+		return nil
+	}
+	delete(m.idleSince, sb.SandboxID)
+	m.metrics.idleReclaims++
+	return m.suspendWithReasonLocked(sb, "idle_reclaim", true)
 }
 
 // enforceLeaseLocked applies lease limits to one live sandbox, emitting
