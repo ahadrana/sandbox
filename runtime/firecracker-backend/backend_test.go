@@ -740,15 +740,25 @@ func TestEgressPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("iptables-save: %v", err)
 	}
-	if strings.Contains(string(out), "FC-EGR-") {
-		t.Fatalf("egress chains survived Terminate:\n%s", out)
-	}
 	out6, err := exec.Command("sudo", "-n", "ip6tables-save").CombinedOutput()
 	if err != nil {
 		t.Fatalf("ip6tables-save: %v", err)
 	}
-	if strings.Contains(string(out6), "FC-EGR6-") {
-		t.Fatalf("ip6tables chains survived Terminate:\n%s", out6)
+	// Teardown is per-slot; assert on THIS test's slots only. A host-agentd
+	// sharing the host (fleet VMs) has live FC-EGR-* chains of its own — a
+	// global Contains fails on foreign chains under concurrent fleet load.
+	for _, ns := range nss {
+		pfx := fmt.Sprintf("FC-EGR-%d-", ns.slot)
+		if strings.Contains(string(out), pfx) {
+			t.Fatalf("egress chains for slot %d survived Terminate:\n%s", ns.slot, out)
+		}
+		pfx6 := fmt.Sprintf("FC-EGR6-%d", ns.slot)
+		if strings.Contains(string(out6), pfx6) {
+			t.Fatalf("ip6tables chains for slot %d survived Terminate:\n%s", ns.slot, out6)
+		}
+		if strings.Contains(string(out), "-i "+ns.tap+" ") {
+			t.Fatalf("jump rules for %s survived Terminate:\n%s", ns.tap, out)
+		}
 	}
 	for _, ns := range nss {
 		if err := exec.Command("ip", "link", "show", ns.tap).Run(); err == nil {

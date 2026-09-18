@@ -317,7 +317,12 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
   deterministic trace artifact). Phase 5 adds an enriched JSONL trace (causal parent links, inline
   world snapshots, embedded invariant report) and a self-contained time-travel replay UI
   (<code>sandbox-lab render</code>/<code>replay</code>): scrub virtual time, inspect hosts/sandboxes/
-  events with causal-parent jumps, and click violations to jump to the offending seq.</li>
+  events with causal-parent jumps, and click violations to jump to the offending seq. The engine also
+  ingests REAL traces: control-planed exports its outbox (<code>GET /v1/events?since=</code>) and
+  <code>cmd/invcheck</code> replays it through <code>NewLiveEngine</code> — event-stream checkers at full
+  strength, state-snapshot checkers honestly not-exercised (a live stream carries no world state). A 4h
+  soak harness (sandbox-sim <code>-duration</code> + periodic invcheck + daemon RSS/fd/thread sampling)
+  runs on node 1 against the standalone fleet.</li>
 <li class="yes"><b>Two-machine fleet proof</b> — standalone control-planed on node 1 plus one host-agentd per
   node (two AWS aarch64 instances, kernels 6.8 and 7.0): both hosts register with distinct facts and
   capacity; endpoint DNAT serves a guest HTTP server cross-machine (curl from the peer node → 200);

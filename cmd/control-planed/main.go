@@ -50,6 +50,7 @@ type server struct {
 	mgr     *sandboxmanager.Manager
 	fleet   *hostagent.Fleet
 	ws      *workspace.Memory
+	outbox  *eventservice.Outbox
 	token   string
 	gateway *network.Gateway
 
@@ -78,7 +79,7 @@ func main() {
 	store := sandboxmanager.NewMemoryStore()
 	fleet := hostagent.NewFleet(clock, nil, ws)
 	mgr := sandboxmanager.New(clock, ids, ws, loggingRestore{fleet}, outbox, store, "control-plane-0")
-	s := &server{mgr: mgr, fleet: fleet, ws: ws, token: token, hosts: map[string]*remoteHost{}, gateway: network.NewGateway(mgr)}
+	s := &server{mgr: mgr, fleet: fleet, ws: ws, outbox: outbox, token: token, hosts: map[string]*remoteHost{}, gateway: network.NewGateway(mgr)}
 
 	go s.tickLoop()
 
@@ -91,6 +92,9 @@ func main() {
 	mux.HandleFunc("/v1/sandboxes", s.guard(s.sandboxes))
 	mux.HandleFunc("/v1/sandboxes/", s.guard(s.sandboxOp))
 	mux.HandleFunc("/v1/hosts", s.guard(s.hostViews))
+	// Read-only event-stream export (ADR-010 live ingestion): feeds the
+	// sandboxlab invariant engine from a running control plane.
+	mux.HandleFunc("/v1/events", s.guard(s.events))
 	// Endpoint data-path support for the resume proxy (ADR-007): binding
 	// create/lookup, gateway route verdicts, and sandbox resume.
 	mux.HandleFunc("/v1/bindings", s.guard(s.createBinding))
@@ -431,6 +435,43 @@ func (s *server) hostViews(w http.ResponseWriter, r *http.Request) {
 		out = append(out, hostEntry{HostID: ref.id, URL: ref.url, LastSeen: ref.lastSeen, Down: s.fleet.HostDown(ref.id), View: ref.client.View()})
 	}
 	writeJSON(w, map[string]interface{}{"hosts": out, "capabilities": s.fleet.Capabilities()})
+}
+
+// events is GET /v1/events?since=<cursor>&limit=<n>: a paginated replay of
+// the manager's durable outbox (the same cursor semantics as
+// eventservice.Outbox.Replay). Read-only; powers live invariant checking
+// (cmd/invcheck) against a running control plane.
+func (s *server) events(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	var since int64
+	if v := r.URL.Query().Get("since"); v != "" {
+		var err error
+		if since, err = strconv.ParseInt(v, 10, 64); err != nil {
+			http.Error(w, "bad since cursor", http.StatusBadRequest)
+			return
+		}
+		if since < 0 {
+			since = 0
+		}
+	}
+	limit := 1000
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			http.Error(w, "bad limit", http.StatusBadRequest)
+			return
+		}
+		limit = n
+	}
+	events, next := s.outbox.Replay(since)
+	if len(events) > limit {
+		events = events[:limit]
+		next = since + int64(limit)
+	}
+	writeJSON(w, map[string]interface{}{"events": events, "cursor": next})
 }
 
 func randKey() string {

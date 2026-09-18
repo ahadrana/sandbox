@@ -129,6 +129,7 @@ type Sim struct {
 	cp       CPClient
 	scenario string
 	started  time.Time
+	PortBase int // target-port base for per-sandbox workloads (default 8000)
 
 	mu        sync.Mutex
 	sandboxes []*SandboxRec
@@ -141,7 +142,7 @@ type Sim struct {
 
 func NewSim(cp CPClient, scenario string) *Sim {
 	return &Sim{
-		cp: cp, scenario: scenario, started: time.Now(),
+		cp: cp, scenario: scenario, started: time.Now(), PortBase: 8000,
 		events: newRing(ringSize), stop: make(chan struct{}),
 		stats: Stats{ByState: map[string]int{}},
 	}
@@ -199,14 +200,12 @@ func (s *Sim) timed(sb *SandboxRec, kind, detail string, fn func() error) error 
 }
 
 // Setup creates, materializes, workloads, and binds N sandboxes. Sandbox i
-// serves on target port targetPortBase+i (host ports are per-binding
+// serves on target port PortBase+i (host ports are per-binding
 // published, so each sandbox needs its own).
-const targetPortBase = 8000
-
 func (s *Sim) Setup(n int) error {
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("sim-%d", i)
-		port := targetPortBase + i
+		port := s.PortBase + i
 		rec := &SandboxRec{Name: name, Continuity: ""}
 		err := s.timed(rec, "CREATE", "create+materialize+workload", func() error {
 			info, err := s.cp.CreateSandbox("sandbox-sim-" + name)
@@ -524,6 +523,17 @@ func (s *Sim) loop(period, initialDelay time.Duration, fn func()) {
 
 // Stop halts all scenario goroutines.
 func (s *Sim) Stop() { s.stopped.Do(func() { close(s.stop) }) }
+
+// Summary renders the final soak-relevant tally (start, uptime, cycles,
+// continuity pass/fail) for the log.
+func (s *Sim) Summary() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fmt.Sprintf("SUMMARY scenario=%s started=%s uptime=%ds restores=%d restore_fails=%d continuity_pass=%d continuity_fail=%d exec_ok=%d exec_fail=%d curl_ok=%d curl_fail=%d",
+		s.scenario, s.started.Format(time.RFC3339), int64(time.Since(s.started).Seconds()),
+		s.stats.Restores, s.stats.RestoreFails, s.stats.ContinuityPass, s.stats.ContinuityFail,
+		s.stats.ExecOK, s.stats.ExecFail, s.stats.CurlOK, s.stats.CurlFail)
+}
 
 // StateJSON renders the /api/state payload.
 func (s *Sim) StateJSON() []byte {

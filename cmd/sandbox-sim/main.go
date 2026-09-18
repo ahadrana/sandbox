@@ -32,6 +32,8 @@ func main() {
 		uiAddr   = flag.String("ui", ":9100", "UI listen address")
 		scenario = flag.String("scenario", "steady", "scenario: steady | churn | storm")
 		seed     = flag.Int64("seed", 0, "random seed (0 = time-based)")
+		duration = flag.Duration("duration", 0, "stop the scenario after this wall-clock duration (0 = run until signal)")
+		portBase = flag.Int("portbase", 8000, "base target port: sandbox i serves on portbase+i")
 	)
 	flag.Parse()
 	if *seed != 0 {
@@ -42,6 +44,7 @@ func main() {
 
 	cp := NewCPClient(*cpURL, *proxyURL, *token)
 	sim := NewSim(cp, *scenario)
+	sim.PortBase = *portBase
 	log.Printf("sandbox-sim: control plane %s, proxy %s, %d sandboxes, scenario %s", *cpURL, *proxyURL, *n, *scenario)
 
 	if err := sim.Setup(*n); err != nil {
@@ -67,6 +70,15 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	log.Printf("shutting down")
+	if *duration > 0 {
+		select {
+		case <-time.After(*duration):
+			log.Printf("duration %s elapsed; stopping", *duration)
+		case <-sig:
+		}
+	} else {
+		<-sig
+	}
+	sim.Stop()
+	log.Printf("shutting down\n%s", sim.Summary())
 }

@@ -127,18 +127,33 @@ func (r Report) String() string {
 
 // Engine drives the checker set over a scenario run.
 type Engine struct {
-	sf       *SimFleet
+	sf       *SimFleet // nil in live mode (real-trace ingestion)
 	consumer *eventservice.Consumer
 	checkers []Checker
 	viol     map[string][]Violation
 	static   []Entry // not-checkable registrations
 	observed uint64
+	fed      uint64 // events fed in live mode (violation seq anchor)
 }
 
 // NewEngine builds the engine over a SimFleet and wires it into the kernel.
 func NewEngine(sf *SimFleet) *Engine {
+	e := newEngine()
+	e.sf = sf
+	sf.Kernel.AfterEach = e.observe
+	return e
+}
+
+// NewLiveEngine builds the engine for real-trace ingestion via Feed (no
+// SimFleet). Only the event-stream checkers can run: state-snapshot
+// checkers need consistent world state (manager/fleet/host views) that a
+// real event stream does not carry, so they stay not-exercised — an honest
+// coverage reduction, reported as such. Violations are pinned to the
+// fed-event ordinal instead of a kernel seq.
+func NewLiveEngine() *Engine { return newEngine() }
+
+func newEngine() *Engine {
 	e := &Engine{
-		sf:       sf,
 		consumer: eventservice.NewConsumer(),
 		viol:     map[string][]Violation{},
 	}
@@ -187,7 +202,6 @@ func NewEngine(sf *SimFleet) *Engine {
 	} {
 		e.static = append(e.static, s)
 	}
-	sf.Kernel.AfterEach = e.observe
 	return e
 }
 
@@ -217,10 +231,11 @@ func (e *Engine) snapshotAll() {
 	}
 }
 
-// Feed replays an event stream through the event checkers (meta-tests and,
-// later, real-trace ingestion).
+// Feed replays an event stream through the event checkers (meta-tests and
+// real-trace ingestion via NewLiveEngine).
 func (e *Engine) Feed(events []domain.Event) {
 	for _, ev := range events {
+		e.fed++
 		for _, c := range e.checkers {
 			c.OnEvent(e, ev)
 		}
@@ -236,16 +251,24 @@ func (e *Engine) Violate(id, detail string) {
 			return
 		}
 	}
-	v := Violation{Invariant: id, Detail: detail, Seq: e.sf.Kernel.seq, At: e.sf.Kernel.Now()}
+	var v Violation
+	if e.sf != nil {
+		v = Violation{Invariant: id, Detail: detail, Seq: e.sf.Kernel.seq, At: e.sf.Kernel.Now()}
+		e.sf.Kernel.Note(fmt.Sprintf("INVARIANT_VIOLATION %s seq=%d %s", id, v.Seq, detail))
+	} else {
+		// Live mode: no kernel clock — pin the fed-event ordinal.
+		v = Violation{Invariant: id, Detail: detail, Seq: e.fed}
+	}
 	e.viol[id] = append(e.viol[id], v)
-	e.sf.Kernel.Note(fmt.Sprintf("INVARIANT_VIOLATION %s seq=%d %s", id, v.Seq, detail))
 }
 
 // Report finalizes the run: Finish on every checker, then per-invariant
 // status (violation > pass > not-exercised) plus the static not-checkable
 // rows, ordered by invariant ID.
 func (e *Engine) Report() Report {
-	e.snapshotAll() // final full snapshot at scenario end
+	if e.sf != nil {
+		e.snapshotAll() // final full snapshot at scenario end
+	}
 	for _, c := range e.checkers {
 		c.Finish(e)
 	}
