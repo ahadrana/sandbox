@@ -495,3 +495,107 @@ func TestFirecrackerFleetRoutedRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Startup-hook marquee against the firecracker backend (ADR-011 step 2):
+// an environment terminal hook launches a long-running service in the guest.
+// A workspace-only suspend destroys the VM; the epoch-creating resume must
+// re-run the recipe and reconstruct the service with no agent-driven
+// execution, while the environment artifact overlay and the committed
+// workspace survive. Checkpoint capability is masked (noCheckpointRuntime)
+// to force the workspace-only path deterministically.
+func TestFirecrackerStartupHooksReconstructServices(t *testing.T) {
+	s := newSystem(t, "firecracker")
+	fcb := fcBackend(t, s)
+	s.rt = noCheckpointRuntime{s.rt}
+	s.mgr = sandboxmanager.New(s.clock, s.ids, s.ws, s.rt, s.outbox, s.store, "host-1")
+
+	f := newEnvFixture(t)
+	f.repos.AddVersion("base-go", "", map[string]string{"bin/go": "binary"})
+	f.repos.AddVersion("app", "sha-app-1", map[string]string{"main.go": "v1"})
+	spec := baseSpec()
+	spec.Start = []string{"echo booted >> hooks.log"}
+	spec.Terminals = []string{"sleep 3611"}
+	env := mustBuild(t, f, "coding", spec)
+	s.mgr.SetEnvironmentSource(f.builder)
+
+	d := agentdriver.New(s.mgr, "tenant-1", "principal-1", 92)
+	sb, err := s.mgr.CreateSandbox(api.CreateSandboxRequest{
+		Version:       api.SchemaVersionV1,
+		TenantID:      "tenant-1",
+		TaskRef:       "task-fc-hooks",
+		EnvironmentID: env.EnvironmentID,
+		PolicyRef:     "policy-default",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMaterialize(t, d, sb.SandboxID)
+	if _, err := d.ExecSync(sb.SandboxID, domain.Operation{
+		Command: "true",
+		Writes:  map[string]string{"committed.txt": "data"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	incID := *mustGetSandbox(t, s, sb.SandboxID).RuntimeIncarnationID
+	h := backendinterface.Handle{IncarnationID: incID}
+	sleeperUp := func() bool {
+		inv, err := fcb.ProcessInventory(h)
+		if err != nil {
+			return false
+		}
+		for _, p := range inv {
+			if strings.Contains(p.Command, "sleep 3611") {
+				return true
+			}
+		}
+		return false
+	}
+	pollUntil(t, 10*time.Second, "terminal-hook service in guest", sleeperUp)
+
+	if err := s.mgr.Suspend(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	consumer := eventservice.NewConsumer()
+	suspended := eventsOfType(consumer.Poll(s.outbox), domain.EventSandboxSuspended)
+	if len(suspended) != 1 || suspended[0].Payload["mode"] != "workspace_only" {
+		t.Fatalf("want workspace_only suspend event: %v", suspended)
+	}
+
+	report, err := s.mgr.Resume(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.PriorEpoch != 1 || report.NewEpoch != 2 {
+		t.Fatalf("epoch %d -> %d, want 1 -> 2", report.PriorEpoch, report.NewEpoch)
+	}
+	fresh := consumer.Poll(s.outbox)
+	if got := eventsOfType(fresh, domain.EventExecutionStateReset); len(got) != 1 {
+		t.Fatalf("want one ExecutionStateReset: %v", got)
+	}
+	if got := eventsOfType(fresh, domain.EventEnvironmentHooksStarted); len(got) != 1 {
+		t.Fatalf("hooks did not re-run on epoch-creating resume: %v", got)
+	}
+	iCompleted := indexOf(fresh, domain.EventEnvironmentHooksCompleted)
+	iReset := indexOf(fresh, domain.EventExecutionStateReset)
+	if iCompleted < 0 || iReset < 0 || iCompleted > iReset {
+		t.Fatalf("hooks must complete before ExecutionStateReset: completed=%d reset=%d", iCompleted, iReset)
+	}
+
+	// The new incarnation is a different VM: re-derive its handle.
+	incID = *mustGetSandbox(t, s, sb.SandboxID).RuntimeIncarnationID
+	h = backendinterface.Handle{IncarnationID: incID}
+	pollUntil(t, 15*time.Second, "service reconstructed on resume", sleeperUp)
+	files, err := s.mgr.RuntimeFiles(sb.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(files["hooks.log"], "booted"); got != 2 {
+		t.Fatalf("start hook ran %d times, want 2 (log %q)", got, files["hooks.log"])
+	}
+	if strings.TrimSpace(files["committed.txt"]) != "data" {
+		t.Fatalf("committed workspace not restored: %q", files["committed.txt"])
+	}
+	if err := s.mgr.KillRuntime(sb.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+}

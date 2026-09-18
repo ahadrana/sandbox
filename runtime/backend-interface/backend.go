@@ -52,6 +52,15 @@ type Spec struct {
 	// P1.7). Placement uses it to gate the checkpoint-locality bonus to
 	// hosts whose facts match exactly; backends ignore it.
 	CheckpointFacts map[string]string
+	// HookStart/HookTerminals carry the restart recipe (ADR-011 step 2):
+	// the environment's start/terminal hooks, resolved by the control plane
+	// at create time. They are persisted into the snapshot package's
+	// meta.json (via the Spec field), so a continuity checkpoint restored
+	// after the environment was deleted/upgraded still records what the
+	// sandbox was built with. Backends never execute them; the control
+	// plane runs hooks. Additive: absent in legacy packages.
+	HookStart     []string `json:",omitempty"`
+	HookTerminals []string `json:",omitempty"`
 }
 
 type Handle struct {

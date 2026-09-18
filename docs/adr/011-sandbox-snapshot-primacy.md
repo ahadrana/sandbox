@@ -90,6 +90,61 @@ restart recipe, so a sandbox that must rebuild terminals, agents, or
 servers does so identically after host loss, kernel upgrade, or cold
 materialization.
 
+## Amendment 2026-09-18: step 2 implemented (startup hooks)
+
+Step 2 landed as specified:
+
+- **Schema (additive).** `EnvironmentSpec` gained `Start` / `Terminals`
+  ([]string). They participate in `SpecDigest` only when non-empty, so
+  hook-less environment digests (and dedup/reuse) are unchanged. The
+  resolved recipe is copied onto the `Sandbox` record
+  (`StartHooks`/`TerminalHooks`) at create time, so hook execution does not
+  depend on the environment still existing at resume.
+- **Persistence.** The recipe is persisted twice: `recipe.json` beside
+  `manifest.json` in the environment artifact (served by
+  `Builder.HookRecipe`, surviving builder restarts and environment
+  retirement), and `Spec.HookStart`/`Spec.HookTerminals` inside the
+  firecracker snapshot package's `meta.json` (additive; legacy packages
+  lack the fields and validation tolerates their absence). The manager's
+  sandbox record remains the source of truth on restore; meta.json carries
+  the recipe for package portability and inspection.
+- **Execution semantics.** On every epoch-creating materialization (fresh
+  create, snapshot/workspace-only resume — never a continuity restore), the
+  manager runs, in order: start hooks (sequential, must exit 0), then the
+  sandbox's per-session StartupCommands/BaselineCommands (unchanged), then
+  terminal hooks (long-running; launched backgrounded in the guest, not
+  waited on). A failing start hook is an honest boot failure: the sandbox
+  transitions FAILED with `EnvironmentHooksFailed` + `SandboxFailed`, never
+  RUNNING-without-services. Hooks complete before `ExecutionStateReset` and
+  the RUNNING transition are published, so observers never see a sandbox
+  advertised as ready before its services were reconstructed.
+- **Recording.** Each hook runs as a real hook-labeled `Execution`
+  (`Operation.Hook` = "start"/"terminal", principal `environment-hook`,
+  idempotency key `hook:<label>:<idx>:epoch-<n>`) with
+  `ExecutionStarted/Completed/Failed` events (INV-010/INV-013). Lifecycle
+  events `EnvironmentHooksStarted/Completed/Failed` bracket the block; an
+  environment with no recorded recipe emits `HooksCompleted` with
+  `recipe_empty: true` so absence is distinguishable from silence.
+- **Idempotency contract.** Hooks must be idempotent: any sandbox may
+  re-run them on a later epoch (host loss, reclaiming suspend, kernel
+  upgrade). Terminal hooks are wrapped `( cmd ) < /dev/null >>
+  /tmp/hook-terminal-N.log 2>&1 & echo launched` so the hook execution
+  completes at launch.
+- **Evidence.** Local (local-backend): hook ordering and lifecycle-event
+  order on fresh materialize; failing start hook → FAILED; marquee
+  reconstruct-services — a terminal-hook `python3 -m http.server` serving
+  the workspace is killed by a reclaiming (workspace-only) suspend and
+  serves again after resume with no agent-driven execution; continuity
+  (STOP/CONT checkpoint) resume runs no hooks and retains the epoch; recipe
+  persistence across builder reopen. Remote (firecracker, node1):
+  `TestFirecrackerStartupHooksReconstructServices` re-runs the marquee
+  against real VMs (workspace-only suspend → new VM → `sleep` service
+  reconstructed, epoch 1→2, hooks completed before reset). Full FC
+  conformance + firecracker-backend suites green.
+- **Deferred.** Step 3 (ACTIVE/IDLE lifecycle driver) remains open; the
+  meta.json primary-section reshaping beyond the additive Spec fields stays
+  as it was (the package remains chain-shaped, primacy contractual).
+
 ### What does not change
 
 - INV-009 is unchanged and reinforced: continuity checkpoints were never
@@ -115,10 +170,9 @@ materialization.
   matching cohorts. Two resume paths must both stay fast and well-tested.
   The current snapshot package format (meta.json) still physically carries
   workspace bits inside the checkpoint chain; the conceptual remapping is
-  documented in code, with format work deferred to step 2 (hooks), when the
-  restart-recipe fields actually land.
-- Follow-ups: step 2 — startup-hook execution on epoch-creating resume +
-  Sandbox Snapshot primary section in meta.json; step 3 — ACTIVE/IDLE
+  documented in code; step 2 (amendment above) physically added the
+  restart-recipe fields to meta.json via `Spec.HookStart`/`HookTerminals`.
+- Follow-ups: step 3 — ACTIVE/IDLE
   lifecycle driver (checkpoint-reclaim on idle); soak-coverage of the
   snapshot-resume path at the same depth as continuity resume.
 
@@ -145,11 +199,12 @@ materialization.
   re-ranks existing, already-honest mechanisms. Snapshot resume keeps the
   epoch bump + `ExecutionStateReset` + lost-classes reporting (INV-002/008);
   INV-009 is quoted and reinforced, not edited.
-- [x] Conformance tests updated/added before semantic change: no semantic
-  change in this step — the existing durability/isolation/fleet conformance
-  suites and SandboxLab scenario gates (host-loss-mid-restore,
-  guard-mismatch) already cover both resume paths and stay green. Step 2
-  (hooks) adds its conformance coverage with the semantic change.
+- [x] Conformance tests updated/added before semantic change: step 2
+  (hooks) landed with its conformance coverage — hook ordering/failure/
+  reconstruct-services/continuity-skip tests locally and the firecracker
+  marquee on node1 (see amendment); durability/isolation/fleet suites and
+  SandboxLab scenario gates (host-loss-mid-restore, guard-mismatch) stay
+  green.
 - [x] No invariant text required editing: INVARIANTS.md already encodes the
   disk-primary contract (INV-005/006/008/009); this ADR aligns packaging
   and lifecycle language with it.

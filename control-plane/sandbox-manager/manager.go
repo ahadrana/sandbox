@@ -125,9 +125,11 @@ type LostIncarnationTracker interface {
 	LostIncarnations() []string
 }
 
-// EnvironmentSource resolves prepared-environment artifacts (PLAN §7).
+// EnvironmentSource resolves prepared-environment artifacts (PLAN §7) and
+// restart recipes (ADR-011 step 2).
 type EnvironmentSource interface {
 	ArtifactManifest(environmentID string) (map[string]string, error)
+	HookRecipe(environmentID string) (domain.EnvironmentRecipe, error)
 }
 
 type Manager struct {
@@ -545,6 +547,15 @@ func (m *Manager) CreateSandbox(req api.CreateSandboxRequest) (*domain.Sandbox, 
 		BaselineCommands:    append([]string{}, req.BaselineCommands...),
 		Version:             1,
 	}
+	// Resolve the environment's restart recipe onto the sandbox record
+	// (ADR-011): the sandbox then carries its hooks even if the environment
+	// is later retired or the builder restarted.
+	if m.envs != nil && req.EnvironmentID != "" {
+		if recipe, err := m.envs.HookRecipe(req.EnvironmentID); err == nil {
+			sb.StartHooks = append([]string{}, recipe.Start...)
+			sb.TerminalHooks = append([]string{}, recipe.Terminals...)
+		}
+	}
 	lease := &domain.Lease{
 		LeaseID:           m.ids.Next("lease"),
 		TenantID:          sb.TenantID,
@@ -667,6 +678,8 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 		Env:                 map[string]string{"AGENT_SANDBOX_EGRESS": egressEnv},
 		Priority:            sb.Priority,
 		CheckpointFacts:     checkpointFacts,
+		HookStart:           append([]string{}, sb.StartHooks...),
+		HookTerminals:       append([]string{}, sb.TerminalHooks...),
 	}
 	h, err := m.rt.Create(spec)
 	// Fleet full: preempt (suspend) strictly-lower-priority BACKGROUND
@@ -704,7 +717,32 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 		m.rt.Terminate(h)
 		return err
 	}
+	hooks := len(sb.StartHooks) + len(sb.TerminalHooks)
+	if hooks > 0 {
+		m.emit(sb, sb.SandboxID, domain.EventEnvironmentHooksStarted, map[string]any{
+			"environment_id":  sb.EnvironmentID,
+			"start_hooks":     len(sb.StartHooks),
+			"terminal_hooks":  len(sb.TerminalHooks),
+			"execution_epoch": sb.ExecutionEpoch,
+		})
+	} else if sb.EnvironmentID != "" {
+		// Legacy/pre-step-2 environment (or snapshot package) with no
+		// recorded recipe: hooks are honestly absent, not silently skipped.
+		m.emit(sb, sb.SandboxID, domain.EventEnvironmentHooksCompleted, map[string]any{
+			"environment_id":  sb.EnvironmentID,
+			"start_hooks":     0,
+			"terminal_hooks":  0,
+			"execution_epoch": sb.ExecutionEpoch,
+			"recipe_empty":    true,
+		})
+	}
 	if err := m.runStartupLocked(sb, h, incID); err != nil {
+		if hooks > 0 {
+			m.emit(sb, sb.SandboxID, domain.EventEnvironmentHooksFailed, map[string]any{
+				"environment_id": sb.EnvironmentID,
+				"detail":         err.Error(),
+			})
+		}
 		m.rt.Terminate(h)
 		delete(m.handles, sb.SandboxID)
 		if terr := m.transition(sb, domain.SandboxFailed); terr != nil {
@@ -715,6 +753,14 @@ func (m *Manager) materializeLocked(sb *domain.Sandbox, report *api.RestoreRepor
 			"detail": err.Error(),
 		})
 		return err
+	}
+	if hooks > 0 {
+		m.emit(sb, sb.SandboxID, domain.EventEnvironmentHooksCompleted, map[string]any{
+			"environment_id":  sb.EnvironmentID,
+			"start_hooks":     len(sb.StartHooks),
+			"terminal_hooks":  len(sb.TerminalHooks),
+			"execution_epoch": sb.ExecutionEpoch,
+		})
 	}
 	now := m.clock.Now()
 	m.materializedAt[sb.SandboxID] = now
@@ -912,11 +958,22 @@ func (m *Manager) preemptableLocked(requester *domain.Sandbox, excluded map[stri
 	return victim
 }
 
-// runStartupLocked executes per-session startup commands after workspace
-// materialization and before RUNNING. A failed startup is explicit: the
-// sandbox transitions to FAILED with an event rather than silently reporting
-// RUNNING without its services (FR-ENV-005).
+// runStartupLocked executes the restart recipe and per-session startup
+// commands after workspace materialization and before RUNNING. Order
+// (ADR-011 step 2): environment start hooks (sequential, must exit 0,
+// recorded as hook-labeled executions per INV-010), then the sandbox's
+// StartupCommands/BaselineCommands, then environment terminal hooks
+// (long-running; launched, not waited on). A failed start hook or startup
+// command is explicit: the sandbox transitions to FAILED with an event
+// rather than silently reporting RUNNING without its services
+// (FR-ENV-005). Hooks never run on a continuity restore — that path does
+// not reach materializeLocked.
 func (m *Manager) runStartupLocked(sb *domain.Sandbox, h backendinterface.Handle, incID string) error {
+	for i, cmd := range sb.StartHooks {
+		if err := m.runHookExecutionLocked(sb, h, "start", i, cmd); err != nil {
+			return err
+		}
+	}
 	commands := make([]domain.Operation, 0, len(sb.StartupCommands)+len(sb.BaselineCommands))
 	for _, cmd := range sb.StartupCommands {
 		commands = append(commands, domain.Operation{Command: cmd})
@@ -938,6 +995,83 @@ func (m *Manager) runStartupLocked(sb *domain.Sandbox, h backendinterface.Handle
 			return fmt.Errorf("startup command %d %q exited %d", i, cmd, res.ExitCode)
 		}
 	}
+	for i, cmd := range sb.TerminalHooks {
+		// Long-running process: backgrounded in the guest so the hook
+		// execution itself completes once the process is launched.
+		launch := fmt.Sprintf("( %s ) < /dev/null >> /tmp/hook-terminal-%d.log 2>&1 & echo launched", cmd, i)
+		if err := m.runHookExecutionLocked(sb, h, "terminal", i, launch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runHookExecutionLocked runs one restart-recipe hook as a recorded,
+// hook-labeled execution (INV-010/INV-013) and waits for it. A nonzero exit
+// or dispatch error is a boot failure.
+func (m *Manager) runHookExecutionLocked(sb *domain.Sandbox, h backendinterface.Handle, label string, idx int, cmd string) error {
+	now := m.clock.Now()
+	ex := &domain.Execution{
+		ExecutionID:                  m.ids.Next("ex"),
+		IdempotencyKey:               "hook:" + label + ":" + itoaInt(idx) + ":epoch-" + itoaInt64(sb.ExecutionEpoch),
+		TenantID:                     sb.TenantID,
+		SandboxID:                    sb.SandboxID,
+		PrincipalID:                  "environment-hook",
+		ExecutionEpoch:               sb.ExecutionEpoch,
+		RequestedWorkspaceGeneration: sb.WorkspaceGeneration,
+		Operation:                    domain.Operation{Command: cmd, Hook: label},
+		State:                        domain.ExecutionPending,
+		CreatedAt:                    now,
+		GenerationBefore:             sb.WorkspaceGeneration,
+	}
+	for _, st := range []domain.ExecutionState{domain.ExecutionDispatched, domain.ExecutionRunning} {
+		if err := domain.TransitionExecution(ex.State, st); err != nil {
+			return err
+		}
+		ex.State = st
+	}
+	if err := m.rt.Exec(h, ex.ExecutionID, ex.Operation); err != nil {
+		return fmt.Errorf("%s hook %d %q: %w", label, idx, cmd, err)
+	}
+	m.executions[ex.ExecutionID] = ex
+	m.txExecution(ex)
+	m.emit(sb, ex.ExecutionID, domain.EventExecutionStarted, map[string]any{
+		"execution_id":    ex.ExecutionID,
+		"principal_id":    ex.PrincipalID,
+		"execution_epoch": ex.ExecutionEpoch,
+		"hook":            label,
+	})
+	fail := func(cause error) error {
+		if terr := domain.TransitionExecution(ex.State, domain.ExecutionFailed); terr != nil {
+			return terr
+		}
+		ex.State = domain.ExecutionFailed
+		ex.CompletedAt = &now
+		reason := cause.Error()
+		ex.TerminalReason = &reason
+		m.txExecution(ex)
+		m.emit(sb, ex.ExecutionID, domain.EventExecutionFailed, map[string]any{
+			"execution_id": ex.ExecutionID, "hook": label, "detail": reason,
+		})
+		return fmt.Errorf("%s hook %d %q: %v", label, idx, cmd, cause)
+	}
+	res, err := m.rt.WaitExecution(h, ex.ExecutionID)
+	if err != nil {
+		return fail(err)
+	}
+	if res.ExitCode != 0 {
+		return fail(fmt.Errorf("exited %d", res.ExitCode))
+	}
+	if terr := domain.TransitionExecution(ex.State, domain.ExecutionCompleted); terr != nil {
+		return terr
+	}
+	ex.State = domain.ExecutionCompleted
+	ex.CompletedAt = &now
+	ex.ExitCode = &res.ExitCode
+	m.txExecution(ex)
+	m.emit(sb, ex.ExecutionID, domain.EventExecutionCompleted, map[string]any{
+		"execution_id": ex.ExecutionID, "hook": label, "exit_code": res.ExitCode,
+	})
 	return nil
 }
 

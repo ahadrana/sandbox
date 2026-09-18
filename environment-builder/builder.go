@@ -2,7 +2,10 @@
 // pipeline (DESIGN §6.5, PLAN §7): versioned specs with deterministic
 // identity, async bounded builds, immutable digest-verified artifacts, and
 // family default (ACTIVE) management. Environment preparation is distinct
-// from per-session startup (FR-ENV-005).
+// from per-session startup (FR-ENV-005). Specs optionally carry a restart
+// recipe (Start/Terminals hooks, ADR-011): persisted as recipe.json in the
+// artifact and executed by the control plane on every epoch-creating
+// materialization of sandboxes built from the environment.
 package environmentbuilder
 
 import (
@@ -32,10 +35,18 @@ var (
 
 // EnvironmentSpec is the versioned build input. Its digest is the
 // environment's identity: identical inputs produce identical digests.
+//
+// Start and Terminals are the runtime hooks (ADR-011; Cursor-model start/
+// terminals): Start commands run sequentially and must exit 0 on every
+// epoch-creating materialization (fresh create, snapshot resume);
+// Terminals are long-running processes launched (not waited on) after
+// Start completes. Neither runs on a continuity restore.
 type EnvironmentSpec struct {
 	BaseRuntimeRef string
 	RepoInputs     []domain.RepoInput
 	InstallCommand string
+	Start          []string
+	Terminals      []string
 	Config         map[string]string
 }
 
@@ -59,6 +70,18 @@ func SpecDigest(spec EnvironmentSpec) string {
 		field("repo", r.RepoURL+"@"+r.SHA)
 	}
 	field("install", spec.InstallCommand)
+	// Hook lists are digest-relevant only when present, so adding the fields
+	// (ADR-011 step 2) does not change digests of hook-less specs.
+	join := func(tag string, items []string) {
+		if len(items) == 0 {
+			return
+		}
+		for _, it := range items {
+			field(tag, it)
+		}
+	}
+	join("start", spec.Start)
+	join("terminals", spec.Terminals)
 	keys := make([]string, 0, len(spec.Config))
 	for k := range spec.Config {
 		keys = append(keys, k)
@@ -156,6 +179,42 @@ func copyDir(src, dest string) error {
 		}
 		return os.WriteFile(target, data, 0o644)
 	})
+}
+
+// Recipe is the environment's restart recipe (ADR-011): the hooks a sandbox
+// built from this environment runs on every epoch-creating materialization.
+// It is persisted in the artifact (recipe.json) so the recipe survives
+// builder restarts and environment deletion alike.
+type Recipe = domain.EnvironmentRecipe
+
+// HookRecipe returns the environment's restart recipe. Served from the
+// immutable artifact for terminal environments, from the in-memory spec
+// for a BUILDING one.
+func (b *Builder) HookRecipe(environmentID string) (Recipe, error) {
+	b.mu.Lock()
+	env, ok := b.envs[environmentID]
+	spec, hasSpec := b.specs[environmentID]
+	b.mu.Unlock()
+	if !ok {
+		return Recipe{}, ErrNotFound
+	}
+	if env.Status == domain.EnvironmentBuilding && hasSpec {
+		return Recipe{Start: spec.Start, Terminals: spec.Terminals}, nil
+	}
+	data, err := os.ReadFile(filepath.Join(b.root, "artifacts", env.ConfigDigest, "recipe.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Pre-ADR-011-step-2 artifact: no recipe recorded. Empty recipe,
+			// honestly distinguishable from an absent environment.
+			return Recipe{}, nil
+		}
+		return Recipe{}, err
+	}
+	var r Recipe
+	if err := json.Unmarshal(data, &r); err != nil {
+		return Recipe{}, err
+	}
+	return r, nil
 }
 
 // artifactManifest records every file in an artifact with its digest.
@@ -464,6 +523,18 @@ func (b *Builder) finish(env *domain.Environment, artifactDir string, reused boo
 		}
 		if err := os.WriteFile(filepath.Join(artifactDir, "manifest.json"), data, 0o644); err != nil {
 			return err
+		}
+		// Persist the restart recipe with the artifact (ADR-011): a sandbox
+		// resumed after this environment was retired or the builder
+		// restarted still reconstructs its services.
+		if spec, ok := b.specs[env.EnvironmentID]; ok && (len(spec.Start) > 0 || len(spec.Terminals) > 0) {
+			rdata, err := json.Marshal(Recipe{Start: spec.Start, Terminals: spec.Terminals})
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(artifactDir, "recipe.json"), rdata, 0o644); err != nil {
+				return err
+			}
 		}
 		if logPath != "" {
 			logData, err := os.ReadFile(logPath)

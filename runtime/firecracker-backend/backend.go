@@ -685,9 +685,10 @@ func (b *Backend) Resume(h backendinterface.Handle) error {
 // generation bits in workspace.img, the restart-relevant Spec below) AND
 // the optional Continuity Checkpoint (vm.state/mem.file + the
 // compatibility-class fields Arch/KernelRelease/CPUPart/
-// FirecrackerVersion/KernelSHA256). Until step 2 (startup hooks) adds the
-// primary sandbox-snapshot section (workspace generation ref, environment
-// identity, restart recipe), the format stays chain-shaped: legacy packages
+// FirecrackerVersion/KernelSHA256). Step 2 (startup hooks) physically added
+// the restart recipe to the sandbox-snapshot section: Spec.HookStart and
+// Spec.HookTerminals ride inside the serialized Spec, so a relocated package
+// carries everything a boot needs to reconstruct services. Legacy packages
 // restore unchanged and validation (P0.4) tolerates missing fields. The
 // primacy is contractual, not physical: restore of the continuity section
 // may ALWAYS be abandoned (guard mismatch, kernel upgrade) in favor of the

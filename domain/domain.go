@@ -191,6 +191,11 @@ const (
 	EventQuotaExceeded         EventType = "QuotaExceeded"
 	EventTenantDeleted         EventType = "TenantDeleted"
 	EventSandboxPreempted      EventType = "SandboxPreempted"
+	// Environment hook lifecycle (ADR-011 step 2): emitted around the
+	// start/terminal hook block on every epoch-creating materialization.
+	EventEnvironmentHooksStarted   EventType = "EnvironmentHooksStarted"
+	EventEnvironmentHooksCompleted EventType = "EnvironmentHooksCompleted"
+	EventEnvironmentHooksFailed    EventType = "EnvironmentHooksFailed"
 )
 
 type Tenant struct {
@@ -202,6 +207,16 @@ type Tenant struct {
 type RepoInput struct {
 	RepoURL string
 	SHA     string
+}
+
+// EnvironmentRecipe is an environment's restart recipe (ADR-011 step 2):
+// hooks run on every epoch-creating materialization of a sandbox built from
+// that environment. Start runs sequentially and must exit 0; Terminals are
+// long-running processes launched (not waited on) after Start completes.
+// Hooks must be idempotent: any sandbox may re-run them on a later epoch.
+type EnvironmentRecipe struct {
+	Start     []string `json:"start,omitempty"`
+	Terminals []string `json:"terminals,omitempty"`
 }
 
 type Environment struct {
@@ -260,7 +275,15 @@ type Sandbox struct {
 	// BaselineCommands are startup commands tagged as baseline services:
 	// metered and lease-bound, but never blocking quiescence.
 	BaselineCommands []string
-	Version          int64
+	// StartHooks/TerminalHooks are the sandbox's restart recipe (ADR-011):
+	// the environment's start/terminal hooks resolved at create time (or
+	// from the snapshot package on restore) so an epoch-creating resume
+	// reconstructs services even after the environment was deleted or
+	// upgraded. Start hooks run sequentially and must exit 0; terminal
+	// hooks are long-running processes launched after start completes.
+	StartHooks    []string
+	TerminalHooks []string
+	Version       int64
 }
 
 type RuntimeIncarnation struct {
@@ -293,6 +316,10 @@ type Operation struct {
 	// Baseline designates a startup service: metered and lease-bound, but it
 	// never blocks sandbox quiescence.
 	Baseline bool
+	// Hook labels an environment hook execution (ADR-011): "start" or
+	// "terminal". Empty is a normal execution. Lets UIs/audits distinguish
+	// restart-recipe work from agent-driven work (INV-010).
+	Hook string
 	// Env carries per-execution environment variables (e.g. broker-issued
 	// credential tokens) delivered to the process but never embedded in
 	// event payloads (INV-025).
