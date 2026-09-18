@@ -407,7 +407,7 @@ func (f *Fleet) UnpublishPort(h backendinterface.Handle, hostPort int) error {
 // from the origin host first (ADR-009). Capacity and the checkpoint's
 // host-facts guard (arch, kernel release, CPU part) are enforced either
 // way, so an inadmissible fleet fails the restore honestly and the caller
-// falls back to workspace-only recovery.
+// takes the co-equal snapshot-resume path (ADR-011).
 func (f *Fleet) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
 	f.mu.Lock()
 	if hostID, ok := f.byIncarnation[cp.IncarnationID]; ok {
@@ -431,7 +431,8 @@ func (f *Fleet) Restore(cp backendinterface.CheckpointData) (backendinterface.Ha
 		return backendinterface.Handle{}, fmt.Errorf("checkpoint origin host %q not in fleet: %w", origin, backendinterface.ErrNotFound)
 	}
 	// A down origin cannot boot the checkpoint NOR serve its package to a
-	// peer (ADR-009): both paths fail honestly and the manager falls back.
+	// peer (ADR-009): both paths fail honestly and the manager snapshot-
+	// resumes (ADR-011).
 	if f.down[origin] {
 		f.mu.Unlock()
 		return backendinterface.Handle{}, fmt.Errorf("checkpoint origin host %q unavailable: %w", origin, backendinterface.ErrRuntimeGone)

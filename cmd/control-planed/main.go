@@ -485,9 +485,10 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// loggingRestore surfaces routed-restore failures in the daemon log: the
-// manager falls back to workspace-only resume on any Restore error
-// (INV-009), which is correct but must never be silent for operators.
+// loggingRestore surfaces routed-restore failures in the daemon log: on any
+// Restore error the manager takes the co-equal snapshot-resume path
+// (INV-009, ADR-011: workspace-only, epoch bump) — correct, but never
+// silent for operators.
 type loggingRestore struct {
 	*hostagent.Fleet
 }
@@ -495,7 +496,7 @@ type loggingRestore struct {
 func (l loggingRestore) Restore(cp backendinterface.CheckpointData) (backendinterface.Handle, error) {
 	h, err := l.Fleet.Restore(cp)
 	if err != nil {
-		log.Printf("restore of incarnation %s failed (workspace-only fallback follows): %v", cp.IncarnationID, err)
+		log.Printf("restore of incarnation %s unavailable (snapshot resume follows): %v", cp.IncarnationID, err)
 	}
 	return h, err
 }
@@ -511,7 +512,7 @@ func (l loggingRestore) Pause(h backendinterface.Handle) error {
 func (l loggingRestore) Snapshot(h backendinterface.Handle) (backendinterface.CheckpointData, error) {
 	cp, err := l.Fleet.Snapshot(h)
 	if err != nil {
-		log.Printf("snapshot of incarnation %s failed (workspace-only suspend follows): %v", h.IncarnationID, err)
+		log.Printf("snapshot of incarnation %s failed (disk-only suspend follows, no continuity checkpoint): %v", h.IncarnationID, err)
 	}
 	return cp, err
 }

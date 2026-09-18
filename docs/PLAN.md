@@ -352,7 +352,9 @@ Then implement Firecracker snapshot path:
 - snapshot compatibility metadata;
 - restore;
 - lazy memory loading where useful;
-- fallback to workspace-only reset when incompatible/corrupt.
+- snapshot-resume (workspace-only reset, epoch bump) when the continuity
+  checkpoint is incompatible/corrupt — co-equal path, not a failure
+  (ADR-011).
 
 ## Benchmark
 

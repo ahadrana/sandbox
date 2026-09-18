@@ -678,6 +678,20 @@ func (b *Backend) Resume(h backendinterface.Handle) error {
 	return nil
 }
 
+// snapshotMeta is the per-link meta.json of a checkpoint chain.
+//
+// ADR-011 conceptual mapping (primacy inversion): this package physically
+// carries BOTH the durable Sandbox Snapshot content (the workspace
+// generation bits in workspace.img, the restart-relevant Spec below) AND
+// the optional Continuity Checkpoint (vm.state/mem.file + the
+// compatibility-class fields Arch/KernelRelease/CPUPart/
+// FirecrackerVersion/KernelSHA256). Until step 2 (startup hooks) adds the
+// primary sandbox-snapshot section (workspace generation ref, environment
+// identity, restart recipe), the format stays chain-shaped: legacy packages
+// restore unchanged and validation (P0.4) tolerates missing fields. The
+// primacy is contractual, not physical: restore of the continuity section
+// may ALWAYS be abandoned (guard mismatch, kernel upgrade) in favor of the
+// workspace content — never the reverse.
 type snapshotMeta struct {
 	Spec      backendinterface.Spec `json:"spec"`
 	CreatedAt time.Time             `json:"created_at"`

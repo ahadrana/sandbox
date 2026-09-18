@@ -96,15 +96,18 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:18px 0 40px;colo
 
 <header class="hero"><div class="wrap">
   <h1>Agent Sandbox Platform</h1>
-  <div class="sub">architecture overview · generated from docs/DESIGN.md, docs/INVARIANTS.md, ADR-001…008, deploy/k8s/README.md</div>
+  <div class="sub">architecture overview · generated from docs/DESIGN.md, docs/INVARIANTS.md, ADR-001…011, deploy/k8s/README.md</div>
   <p class="lede">A microVM sandbox platform for AI agents. Each agent's workload runs inside a
   <b>Firecracker microVM</b> (stronger isolation than a Kubernetes namespace, INV-027), behind a
   <b>durable control plane</b> that treats the sandbox as a logical entity — workspace generations and
-  execution epochs survive the compute they ran on. Sandboxes <b>suspend and resume</b>: full-VM
-  checkpoints form incremental chains (ADR-006), and a suspended sandbox springs back to life when
-  traffic arrives at its endpoint (ADR-007/008). A <b>fail-closed egress policy</b> decides which
-  networks a guest may reach, and <b>endpoint bindings</b> expose selected guest ports to clients —
-  with traffic-triggered resume making suspended sandboxes transparently addressable.</p>
+  execution epochs survive the compute they ran on. The durable unit is the <b>Sandbox Snapshot</b>
+  (committed disk state + restart recipe, ADR-011); full-VM <b>Continuity Checkpoints</b> are an optional
+  accelerator on top — incremental chains (ADR-006) that let a suspended sandbox spring back with its RAM
+  intact when a compatible host is available, and an epoch-preserving traffic-triggered resume
+  (ADR-007/008) — while the epoch-bumping snapshot resume is a co-equal, always-available path. A
+  <b>fail-closed egress policy</b> decides which networks a guest may reach, and <b>endpoint bindings</b>
+  expose selected guest ports to clients — with traffic-triggered resume making suspended sandboxes
+  transparently addressable.</p>
 </div></header>
 
 <nav class="toc" aria-label="Sections"><div class="wrap">
@@ -338,10 +341,11 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
 <li class="no"><b>Cross-machine checkpoint restore with RAM continuity</b> — correctly refused when host
   kernels differ (node 1: 6.8, node 2: 7.0): the scheduler's facts guard finds no candidate, and even with
   advertised facts overridden (HOST_FACTS_OVERRIDE test seam) the backend's snapshot-package validation
-  vetoes on the real uname — workspace-only fallback preserves the committed workspace either way. The
-  ADR-009 pull path itself engaged (checkpoint package transferred to the peer) before the veto; a full
-  RAM-continuity pull across machines needs matching kernels and remains proven only in the two-agent
-  single-node topology. Joining node 2 into the k3s cluster is also deferred (kernel 7.0 kubelet/cadvisor
+  vetoes on the real uname — the co-equal snapshot resume (ADR-011) preserves the committed workspace
+  either way. The ADR-009 pull path itself engaged (checkpoint package transferred to the peer) before the
+  veto; a full RAM-continuity pull across machines needs matching kernels and remains proven only in the
+  two-agent single-node topology. Per ADR-011 this is demoted to a cohort-expansion optimization, not a
+  correctness gap. Joining node 2 into the k3s cluster is also deferred (kernel 7.0 kubelet/cadvisor
   risk; the standalone topology was chosen instead).</li>
 <li class="no"><b>Scale/load</b> — logic-level scale is covered by SandboxLab (ADR-010: storms, bursts, 10k
   logical sandboxes, byte-identical traces), but real-time density and contention on actual hosts is
@@ -561,7 +565,8 @@ var ADRS = [
  ["ADR-007","2026-09-15","Traffic-triggered resume","An ingress resume-proxy makes suspended sandboxes transparently addressable: single-flight resume, then forward."],
  ["ADR-008","2026-09-16","Routed checkpoint restore, origin-host-only","Restore routes to the checkpoint's origin host under a fresh fence; pending placement + rollback keep it atomic (Batch C amendment)."],
  ["ADR-009","2026-09-16","Cross-host checkpoint restore (pull streaming)","Destination host pulls the snapshot package from the origin over the host-agent RPC (manifest + blob endpoints, per-file sha256, staged atomic install, GC pinning); origin preferred, guard-matching peers as failover."],
- ["ADR-010","2026-09-17","SandboxLab deterministic simulation","Discrete-event kernel (virtual clock, seeded priority queue) running the real control plane in-process; same seed gives a byte-identical trace. Hosts report per-host facts via a HostAgent.SetFacts seam."]
+ ["ADR-010","2026-09-17","SandboxLab deterministic simulation","Discrete-event kernel (virtual clock, seeded priority queue) running the real control plane in-process; same seed gives a byte-identical trace. Hosts report per-host facts via a HostAgent.SetFacts seam."],
+ ["ADR-011","2026-09-18","Sandbox snapshot primacy","The durable unit is the Sandbox Snapshot (workspace generation + environment/build identity + restart recipe); the VM Continuity Checkpoint is an optional accelerator. Snapshot resume (epoch bump, hooks, ExecutionStateReset) is a co-equal resume path, not a failure fallback. Motivated by the Cursor-model analysis (industry validation of disk-primary)."]
 ];
 var adrHtml = '';
 ADRS.forEach(function(a){

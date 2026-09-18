@@ -308,8 +308,10 @@ func (s *Sim) execTick(rec *SandboxRec) {
 }
 
 // churnOnce suspends rec, resumes it via the API, and checks continuity:
-// epoch preserved (continuity restore, not workspace-only fallback) AND the
-// tmpfs counter (guest RAM) still at/above its pre-suspend value.
+// epoch preserved (continuity restore, not the epoch-bumping snapshot
+// resume) AND the tmpfs counter (guest RAM) still at/above its pre-suspend
+// value. Snapshot resume is a supported path (ADR-011), just not what this
+// check measures.
 func (s *Sim) churnOnce(rec *SandboxRec) {
 	// Snapshot the pre-suspend continuity facts.
 	if _, ok := s.curlOnce(rec); !ok {
@@ -346,7 +348,7 @@ func (s *Sim) churnOnce(rec *SandboxRec) {
 	var why []string
 	if rep.NewEpoch != rep.PriorEpoch {
 		pass = false
-		why = append(why, fmt.Sprintf("epoch bumped %d->%d (workspace-only fallback)", rep.PriorEpoch, rep.NewEpoch))
+		why = append(why, fmt.Sprintf("epoch bumped %d->%d (snapshot resume, no continuity)", rep.PriorEpoch, rep.NewEpoch))
 	}
 	body, ok := s.curlOnce(rec)
 	if !ok {

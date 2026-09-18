@@ -1697,8 +1697,9 @@ func (m *Manager) lostInventoryLocked(h backendinterface.Handle) []string {
 // Resume restores a suspended sandbox. With an EXECUTION_STATE checkpoint
 // and continuity guaranteed (all checkpointed PIDs alive and owned), the
 // epoch is RETAINED and no ExecutionStateReset is emitted (FR-SR-005).
-// Otherwise it falls back to workspace-only recovery: epoch increment,
-// startup rerun, ExecutionStateReset — never false continuity (INV-009).
+// Otherwise it takes the co-equal snapshot-resume path (ADR-011): epoch
+// increment, startup rerun, ExecutionStateReset — a normal supported
+// resume, never false continuity (INV-009).
 func (m *Manager) Resume(sandboxID string) (*api.RestoreReport, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
