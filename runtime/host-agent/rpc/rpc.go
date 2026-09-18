@@ -319,6 +319,30 @@ func NewClientWithID(baseURL, token, id string) *Client {
 	return &Client{BaseURL: baseURL, Token: token, ID: id}
 }
 
+// Liveness/read ops ride a bounded client: an unbounded one let a single
+// stalled host agent wedge every fleet operation behind the fleet lock
+// (observed in the two-machine validation: one hung Tick RPC deadlocked the
+// control plane's heartbeat path). Long-blocking ops (wait) stay unbounded.
+var (
+	fastRPCClient = &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{MaxIdleConnsPerHost: 32},
+	}
+	longRPCClient = &http.Client{
+		Timeout:   0,
+		Transport: &http.Transport{MaxIdleConnsPerHost: 32},
+	}
+)
+
+func rpcHTTPClient(op string) *http.Client {
+	switch op {
+	case "tick", "view", "capabilities":
+		return fastRPCClient
+	default:
+		return longRPCClient
+	}
+}
+
 func (c *Client) call(req request) (response, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -326,9 +350,7 @@ func (c *Client) call(req request) (response, error) {
 	}
 	hc := c.HTTP
 	if hc == nil {
-		hc = &http.Client{Timeout: 0}
-		// Transport tuned for long-blocking Waits and many short calls.
-		hc.Transport = &http.Transport{MaxIdleConnsPerHost: 32}
+		hc = rpcHTTPClient(req.Op)
 	}
 	httpReq, err := http.NewRequest(http.MethodPost, c.BaseURL+"/rpc", bytes.NewReader(body))
 	if err != nil {

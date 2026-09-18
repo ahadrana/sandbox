@@ -318,16 +318,30 @@ plain-English gloss. These are the review rule: any change that breaks one is a 
   world snapshots, embedded invariant report) and a self-contained time-travel replay UI
   (<code>sandbox-lab render</code>/<code>replay</code>): scrub virtual time, inspect hosts/sandboxes/
   events with causal-parent jumps, and click violations to jump to the offending seq.</li>
+<li class="yes"><b>Two-machine fleet proof</b> — standalone control-planed on node 1 plus one host-agentd per
+  node (two AWS aarch64 instances, kernels 6.8 and 7.0): both hosts register with distinct facts and
+  capacity; endpoint DNAT serves a guest HTTP server cross-machine (curl from the peer node → 200);
+  suspend → resume on the origin host preserves RAM state and epoch; real host loss (killed host-agentd)
+  is latched down in ~6 s, declared lost, and the sandbox goes FAILED, then re-materializes on the
+  surviving host with an epoch bump, ExecutionStateReset, and the committed workspace intact. The run also
+  exposed and fixed two control-plane robustness bugs (an unbounded heartbeat RPC wedging the fleet lock,
+  and a miss-counter reset stalling lost-host declaration). FC conformance suites are green on the second
+  node too.</li>
 </ul></div>
 <div class="panel"><h3 style="margin-top:0" class="missing">Not yet proven</h3>
 <ul>
-<li class="no"><b>Multi-host fleet</b> — a single bare-metal node only. Cross-host checkpoint restore is
-  implemented (ADR-009, host-to-host pull streaming) and proven in the two-agent single-node topology
-  (two host agents, separate roots, real microVM pulled + restored across them); true multi-node operation
-  is untested.</li>
+<li class="no"><b>Cross-machine checkpoint restore with RAM continuity</b> — correctly refused when host
+  kernels differ (node 1: 6.8, node 2: 7.0): the scheduler's facts guard finds no candidate, and even with
+  advertised facts overridden (HOST_FACTS_OVERRIDE test seam) the backend's snapshot-package validation
+  vetoes on the real uname — workspace-only fallback preserves the committed workspace either way. The
+  ADR-009 pull path itself engaged (checkpoint package transferred to the peer) before the veto; a full
+  RAM-continuity pull across machines needs matching kernels and remains proven only in the two-agent
+  single-node topology. Joining node 2 into the k3s cluster is also deferred (kernel 7.0 kubelet/cadvisor
+  risk; the standalone topology was chosen instead).</li>
 <li class="no"><b>Scale/load</b> — logic-level scale is covered by SandboxLab (ADR-010: storms, bursts, 10k
   logical sandboxes, byte-identical traces), but real-time density and contention on actual hosts is
-  untested; virtual latency models work, not contention.</li>
+  untested; virtual latency models work, not contention. One load-sensitive FC test flake observed
+  (egress-chain cleanup assertion failing only while the host also ran 16 fleet VMs; green idle).</li>
 <li class="no"><b>Production hardening</b> — dev shared-token auth everywhere; the endpoint proxy dials
   heartbeat-self-reported host URLs (L11 SSRF posture, accepted for dev).</li>
 <li class="no"><b>Portability</b> — arm64 (aarch64) only so far.</li>

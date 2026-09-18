@@ -218,10 +218,18 @@ func (f *Fleet) HostDown(hostID string) bool {
 	return f.down[hostID]
 }
 
-// SimulateHostLoss cuts heartbeats and reachability for a host.
+// SimulateHostLoss cuts heartbeats and reachability for a host. Idempotent:
+// the control-plane tick loop calls it on every stale tick, and resetting
+// missed each call would keep the host below heartbeatMissThreshold forever
+// — down but never declared lost (observed live: a killed host agent left
+// its sandboxes QUIESCENT with live handles, and Resume then reported
+// continuity "success" against the dead host).
 func (f *Fleet) SimulateHostLoss(hostID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.down[hostID] {
+		return
+	}
 	f.down[hostID] = true
 	f.missed[hostID] = 0
 }
@@ -698,8 +706,12 @@ func (f *Fleet) Alive(h backendinterface.Handle) bool {
 // honestly).
 func (f *Fleet) Capabilities() backendinterface.Capabilities {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.hosts) == 0 {
+	hosts := make([]Host, 0, len(f.hosts))
+	for _, h := range f.hosts {
+		hosts = append(hosts, h)
+	}
+	f.mu.Unlock()
+	if len(hosts) == 0 {
 		return backendinterface.Capabilities{}
 	}
 	classRank := map[backendinterface.IsolationClass]int{
@@ -709,7 +721,7 @@ func (f *Fleet) Capabilities() backendinterface.Capabilities {
 	}
 	var caps backendinterface.Capabilities
 	first := true
-	for _, h := range f.hosts {
+	for _, h := range hosts {
 		c := h.Capabilities()
 		if first {
 			caps = c
@@ -740,9 +752,17 @@ func (f *Fleet) ReleaseSandbox(sandboxID string) {
 // Tick receives heartbeats from healthy hosts and declares hosts lost after
 // heartbeatMissThreshold consecutive misses.
 func (f *Fleet) Tick() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	now := f.clock.Now()
+	// Loss bookkeeping and the host snapshot happen under the lock; the
+	// heartbeat/view RPCs run unlocked so a stalled host agent can never
+	// wedge every fleet operation behind f.mu (and, transitively, the
+	// control plane's s.mu via HostSeen in the heartbeat handler).
+	type beat struct {
+		id   string
+		host Host
+	}
+	f.mu.Lock()
+	var beats []beat
 	for id, h := range f.hosts {
 		if f.down[id] {
 			if f.lostDeclared[id] {
@@ -759,19 +779,34 @@ func (f *Fleet) Tick() {
 			}
 			continue
 		}
-		h.Tick()
-		f.lastSeen[id] = now
+		beats = append(beats, beat{id: id, host: h})
+	}
+	f.mu.Unlock()
+	type view struct {
+		id string
+		v  scheduler.HostView
+	}
+	views := make([]view, 0, len(beats))
+	for _, b := range beats {
+		b.host.Tick()
+		views = append(views, view{id: b.id, v: b.host.View()})
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, b := range beats {
+		if !f.down[b.id] {
+			f.lastSeen[b.id] = now
+		}
 	}
 	// Utilization for the scale-in signal: worst healthy-host slot usage.
 	healthy, maxUtil := 0, 0.0
-	for id, h := range f.hosts {
-		if f.down[id] {
+	for _, vv := range views {
+		if f.down[vv.id] {
 			continue
 		}
 		healthy++
-		v := h.View()
-		if v.CapacitySlots > 0 {
-			if u := float64(v.UsedSlots) / float64(v.CapacitySlots); u > maxUtil {
+		if vv.v.CapacitySlots > 0 {
+			if u := float64(vv.v.UsedSlots) / float64(vv.v.CapacitySlots); u > maxUtil {
 				maxUtil = u
 			}
 		}

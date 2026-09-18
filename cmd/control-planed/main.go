@@ -413,11 +413,23 @@ func (s *server) hostViews(w http.ResponseWriter, r *http.Request) {
 		Down     bool        `json:"down"`
 		View     interface{} `json:"view"`
 	}
-	out := []hostEntry{}
+	// Snapshot under s.mu; the View RPCs run unlocked so a stalled host
+	// agent cannot hold s.mu (and with it the heartbeat path) hostage.
+	type hostRef struct {
+		id       string
+		url      string
+		lastSeen time.Time
+		client   *rpc.Client
+	}
+	refs := []hostRef{}
 	for id, h := range s.hosts {
-		out = append(out, hostEntry{HostID: id, URL: h.url, LastSeen: h.lastSeen, Down: s.fleet.HostDown(id), View: h.client.View()})
+		refs = append(refs, hostRef{id: id, url: h.url, lastSeen: h.lastSeen, client: h.client})
 	}
 	s.mu.Unlock()
+	out := []hostEntry{}
+	for _, ref := range refs {
+		out = append(out, hostEntry{HostID: ref.id, URL: ref.url, LastSeen: ref.lastSeen, Down: s.fleet.HostDown(ref.id), View: ref.client.View()})
+	}
 	writeJSON(w, map[string]interface{}{"hosts": out, "capabilities": s.fleet.Capabilities()})
 }
 

@@ -23,6 +23,7 @@ import (
 	firecrackerbackend "github.com/agent-sandbox/platform/runtime/firecracker-backend"
 	hostagent "github.com/agent-sandbox/platform/runtime/host-agent"
 	"github.com/agent-sandbox/platform/runtime/host-agent/rpc"
+	"github.com/agent-sandbox/platform/runtime/hostfacts"
 )
 
 func envOr(key, def string) string {
@@ -116,8 +117,12 @@ func main() {
 		// platform-named TAP/chain belongs to a crashed predecessor (pod
 		// teardown kills its VMMs), so the FM11 sweep is safe here — and
 		// here only (default-off keeps test/dev backends on the same host
-		// from destroying this daemon's live plumbing).
-		SweepStaleNetworking: os.Getenv("FC_NETWORKING") == "true",
+		// from destroying this daemon's live plumbing). FC_SWEEP_STALE
+		// decouples the sweep from networking: a second agent sharing a
+		// node (e.g. a standalone agent beside the k3s DaemonSet one) must
+		// not sweep — platform-named TAPs/chains may be the OTHER agent's
+		// live plumbing.
+		SweepStaleNetworking: envOr("FC_SWEEP_STALE", os.Getenv("FC_NETWORKING")) == "true",
 		PublishDenyPorts:     publishDenyPorts(),
 		BootTimeout:          120 * time.Second,
 		DefaultMemMiB:        256,
@@ -132,6 +137,30 @@ func main() {
 		ws = &remoteWS{url: controlPlane, token: token}
 	}
 	agent := hostagent.New(hostID, backend, nil, ws, memCapacity, int(slots), 64)
+	// HOST_FACTS_OVERRIDE is a test-only seam (the daemon-side analogue of
+	// HostAgent.SetFacts, ADR-010): comma-separated kernel_release= / cpu_part=
+	// / arch= pairs. It exists to run cross-kernel checkpoint-compat
+	// experiments; production deployments leave it unset so View reports the
+	// real uname facts.
+	if ov := os.Getenv("HOST_FACTS_OVERRIDE"); ov != "" {
+		f := hostfacts.Current()
+		for _, kv := range strings.Split(ov, ",") {
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			switch parts[0] {
+			case "kernel_release":
+				f.KernelRelease = parts[1]
+			case "cpu_part":
+				f.CPUPart = parts[1]
+			case "arch":
+				f.Arch = parts[1]
+			}
+		}
+		agent.SetFacts(f)
+		log.Printf("host facts overridden via HOST_FACTS_OVERRIDE (test seam): %+v", f)
+	}
 	// Never let an endpoint binding publish the agent's own RPC port: the
 	// DNAT would hijack heartbeats/RPC into a guest.
 	if _, port, err := net.SplitHostPort(listen); err == nil {

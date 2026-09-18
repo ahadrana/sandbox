@@ -212,6 +212,17 @@ curl -s -H "$T" -d '{}' localhost:18080/v1/sandboxes/$SB/terminate
 - Kernel/roots artifacts and the patched jailer are baked into the image;
   VM state lives in an `emptyDir` (pod restart = microVM loss = explicit
   reconcile).
+- Second node (validated 2026-09-18): a two-machine fleet was proven with
+  node 2 (52.25.58.47, aarch64, kernel 7.0.0-1012-aws) running a STANDALONE
+  host-agentd against a standalone control-planed on node 1 — NOT joined to
+  this k3s cluster. The join is deferred: node 2 ships kernel 7.0, which is
+  exactly the kubelet/cadvisor crash-loop case documented above. The
+  standalone pair exercised cross-machine registration, DNAT, origin-host
+  restore, guard-refused cross-kernel checkpoint restore (workspace-only
+  fallback), and real host-loss recovery; see docs/architecture-overview.html
+  ("Two-machine fleet proof"). A standalone agent beside the k3s DaemonSet
+  agent on the same host must run with `FC_SWEEP_STALE=false` (its crash
+  sweep would otherwise delete the k3s agent's live TAPs).
 
 ## Simulation harness: sandbox-sim
 
