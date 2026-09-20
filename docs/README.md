@@ -136,6 +136,17 @@ milestone to code:
 
 Run everything with `go test ./...` from the repository root.
 
+## Agent harness — LLM-agent end-to-end validation
+
+`agent-harness/` is a **separate Node/TypeScript toolchain** (Vercel AI SDK;
+not part of the Go build — `go build ./...` ignores it, and `.gitignore`
+covers `node_modules/`). It drives the real control-plane HTTP API with
+either a deterministic scripted driver (CI, offline) or a live LLM
+(`DRIVER=live` + `TOGETHER_API_KEY`), asserting observable outcomes only.
+See `agent-harness/README.md` for commands and the metal-readiness
+checklist. Its emulation stack uses control-planed's dev-only
+`BACKEND=local|fake` mode.
+
 ## SandboxLab — deterministic simulation + scenario runner
 
 `sandboxlab/` (ADR-010) runs the real control plane in-process on a virtual

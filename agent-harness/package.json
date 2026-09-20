@@ -1,0 +1,25 @@
+{
+  "name": "agent-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agentic validation harness for the agent-sandbox platform: scripted (deterministic, CI) or live-LLM (Vercel AI SDK) scenario runs against the control-plane HTTP API.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && npm run stack && npm run scenario:all",
+    "stack": "bash scripts/start-stack.sh",
+    "stack:stop": "bash scripts/stop-stack.sh",
+    "scenario": "tsx src/runner.ts",
+    "scenario:all": "tsx src/runner.ts --all"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.53",
+    "ai": "^7.0.107",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

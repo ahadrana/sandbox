@@ -7,6 +7,15 @@
 // Dev topology: in-memory workspace/store/outbox (single process, state
 // lost on restart), shared-token header auth only. AuthN/TLS is the
 // gateway's concern (DESIGN §6.1); durable stores are the M3+ work.
+//
+// Emulation mode (BACKEND=local|fake, default fleet): the runtime backend
+// runs IN-PROCESS (no host agents needed) so the full HTTP stack — sandbox
+// lifecycle, hooks, endpoints, events — is exercisable on a single KVM-free
+// box (agent-harness runs against this). DEV_ENVIRONMENTS optionally
+// declares static environments with restart recipes (JSON:
+// [{"environment_id":"...","start":[...],"terminals":[...]}]);
+// SANDBOX_DEV_FAULTS=1 enables POST /v1/dev/fault/kill-runtime for
+// host-loss drills. All three knobs are dev-only; fleet mode is unchanged.
 package main
 
 import (
@@ -28,8 +37,10 @@ import (
 	"github.com/agent-sandbox/platform/domain"
 	"github.com/agent-sandbox/platform/network"
 	backendinterface "github.com/agent-sandbox/platform/runtime/backend-interface"
+	fakebackend "github.com/agent-sandbox/platform/runtime/fake-backend"
 	hostagent "github.com/agent-sandbox/platform/runtime/host-agent"
 	"github.com/agent-sandbox/platform/runtime/host-agent/rpc"
+	localbackend "github.com/agent-sandbox/platform/runtime/local-backend"
 	"github.com/agent-sandbox/platform/workspace"
 )
 
@@ -81,6 +92,56 @@ func main() {
 	mgr := sandboxmanager.New(clock, ids, ws, loggingRestore{fleet}, outbox, store, "control-plane-0")
 	s := &server{mgr: mgr, fleet: fleet, ws: ws, outbox: outbox, token: token, hosts: map[string]*remoteHost{}, gateway: network.NewGateway(mgr)}
 
+	// Emulation mode (BACKEND=local|fake): run the backend in-process
+	// instead of routing to remote host agents. The manager talks to the
+	// backend directly, exactly as conformance tests wire it; the pseudo
+	// host entry below keeps /v1/sandboxes/{id}/address (and with it the
+	// endpoint-proxyd upstream dial) working — local-backend processes
+	// listen on this host directly, so the binding's target port is
+	// reachable at 127.0.0.1 with no DNAT.
+	var envSrc sandboxmanager.EnvironmentSource
+	if envs := os.Getenv("DEV_ENVIRONMENTS"); envs != "" {
+		src, err := parseStaticEnvs(envs)
+		if err != nil {
+			log.Fatalf("DEV_ENVIRONMENTS: %v", err)
+		}
+		envSrc = src
+	}
+	switch backend := envOr("BACKEND", "fleet"); backend {
+	case "fleet":
+		// production-shape topology, unchanged
+	case "local", "fake":
+		var rt sandboxmanager.Runtime
+		if backend == "local" {
+			root := envOr("LOCAL_BACKEND_ROOT", "")
+			if root == "" {
+				var err error
+				root, err = os.MkdirTemp("", "cp-local-backend-")
+				if err != nil {
+					log.Fatalf("local backend root: %v", err)
+				}
+			}
+			lb, err := localbackend.New(root)
+			if err != nil {
+				log.Fatalf("local backend: %v", err)
+			}
+			rt = lb
+		} else {
+			rt = fakebackend.New()
+		}
+		mgr = sandboxmanager.New(clock, ids, ws, rt, outbox, store, "control-plane-0")
+		s.mgr = mgr
+		s.gateway = network.NewGateway(mgr)
+		s.hosts["control-plane-0"] = &remoteHost{url: "http://127.0.0.1", lastSeen: time.Now()}
+		log.Printf("emulation mode: in-process %s backend (no host agents)", backend)
+	default:
+		log.Fatalf("unknown BACKEND %q (want fleet|local|fake)", backend)
+	}
+	if envSrc != nil {
+		mgr.SetEnvironmentSource(envSrc)
+	}
+	devFaults := os.Getenv("SANDBOX_DEV_FAULTS") == "1"
+
 	go s.tickLoop()
 
 	mux := http.NewServeMux()
@@ -100,9 +161,76 @@ func main() {
 	mux.HandleFunc("/v1/bindings", s.guard(s.createBinding))
 	mux.HandleFunc("/v1/bindings/", s.guard(s.bindingByName))
 	mux.HandleFunc("/v1/route/", s.guard(s.routeBinding))
+	if devFaults {
+		// Dev-only fault injection (host-loss drills): kills the sandbox's
+		// runtime incarnation exactly as a host crash would (INV-024).
+		mux.HandleFunc("/v1/dev/fault/kill-runtime", s.guard(s.devKillRuntime))
+		log.Printf("DEV FAULT INJECTION ENABLED at /v1/dev/fault/kill-runtime")
+	}
 
 	log.Printf("control-planed listening on %s", listen)
 	log.Fatal(http.ListenAndServe(listen, mux))
+}
+
+// staticEnvSource is the emulation-mode EnvironmentSource: a fixed set of
+// environments with restart recipes and empty artifact overlays, declared
+// via DEV_ENVIRONMENTS so harness scenarios can exercise hook-driven
+// self-healing without standing up the environment-builder pipeline.
+type staticEnvSource map[string]domain.EnvironmentRecipe
+
+func parseStaticEnvs(jsonSpec string) (staticEnvSource, error) {
+	var entries []struct {
+		EnvironmentID string   `json:"environment_id"`
+		Start         []string `json:"start"`
+		Terminals     []string `json:"terminals"`
+	}
+	if err := json.Unmarshal([]byte(jsonSpec), &entries); err != nil {
+		return nil, err
+	}
+	out := staticEnvSource{}
+	for _, e := range entries {
+		if e.EnvironmentID == "" {
+			return nil, fmt.Errorf("environment_id required")
+		}
+		out[e.EnvironmentID] = domain.EnvironmentRecipe{Start: e.Start, Terminals: e.Terminals}
+	}
+	return out, nil
+}
+
+func (s staticEnvSource) ArtifactManifest(environmentID string) (map[string]string, error) {
+	if _, ok := s[environmentID]; !ok {
+		return nil, domain.ErrNotFound
+	}
+	return map[string]string{}, nil
+}
+
+func (s staticEnvSource) HookRecipe(environmentID string) (domain.EnvironmentRecipe, error) {
+	r, ok := s[environmentID]
+	if !ok {
+		return domain.EnvironmentRecipe{}, domain.ErrNotFound
+	}
+	return r, nil
+}
+
+// devKillRuntime is POST /v1/dev/fault/kill-runtime {"sandbox_id": "..."}.
+// Mounted only when SANDBOX_DEV_FAULTS=1.
+func (s *server) devKillRuntime(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		SandboxID string `json:"sandbox_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SandboxID == "" {
+		http.Error(w, "sandbox_id required", http.StatusBadRequest)
+		return
+	}
+	if err := s.mgr.KillRuntime(req.SandboxID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 // tickLoop drives heartbeats/loss detection and manager reconciliation in
@@ -201,6 +329,7 @@ func (s *server) sandboxes(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		TaskRef         string   `json:"task_ref"`
+		EnvironmentID   string   `json:"environment_id"`
 		Priority        int      `json:"priority"`
 		Class           string   `json:"class"`
 		StartupCommands []string `json:"startup_commands"`
@@ -211,7 +340,8 @@ func (s *server) sandboxes(w http.ResponseWriter, r *http.Request) {
 	}
 	sb, err := s.mgr.CreateSandbox(api.CreateSandboxRequest{
 		Version: api.SchemaVersionV1, TenantID: "tenant-dev", TaskRef: req.TaskRef,
-		Priority: req.Priority, Class: req.Class, StartupCommands: req.StartupCommands,
+		EnvironmentID: req.EnvironmentID,
+		Priority:      req.Priority, Class: req.Class, StartupCommands: req.StartupCommands,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -285,6 +415,14 @@ func (s *server) sandboxOp(w http.ResponseWriter, r *http.Request) {
 		// target port, where the backend's endpoint publish DNATs into
 		// the guest.
 		hostID, ok := s.mgr.HostOf(id)
+		if !ok {
+			// Emulation mode (BACKEND=local|fake): the in-process backend is
+			// no PlacementTracker; the pseudo host registered at startup (in
+			// emulation mode only) is the placement of everything.
+			if _, emu := s.hosts["control-plane-0"]; emu {
+				hostID, ok = "control-plane-0", true
+			}
+		}
 		if !ok {
 			http.Error(w, "sandbox has no live placement", http.StatusNotFound)
 			return

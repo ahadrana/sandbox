@@ -1,3 +1,8 @@
 tmp/
 *.test
 CubeSandbox/
+
+# agent-harness (Node toolchain, not part of the Go build)
+agent-harness/node_modules/
+agent-harness/runs/
+agent-harness/.stack/
