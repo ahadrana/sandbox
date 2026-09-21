@@ -1,8 +1,9 @@
 # Backlog / Follow-up Queue
 
 Consolidated from ADR follow-ups, code-review queues, and session decisions.
-Ordered roughly by value. Last updated: 2026-09-19 (ADR-012 credential
-surrogation spec; Muse-inspired items).
+Ordered roughly by value. Last updated: 2026-09-20 (sub-agent spawn policy
+item added; discussion: harness is a test instrument, VM spawning is a
+platform resource-policy decision).
 
 ## Deprioritized by ADR-011 (the Cursor-model inversion)
 
@@ -34,19 +35,30 @@ surrogation spec; Muse-inspired items).
    sensitive credential swaps/exec classes; ADR-012 phase 3): larger product
    decision — approval UX, timeout semantics, and audit shape need a product
    call before implementation.
-6. **Batch 4 (CubeSandbox borrow list)**: P2 grab-bag — TAP pool pre-warming,
+6. **Sub-agent spawn policy + harness scenarios.** The resource decision
+   (share vs fork vs deny a sub-agent's sandbox) belongs to the *platform* as a
+   policy, not to the agent/harness. Platform side: `ForkPolicy` on the
+   sandbox/environment spec — allowed modes, max children, quota charge,
+   placement constraints; deny-by-default; control plane decides on request.
+   Harness side: scenarios exercising `share` (same sandbox, default/common
+   case per industry practice), `fork` (child sandbox from parent's current
+   workspace generation — cheap for us via ADR-011, a differentiator), and
+   `denied` (policy refusal, assert no VM spawned + invariants hold).
+   Discussion 2026-09-20: harness is a test instrument only; spawning VMs is
+   a resource-policy decision.
+7. **Batch 4 (CubeSandbox borrow list)**: P2 grab-bag — TAP pool pre-warming,
    flattened workspace generations + depth metrics, credential audit fingerprints
    (`fp-<sha256[:8]>`), guest-ready MMIO signal, sandboxctl client validation,
    jittered cache TTLs; plus P1.8 key-schema package for gateway-tier state push.
-7. **Soak coverage of idle-reclaim churn** (ADR-011 step-3 follow-up): run the
+8. **Soak coverage of idle-reclaim churn** (ADR-011 step-3 follow-up): run the
    node-1 soak with IdleReclaimAfter shortened so automatic reclaim cycles are
    exercised longitudinally (current soak covered API-driven churn only).
-8. **Jailer upstream PR** (aarch64 `midr_el1` sysfs patch): deferred by user
+9. **Jailer upstream PR** (aarch64 `midr_el1` sysfs patch): deferred by user
    2026-09-14; still deferred. Relationship groundwork for eventual Firecracker
    snapshot-portability conversations (ADR-011 §Alternatives).
-9. **k3s two-node cluster**: join node 2 once its kernel is aligned/qualified
+10. **k3s two-node cluster**: join node 2 once its kernel is aligned/qualified
    (7.0 kubelet/cadvisor crash risk documented; standalone topology works today).
-10. **True cross-machine RAM continuity proof**: needs matching kernels on both
+11. **True cross-machine RAM continuity proof**: needs matching kernels on both
     nodes (one reboot of node 2 to 6.8.0-1063-aws). Optional; validates ADR-009
     pull path machine-to-machine. Related to item 9's kernel decision.
 
