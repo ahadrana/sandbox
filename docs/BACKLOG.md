@@ -45,7 +45,8 @@ platform resource-policy decision).
    workspace generation — cheap for us via ADR-011, a differentiator), and
    `denied` (policy refusal, assert no VM spawned + invariants hold).
    Discussion 2026-09-20: harness is a test instrument only; spawning VMs is
-   a resource-policy decision.
+   a resource-policy decision. Fork here means **workspace-generation
+   (disk-based) fork only** — see Rejected below for RAM-inclusive fork.
 7. **Batch 4 (CubeSandbox borrow list)**: P2 grab-bag — TAP pool pre-warming,
    flattened workspace generations + depth metrics, credential audit fingerprints
    (`fp-<sha256[:8]>`), guest-ready MMIO signal, sandboxctl client validation,
@@ -64,6 +65,18 @@ platform resource-policy decision).
 
 ## Rejected for now (explicit decisions, revisit triggers noted)
 
+- **RAM-inclusive (memory+fs) fork/clone as a product primitive** — the
+  e2b `POST /sandboxes/{id}/fork` / CubeSandbox `sb.clone(n)` model.
+  Conscious decision 2026-09-20: **we do not support this.** Their use case
+  (RL rollouts, parallel agent fan-out over identical in-memory state on
+  homogeneous fleets) is not ours. RAM snapshots couple children to the
+  parent's kernel/CPU/hypervisor cohort, and fork multiplies that coupling
+  across N placements — exactly the dependency ADR-011 removed from the
+  durability path. Our sub-agent story is `share` (same sandbox) or
+  disk-based workspace-generation fork (portable, epoch-bumping, hooks run);
+  continuity checkpoints remain a *resume accelerator* only, never a
+  replication mechanism. Revisit only if a concrete product requirement for
+  live-process replication appears.
 - **eBPF/LSM taint tracking** (Muse Sentinel-style kernel flow tainting):
   rejected-for-now per ADR-012 §7 — the L7 proxy already observes
   credentialed flows; mixed 6.8/7.0 kernels multiply the compatibility
