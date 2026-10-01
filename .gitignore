@@ -6,3 +6,6 @@ CubeSandbox/
 agent-harness/node_modules/
 agent-harness/runs/
 agent-harness/.stack/
+
+# reference-only clones (never commit)
+substrate/
