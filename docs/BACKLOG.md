@@ -1,9 +1,8 @@
 # Backlog / Follow-up Queue
 
 Consolidated from ADR follow-ups, code-review queues, and session decisions.
-Ordered roughly by value. Last updated: 2026-09-20 (sub-agent spawn policy
-item added; discussion: harness is a test instrument, VM spawning is a
-platform resource-policy decision).
+Ordered roughly by value. Last updated: 2026-10-01 (Substrate review folded
+in: ADR-012 design upgrades, CRNG reseed check, Substrate borrow batch).
 
 ## Deprioritized by ADR-011 (the Cursor-model inversion)
 
@@ -21,6 +20,20 @@ platform resource-policy decision).
    authorizing. Phase 1 = broker surrogate minting + proxy insertion for
    allowlisted HTTPS destinations + fail-closed enforcement + swap audit.
    Estimate ~2–3 sessions.
+   Design upgrades from Substrate review (2026-10-01), fold into the phase-1
+   spec before implementing:
+   - **Identity via cert, not header**: actor presents a per-actor mTLS
+     client cert (SPIFFE-style URI) to the egress proxy; proxy re-verifies
+     the chain itself (defense in depth). Headers are spoofable, certs aren't.
+   - **Placeholder-header swap + provider-plugin split**: agent sends a
+     placeholder Authorization header; proxy resolves `secret://provider/path`
+     via a pluggable CredentialProvider that owns secret storage access and
+     authorizes per-actor identity — the proxy never holds secrets at rest.
+     Never inject into cleartext; all post-injection failures fail closed.
+   - **Shared policy parser** between API validation and dataplane evaluation
+     so the two can't drift.
+   - **Bind issued credentials to host/placement claims** and invalidate on
+     reschedule (their threat-model T-28).
 2. **SSRF final-IP re-verification at connect time** for DNS-learned egress
    entries: re-check the resolved/final IP at connect, not just at DNS-answer
    learn time (TTL rebinding / answer-churn window). Small.
@@ -35,7 +48,34 @@ platform resource-policy decision).
    sensitive credential swaps/exec classes; ADR-012 phase 3): larger product
    decision — approval UX, timeout semantics, and audit shape need a product
    call before implementation.
-6. **Sub-agent spawn policy + harness scenarios.** The resource decision
+6. **Guest CRNG reseed verification on restore** (correctness/security, from
+   Substrate review 2026-10-01): guests restored from a checkpoint share
+   frozen entropy with every other restore of that snapshot. Firecracker's
+   VmGenID solves this cleanly — verify our firecracker-backend actually
+   triggers a guest entropy reseed on restore (and add a conformance check).
+   If it doesn't, this is a security bug, not an enhancement.
+7. **Substrate borrow batch** (review 2026-10-01; repo at substrate/):
+   - **Sparse-extent zstd snapshot encoding** (their pkg/objectstorage/
+     sparsezstd.go): SEEK_DATA/SEEK_HOLE extent enumeration of the sparse
+     memory image, stream only populated extents through parallel zstd;
+     ~2GiB mostly-zero RAM → ~150MiB scan. Apply to our FC memory snapshots.
+   - **Manifest-as-commit-marker snapshot upload**: per-file concurrent
+     upload with deterministic object names, JSON manifest uploaded last as
+     the atomic commit marker; crash leaves only GC-able orphans, retries
+     safe. Adopt for checkpoint transfer (ADR-009 pull path).
+   - **Bounded request-parking for resume storms** (their docs/
+     request-parking.md): resume-triggering requests park under a shared time
+     budget with a bounded lot that load-sheds (503) when full; the resume
+     flight outlives caller cancellation (leader disconnect doesn't abort
+     the restore; joiners share outcome). Upgrade our single-flight resume
+     admission control.
+   - **Reserved telemetry namespace + cardinality rules** when we add
+     metrics: sandbox/guest-emitted label keys under a reserved prefix are
+     dropped (anti-spoofing); metric registry checked in + CI-verified.
+   - **CI fail-closed test guard** (their docs/dev/best-practices/
+     ci-fail-closed.md): a test that skips on missing preconditions must
+     FAIL in CI. Prevents silent coverage loss for our FC suites.
+8. **Sub-agent spawn policy + harness scenarios.** The resource decision
    (share vs fork vs deny a sub-agent's sandbox) belongs to the *platform* as a
    policy, not to the agent/harness. Platform side: `ForkPolicy` on the
    sandbox/environment spec — allowed modes, max children, quota charge,
@@ -47,19 +87,19 @@ platform resource-policy decision).
    Discussion 2026-09-20: harness is a test instrument only; spawning VMs is
    a resource-policy decision. Fork here means **workspace-generation
    (disk-based) fork only** — see Rejected below for RAM-inclusive fork.
-7. **Batch 4 (CubeSandbox borrow list)**: P2 grab-bag — TAP pool pre-warming,
+9. **Batch 4 (CubeSandbox borrow list)**: P2 grab-bag — TAP pool pre-warming,
    flattened workspace generations + depth metrics, credential audit fingerprints
    (`fp-<sha256[:8]>`), guest-ready MMIO signal, sandboxctl client validation,
    jittered cache TTLs; plus P1.8 key-schema package for gateway-tier state push.
-8. **Soak coverage of idle-reclaim churn** (ADR-011 step-3 follow-up): run the
+10. **Soak coverage of idle-reclaim churn** (ADR-011 step-3 follow-up): run the
    node-1 soak with IdleReclaimAfter shortened so automatic reclaim cycles are
    exercised longitudinally (current soak covered API-driven churn only).
-9. **Jailer upstream PR** (aarch64 `midr_el1` sysfs patch): deferred by user
+11. **Jailer upstream PR** (aarch64 `midr_el1` sysfs patch): deferred by user
    2026-09-14; still deferred. Relationship groundwork for eventual Firecracker
    snapshot-portability conversations (ADR-011 §Alternatives).
-10. **k3s two-node cluster**: join node 2 once its kernel is aligned/qualified
+12. **k3s two-node cluster**: join node 2 once its kernel is aligned/qualified
    (7.0 kubelet/cadvisor crash risk documented; standalone topology works today).
-11. **True cross-machine RAM continuity proof**: needs matching kernels on both
+13. **True cross-machine RAM continuity proof**: needs matching kernels on both
     nodes (one reboot of node 2 to 6.8.0-1063-aws). Optional; validates ADR-009
     pull path machine-to-machine. Related to item 9's kernel decision.
 
